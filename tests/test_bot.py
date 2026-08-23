@@ -25,6 +25,7 @@ class RuntimeConfigTests(unittest.TestCase):
             PGUSER="sub2api_tg_bot",
             PGPASSWORD="a-valid-restricted-password",
             PGSSLMODE="prefer",
+            PG_ALLOW_INSECURE_PRIVATE_NETWORK="0",
             MAX_WEBHOOK_BODY=65536,
             WEBHOOK_WORKERS=4,
             WEBHOOK_MAX_PENDING=16,
@@ -52,8 +53,43 @@ class RuntimeConfigTests(unittest.TestCase):
 
     def test_remote_database_requires_tls(self):
         with self.valid_runtime(), mock.patch.multiple(bot, PGHOST="db.example", PGSSLMODE="prefer"):
-            with self.assertRaisesRegex(RuntimeError, "Remote PostgreSQL"):
+            with self.assertRaisesRegex(RuntimeError, "Remote PostgreSQL must use TLS"):
                 bot.validate_runtime_config()
+
+    def test_compose_service_can_use_explicit_private_network(self):
+        with self.valid_runtime(), mock.patch.multiple(
+            bot,
+            PGHOST="sub2api-postgres",
+            PGSSLMODE="disable",
+            PG_ALLOW_INSECURE_PRIVATE_NETWORK="1",
+        ):
+            bot.validate_runtime_config()
+
+    def test_private_network_exception_rejects_public_hostname(self):
+        with self.valid_runtime(), mock.patch.multiple(
+            bot,
+            PGHOST="db.example.com",
+            PGSSLMODE="disable",
+            PG_ALLOW_INSECURE_PRIVATE_NETWORK="1",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "trusted private network"):
+                bot.validate_runtime_config()
+
+    def test_secret_can_be_read_from_absolute_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as secret_file:
+            secret_file.write("secret-value\n")
+            secret_file.flush()
+            with mock.patch.dict(os.environ, {"EXAMPLE_SECRET_FILE": secret_file.name}, clear=False):
+                self.assertEqual(bot.read_secret("EXAMPLE_SECRET"), "secret-value")
+
+    def test_secret_rejects_environment_and_file_together(self):
+        with mock.patch.dict(
+            os.environ,
+            {"EXAMPLE_SECRET": "value", "EXAMPLE_SECRET_FILE": "/run/secrets/example"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Set only one"):
+                bot.read_secret("EXAMPLE_SECRET")
 
 
 class MessageAuthorizationTests(unittest.TestCase):
@@ -152,6 +188,27 @@ class DataSafetyTests(unittest.TestCase):
                 bot.save_alert_state({"example": {"alerted_at": 1}})
             mode = stat.S_IMODE(os.stat(path).st_mode)
             self.assertEqual(mode, 0o600)
+
+
+class ContainerPackagingTests(unittest.TestCase):
+    def test_image_runs_as_unprivileged_user_and_has_healthcheck(self):
+        with open("Dockerfile", "r", encoding="utf-8") as file:
+            dockerfile = file.read()
+        self.assertIn("USER 10001:10001", dockerfile)
+        self.assertIn("HEALTHCHECK", dockerfile)
+        self.assertIn("postgresql-client", dockerfile)
+        self.assertNotIn("docker.sock", dockerfile)
+
+    def test_compose_does_not_publish_ports_or_mount_docker_socket(self):
+        with open("compose.example.yaml", "r", encoding="utf-8") as file:
+            compose = file.read()
+        self.assertIn("read_only: true", compose)
+        self.assertIn("cap_drop:", compose)
+        self.assertIn("internal: true", compose)
+        self.assertIn("PG_ALLOW_INSECURE_PRIVATE_NETWORK: \"1\"", compose)
+        self.assertNotIn("docker.sock", compose)
+        self.assertNotIn("ports:", compose)
+        self.assertNotIn("env_file:", compose)
 
 
 class DispatcherTests(unittest.TestCase):

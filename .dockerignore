@@ -1,0 +1,15 @@
+.git
+.github
+.env
+*.env
+config.json
+alert_state.json
+secrets/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+tests/
+*.log
+*.bak
+.DS_Store
