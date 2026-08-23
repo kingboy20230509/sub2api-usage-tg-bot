@@ -77,7 +77,9 @@ def query_key_usage(key_name):
     q = sql_quote(key_name)
     sql = f"""
 WITH k AS (
-  SELECT id, name, status, quota, quota_used, usage_5h, usage_1d, usage_7d,
+  SELECT id, name, status, quota, quota_used,
+         rate_limit_5h, rate_limit_1d, rate_limit_7d,
+         usage_5h, usage_1d, usage_7d,
          last_used_at, created_at, expires_at
   FROM api_keys
   WHERE name = {q} AND deleted_at IS NULL
@@ -129,10 +131,16 @@ def format_usage(key_name, data):
     quota = dec(k.get("quota"))
     used = dec(k.get("quota_used"))
     quota_line = f"额度：{money(used)} / {money(quota)}，剩余 {money(quota - used)}" if quota > 0 else f"累计扣费：{money(all_.get('actual_cost'))}"
+    def limit_text(value):
+        return "不限" if dec(value) <= 0 else money(value)
     lines = [
         f"🔑 Key：{k.get('name')}（状态：{k.get('status')}）",
         quota_line,
-        f"最近 5h / 1d / 7d：{money(k.get('usage_5h'))} / {money(k.get('usage_1d'))} / {money(k.get('usage_7d'))}",
+        "限额：",
+        f"• 5 小时限额：{limit_text(k.get('rate_limit_5h'))}，已用 {money(k.get('usage_5h'))}，剩余 {money(dec(k.get('rate_limit_5h')) - dec(k.get('usage_5h'))) if dec(k.get('rate_limit_5h')) > 0 else '不限'}",
+        f"• 日限额：{limit_text(k.get('rate_limit_1d'))}，已用 {money(k.get('usage_1d'))}，剩余 {money(dec(k.get('rate_limit_1d')) - dec(k.get('usage_1d'))) if dec(k.get('rate_limit_1d')) > 0 else '不限'}",
+        f"• 周限额：{limit_text(k.get('rate_limit_7d'))}，已用 {money(k.get('usage_7d'))}，剩余 {money(dec(k.get('rate_limit_7d')) - dec(k.get('usage_7d'))) if dec(k.get('rate_limit_7d')) > 0 else '不限'}",
+
         "",
         "今日用量：",
         f"• 请求：{num(today.get('requests'))}",
