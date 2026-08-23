@@ -18,6 +18,13 @@ class RuntimeConfigTests(unittest.TestCase):
             WEBHOOK_SECRET="A" * 32,
             WEBHOOK_PATH="/tg-sub2api-bot/" + "B" * 32,
             PUBLIC_WEBHOOK_URL="https://bot.example/tg-sub2api-bot/" + "B" * 32,
+            PSQL_BIN="/usr/bin/true",
+            PGHOST="127.0.0.1",
+            PGPORT="5432",
+            PGDATABASE="sub2api",
+            PGUSER="sub2api_tg_bot",
+            PGPASSWORD="a-valid-restricted-password",
+            PGSSLMODE="prefer",
             MAX_WEBHOOK_BODY=65536,
             WEBHOOK_WORKERS=4,
             WEBHOOK_MAX_PENDING=16,
@@ -41,6 +48,11 @@ class RuntimeConfigTests(unittest.TestCase):
     def test_webhook_url_path_must_match(self):
         with self.valid_runtime(), mock.patch.object(bot, "PUBLIC_WEBHOOK_URL", "https://bot.example/wrong"):
             with self.assertRaisesRegex(RuntimeError, "PUBLIC_WEBHOOK_URL"):
+                bot.validate_runtime_config()
+
+    def test_remote_database_requires_tls(self):
+        with self.valid_runtime(), mock.patch.multiple(bot, PGHOST="db.example", PGSSLMODE="prefer"):
+            with self.assertRaisesRegex(RuntimeError, "Remote PostgreSQL"):
                 bot.validate_runtime_config()
 
 
@@ -91,6 +103,47 @@ class DataSafetyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bot.query_key_usage("bad'; DROP TABLE api_keys; --")
             run.assert_not_called()
+
+    def test_valid_key_uses_psql_variable(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_key_usage("example-key")
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.usage(:'key_name')::text;",
+            {"key_name": "example-key"},
+        )
+
+    def test_psql_subprocess_gets_only_database_environment(self):
+        with mock.patch.multiple(
+            bot,
+            PSQL_BIN="/usr/bin/psql",
+            PGHOST="127.0.0.1",
+            PGPORT="5432",
+            PGDATABASE="sub2api",
+            PGUSER="sub2api_tg_bot",
+            PGPASSWORD="database-secret",
+            PGSSLMODE="prefer",
+            TOKEN="telegram-secret",
+            WEBHOOK_SECRET="webhook-secret",
+        ), mock.patch.object(bot.subprocess, "check_output", return_value='{"ok": true}\n') as check:
+            result = bot.run_psql_json("SELECT :'key_name';", {"key_name": "example-key"})
+        self.assertEqual(result, {"ok": True})
+        command = check.call_args.args[0]
+        environment = check.call_args.kwargs["env"]
+        self.assertNotIn("docker", command)
+        self.assertIn("--set=key_name=example-key", command)
+        self.assertEqual(environment["PGUSER"], "sub2api_tg_bot")
+        self.assertIn("default_transaction_read_only=on", environment["PGOPTIONS"])
+        self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
+        self.assertNotIn("WEBHOOK_SECRET", environment)
+
+    def test_database_setup_exposes_only_fixed_function(self):
+        with open("deploy/create_readonly_role.sql", "r", encoding="utf-8") as file:
+            sql = file.read()
+        self.assertIn("SECURITY DEFINER", sql)
+        self.assertIn("SET search_path = pg_catalog", sql)
+        self.assertIn("REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text)", sql)
+        self.assertNotIn("GRANT SELECT", sql)
 
     def test_alert_state_is_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:

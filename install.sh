@@ -8,6 +8,8 @@ ENV_FILE="${ENV_FILE:-/etc/sub2api-tg-bot.env}"
 SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/sub2api-tg-bot.service}"
 CONFIG_FILE="${CONFIG_FILE:-$INSTALL_DIR/config.json}"
 SERVICE_NAME="${SERVICE_NAME:-sub2api-tg-bot}"
+BOT_USER="${BOT_USER:-sub2api-tg-bot}"
+BOT_GROUP="${BOT_GROUP:-sub2api-tg-bot}"
 LISTEN_HOST="${LISTEN_HOST:-127.0.0.1}"
 LISTEN_PORT="${LISTEN_PORT:-8099}"
 ALERT_CHECK_INTERVAL="${ALERT_CHECK_INTERVAL:-600}"
@@ -19,6 +21,13 @@ PUBLIC_WEBHOOK_URL="${PUBLIC_WEBHOOK_URL:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
 SUB2API_KEY_NAME="${SUB2API_KEY_NAME:-}"
+PSQL_BIN="${PSQL_BIN:-/usr/bin/psql}"
+PGHOST="${PGHOST:-127.0.0.1}"
+PGPORT="${PGPORT:-5432}"
+PGDATABASE="${PGDATABASE:-sub2api}"
+PGUSER="${PGUSER:-sub2api_tg_bot}"
+PGPASSWORD="${PGPASSWORD:-}"
+PGSSLMODE="${PGSSLMODE:-prefer}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 SKIP_NGINX_HINT="${SKIP_NGINX_HINT:-0}"
 
@@ -45,8 +54,13 @@ validate_inputs() {
   validate_safe_path SERVICE_FILE "$SERVICE_FILE"
   validate_safe_path CONFIG_FILE "$CONFIG_FILE"
   validate_safe_path ALERT_STATE_PATH "$ALERT_STATE_PATH"
+  validate_safe_path PSQL_BIN "$PSQL_BIN"
   if [[ ! "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
     echo "Invalid SERVICE_NAME" >&2
+    exit 1
+  fi
+  if [[ ! "$BOT_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]] || [[ ! "$BOT_GROUP" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,30}$ ]]; then
+    echo "Invalid BOT_USER or BOT_GROUP" >&2
     exit 1
   fi
   if [[ ! "$LISTEN_PORT" =~ ^[0-9]{1,5}$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 65535 )); then
@@ -60,6 +74,32 @@ validate_inputs() {
   if [[ ! "$TELEGRAM_USER_ID" =~ ^[0-9]{1,20}$ ]]; then
     echo "TELEGRAM_USER_ID must be a numeric Telegram user ID" >&2
     exit 1
+  fi
+  if [[ -z "$PGHOST" || "$PGHOST" == *$'\n'* || "$PGHOST" == *$'\r'* ]]; then
+    echo "Invalid PGHOST" >&2
+    exit 1
+  fi
+  if [[ ! "$PGPORT" =~ ^[0-9]{1,5}$ ]] || (( PGPORT < 1 || PGPORT > 65535 )); then
+    echo "PGPORT must be between 1 and 65535" >&2
+    exit 1
+  fi
+  if [[ ! "$PGDATABASE" =~ ^[A-Za-z_][A-Za-z0-9_.-]{0,62}$ ]] || [[ ! "$PGUSER" =~ ^[A-Za-z_][A-Za-z0-9_.-]{0,62}$ ]]; then
+    echo "Invalid PGDATABASE or PGUSER" >&2
+    exit 1
+  fi
+  if [[ -z "$PGPASSWORD" || "${PGPASSWORD,,}" == *replace_me* || "$PGPASSWORD" == *$'\n'* || "$PGPASSWORD" == *$'\r'* ]]; then
+    echo "PGPASSWORD is required and cannot contain line breaks" >&2
+    exit 1
+  fi
+  if [[ ! "$PGSSLMODE" =~ ^(disable|allow|prefer|require|verify-ca|verify-full)$ ]]; then
+    echo "Invalid PGSSLMODE" >&2
+    exit 1
+  fi
+  if [[ "$PGHOST" != "127.0.0.1" && "$PGHOST" != "::1" && "$PGHOST" != "localhost" && "$PGHOST" != /* ]]; then
+    if [[ "$PGSSLMODE" != "require" && "$PGSSLMODE" != "verify-ca" && "$PGSSLMODE" != "verify-full" ]]; then
+      echo "Remote PostgreSQL connections require PGSSLMODE=require, verify-ca, or verify-full" >&2
+      exit 1
+    fi
   fi
   if [[ ! "$WEBHOOK_SECRET" =~ ^[A-Za-z0-9_-]{32,256}$ ]]; then
     echo "WEBHOOK_SECRET must contain 32-256 A-Z, a-z, 0-9, underscore, or dash characters" >&2
@@ -139,11 +179,14 @@ main() {
   need_root
   have python3 || { echo "python3 is required" >&2; exit 1; }
   have install || { echo "GNU install is required" >&2; exit 1; }
-  have docker || echo "Warning: docker command not found. The bot needs Docker access to query sub2api-postgres." >&2
+  have getent || { echo "getent is required" >&2; exit 1; }
+  have groupadd || { echo "groupadd is required" >&2; exit 1; }
+  have useradd || { echo "useradd is required" >&2; exit 1; }
 
   read_prompt TELEGRAM_BOT_TOKEN "Telegram Bot Token from @BotFather" "" 1
   read_prompt TELEGRAM_USER_ID "Telegram user ID to bind"
   read_prompt SUB2API_KEY_NAME "Sub2API key name for this Telegram user"
+  read_prompt PGPASSWORD "Password for the restricted PostgreSQL role $PGUSER" "" 1
 
   if [[ -z "$WEBHOOK_SECRET" ]]; then
     WEBHOOK_SECRET="$(random_secret)"
@@ -159,11 +202,32 @@ main() {
     echo "Run install.sh from a complete, reviewed repository checkout." >&2
     exit 1
   fi
+  if [[ ! -x "$PSQL_BIN" ]]; then
+    echo "PostgreSQL client not found or not executable: $PSQL_BIN" >&2
+    exit 1
+  fi
 
-  install -d -m 0755 "$INSTALL_DIR"
+  if ! getent group "$BOT_GROUP" >/dev/null; then
+    groupadd --system "$BOT_GROUP"
+  fi
+  if ! id -u "$BOT_USER" >/dev/null 2>&1; then
+    local nologin_bin
+    nologin_bin="$(command -v nologin || true)"
+    nologin_bin="${nologin_bin:-/usr/sbin/nologin}"
+    useradd --system --gid "$BOT_GROUP" --home-dir /nonexistent --shell "$nologin_bin" "$BOT_USER"
+  elif [[ "$(id -gn "$BOT_USER")" != "$BOT_GROUP" ]]; then
+    echo "Existing user $BOT_USER does not use expected primary group $BOT_GROUP" >&2
+    exit 1
+  fi
+
+  install -d -o root -g root -m 0755 "$INSTALL_DIR"
   local alert_state_dir
   alert_state_dir="$(dirname -- "$ALERT_STATE_PATH")"
-  install -d -m 0700 "$alert_state_dir"
+  install -d -o "$BOT_USER" -g "$BOT_GROUP" -m 0700 "$alert_state_dir"
+  if [[ -e "$ALERT_STATE_PATH" ]]; then
+    chown "$BOT_USER:$BOT_GROUP" "$ALERT_STATE_PATH"
+    chmod 0600 "$ALERT_STATE_PATH"
+  fi
   if [[ -f "$CONFIG_FILE" ]]; then
     cp -a "$CONFIG_FILE" "$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
   fi
@@ -190,9 +254,11 @@ main() {
   "timezone": $tz_json
 }
 JSON
-  chmod 0600 "$CONFIG_FILE"
+  chown root:"$BOT_GROUP" "$CONFIG_FILE"
+  chmod 0640 "$CONFIG_FILE"
 
   local token_env secret_env public_url_env webhook_path_env listen_host_env config_env state_env
+  local psql_bin_env pghost_env pgdatabase_env pguser_env pgpassword_env pgsslmode_env
   token_env="$(env_quote "$TELEGRAM_BOT_TOKEN")"
   secret_env="$(env_quote "$WEBHOOK_SECRET")"
   public_url_env="$(env_quote "$PUBLIC_WEBHOOK_URL")"
@@ -200,6 +266,12 @@ JSON
   listen_host_env="$(env_quote "$LISTEN_HOST")"
   config_env="$(env_quote "$CONFIG_FILE")"
   state_env="$(env_quote "$ALERT_STATE_PATH")"
+  psql_bin_env="$(env_quote "$PSQL_BIN")"
+  pghost_env="$(env_quote "$PGHOST")"
+  pgdatabase_env="$(env_quote "$PGDATABASE")"
+  pguser_env="$(env_quote "$PGUSER")"
+  pgpassword_env="$(env_quote "$PGPASSWORD")"
+  pgsslmode_env="$(env_quote "$PGSSLMODE")"
   cat > "$ENV_FILE" <<ENV
 TELEGRAM_BOT_TOKEN=$token_env
 WEBHOOK_SECRET=$secret_env
@@ -210,6 +282,13 @@ LISTEN_PORT=$LISTEN_PORT
 SUB2API_TG_BOT_CONFIG=$config_env
 ALERT_CHECK_INTERVAL=$ALERT_CHECK_INTERVAL
 ALERT_STATE_PATH=$state_env
+PSQL_BIN=$psql_bin_env
+PGHOST=$pghost_env
+PGPORT=$PGPORT
+PGDATABASE=$pgdatabase_env
+PGUSER=$pguser_env
+PGPASSWORD=$pgpassword_env
+PGSSLMODE=$pgsslmode_env
 MAX_WEBHOOK_BODY=65536
 WEBHOOK_WORKERS=4
 WEBHOOK_MAX_PENDING=16
@@ -220,7 +299,7 @@ ENV
   cat > "$SERVICE_FILE" <<SERVICE
 [Unit]
 Description=Telegram bot for Sub2API key usage checks
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -230,8 +309,8 @@ EnvironmentFile=$ENV_FILE
 ExecStart=/usr/bin/python3 $INSTALL_DIR/sub2api_tg_bot.py
 Restart=always
 RestartSec=2
-User=root
-Group=root
+User=$BOT_USER
+Group=$BOT_GROUP
 UMask=0077
 NoNewPrivileges=true
 CapabilityBoundingSet=
@@ -248,8 +327,13 @@ ProtectSystem=strict
 ReadWritePaths=$alert_state_dir
 LockPersonality=true
 MemoryDenyWriteExecute=true
+ProcSubset=pid
+ProtectProc=invisible
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
 RestrictSUIDSGID=true
+SystemCallFilter=@system-service
 SystemCallArchitectures=native
 
 [Install]

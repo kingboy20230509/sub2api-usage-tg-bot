@@ -1,6 +1,8 @@
 # Secrets / real runtime config
 .env
 *.env
+.pgpass
+*.pgpass
 config.json
 alert_state.json
 *.bak
