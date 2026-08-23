@@ -1,6 +1,6 @@
 [Unit]
 Description=Telegram bot for Sub2API key usage checks
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -10,8 +10,8 @@ EnvironmentFile=/etc/sub2api-tg-bot.env
 ExecStart=/usr/bin/python3 /opt/sub2api-tg-bot/sub2api_tg_bot.py
 Restart=always
 RestartSec=2
-User=root
-Group=root
+User=sub2api-tg-bot
+Group=sub2api-tg-bot
 UMask=0077
 NoNewPrivileges=true
 CapabilityBoundingSet=
@@ -28,8 +28,13 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/sub2api-tg-bot
 LockPersonality=true
 MemoryDenyWriteExecute=true
+ProcSubset=pid
+ProtectProc=invisible
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
 RestrictSUIDSGID=true
+SystemCallFilter=@system-service
 SystemCallArchitectures=native
 
 [Install]

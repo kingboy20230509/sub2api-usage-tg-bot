@@ -16,7 +16,7 @@ A small Telegram bot for checking Sub2API API key usage from Telegram.
 - 使用强制 Telegram webhook secret token，并限制请求体、并发和查询频率。
 - 仅允许绑定用户通过私聊查询；群聊不会返回用量数据。
 - 使用 JSON 文件维护「Telegram 用户 ID → Sub2API key 名称」绑定关系。
-- 通过 Docker 容器 `sub2api-postgres` 查询 Sub2API 的 PostgreSQL 数据库。
+- 使用独立 PostgreSQL 登录，只能执行仓库提供的固定用量聚合函数；运行时不接触 Docker socket，也没有表读取权限。
 - 无第三方 Python 框架依赖，仅使用 Python 标准库。
 
 ### 安全提醒
@@ -40,11 +40,9 @@ A small Telegram bot for checking Sub2API API key usage from Telegram.
 ### 环境要求
 
 - Python 3.10+
-- bot 运行用户需要能执行 Docker 命令
-- 已运行 Sub2API PostgreSQL 容器，默认容器名为 `sub2api-postgres`
-- Sub2API 默认 PostgreSQL 配置：
-  - database: `sub2api`
-  - user: `sub2api`
+- PostgreSQL `psql` 客户端（Debian/Ubuntu 软件包：`postgresql-client`）
+- 主机可以通过回环地址或 Unix socket 访问 Sub2API PostgreSQL
+- 数据库所有者需要先运行 `deploy/create_readonly_role.sql`
 - 如果使用 webhook，需要 Nginx/Caddy 等反向代理和 HTTPS 域名
 
 ### 文件说明
@@ -53,6 +51,34 @@ A small Telegram bot for checking Sub2API API key usage from Telegram.
 - `config.example.json`：绑定配置示例
 - `.env.example`：环境变量示例
 - `sub2api-tg-bot.service.example`：systemd 服务示例
+- `deploy/create_readonly_role.sql`：创建受限登录和固定查询函数
+
+### 创建受限数据库账号
+
+安装机器人前，以 Sub2API 数据库所有者执行：
+
+```bash
+docker exec -i sub2api-postgres \
+  psql -U sub2api -d sub2api \
+  < deploy/create_readonly_role.sql
+
+docker exec -it sub2api-postgres \
+  psql -U sub2api -d sub2api \
+  -c '\password sub2api_tg_bot'
+```
+
+第二条命令会安全地提示输入密码，不会把密码写进命令历史。该账号没有 `api_keys` 或 `usage_logs` 的表读取权限，只能执行 `sub2api_tg_bot_api.usage(text)`。
+
+如果 PostgreSQL 容器尚未向主机开放端口，只绑定到回环地址，例如在 Compose 中配置：
+
+```yaml
+ports:
+  - "127.0.0.1:5432:5432"
+```
+
+不要把 PostgreSQL 的 `5432` 端口暴露到公网。
+
+从旧版升级时，先创建上述数据库函数和账号、安装 `postgresql-client`、确认回环连接可用，再重新运行安装脚本。新版服务不再需要 Docker 权限；不要把 `sub2api-tg-bot` 系统用户加入 `docker` 组。
 
 ### 安装
 
@@ -75,11 +101,13 @@ sudo bash ./install.sh
 - Telegram Bot Token
 - 要绑定的 Telegram 用户 ID
 - 对应的 Sub2API key 名称
+- 受限 PostgreSQL 账号 `sub2api_tg_bot` 的密码
 - 公开 webhook URL
 
 安装脚本会自动完成：
 
-- 下载 `sub2api_tg_bot.py` 到 `/opt/sub2api-tg-bot/`
+- 复制当前检出的 `sub2api_tg_bot.py` 到 `/opt/sub2api-tg-bot/`
+- 创建无登录 shell 的系统用户 `sub2api-tg-bot`
 - 生成 `/opt/sub2api-tg-bot/config.json`
 - 生成 `/etc/sub2api-tg-bot.env`
 - 生成并启用 `sub2api-tg-bot.service`
@@ -93,6 +121,7 @@ sudo env \
   TELEGRAM_BOT_TOKEN="123456:replace_me" \
   TELEGRAM_USER_ID="123456789" \
   SUB2API_KEY_NAME="example-key-name" \
+  PGPASSWORD="replace_with_restricted_database_password" \
   PUBLIC_WEBHOOK_URL="https://example.com/tg-sub2api-bot/replace_me" \
   NON_INTERACTIVE=1 \
   bash ./install.sh
@@ -100,11 +129,15 @@ sudo env \
 
 ```bash
 sudo mkdir -p /opt/sub2api-tg-bot /etc
-sudo install -d -m 0700 /var/lib/sub2api-tg-bot
+sudo groupadd --system sub2api-tg-bot
+sudo useradd --system --gid sub2api-tg-bot --home-dir /nonexistent --shell /usr/sbin/nologin sub2api-tg-bot
+sudo install -d -o sub2api-tg-bot -g sub2api-tg-bot -m 0700 /var/lib/sub2api-tg-bot
 sudo cp sub2api_tg_bot.py /opt/sub2api-tg-bot/
 sudo cp config.example.json /opt/sub2api-tg-bot/config.json
 sudo cp .env.example /etc/sub2api-tg-bot.env
-sudo chmod 600 /etc/sub2api-tg-bot.env /opt/sub2api-tg-bot/config.json
+sudo chown root:sub2api-tg-bot /opt/sub2api-tg-bot/config.json
+sudo chmod 600 /etc/sub2api-tg-bot.env
+sudo chmod 640 /opt/sub2api-tg-bot/config.json
 ```
 
 编辑 `/opt/sub2api-tg-bot/config.json`：
@@ -132,6 +165,13 @@ LISTEN_PORT=8099
 ALERT_CHECK_INTERVAL=600
 ALERT_STATE_PATH=/var/lib/sub2api-tg-bot/alert_state.json
 SUB2API_TG_BOT_CONFIG=/opt/sub2api-tg-bot/config.json
+PSQL_BIN=/usr/bin/psql
+PGHOST=127.0.0.1
+PGPORT=5432
+PGDATABASE=sub2api
+PGUSER=sub2api_tg_bot
+PGPASSWORD=请替换为受限数据库账号密码
+PGSSLMODE=prefer
 MAX_WEBHOOK_BODY=65536
 WEBHOOK_WORKERS=4
 WEBHOOK_MAX_PENDING=16
@@ -215,7 +255,7 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
 - Requires a Telegram webhook secret token and bounds request size, concurrency, and query frequency.
 - Returns usage only in a matching private user chat; group chats never receive usage data.
 - Reads bindings from a JSON config file.
-- Queries the Sub2API PostgreSQL database through the `sub2api-postgres` Docker container.
+- Uses a dedicated PostgreSQL login that can execute only a fixed usage aggregation function; the runtime has no Docker socket or table-read access.
 - No framework dependency; uses Python standard library only.
 
 ## Security notes
@@ -235,11 +275,9 @@ This repository includes only example config files.
 ## Requirements
 
 - Python 3.10+
-- Docker access from the bot process
-- A running Sub2API PostgreSQL container named `sub2api-postgres`
-- PostgreSQL database/user defaults used by Sub2API:
-  - database: `sub2api`
-  - user: `sub2api`
+- The PostgreSQL `psql` client (`postgresql-client` on Debian/Ubuntu)
+- Host access to Sub2API PostgreSQL through loopback or a Unix socket
+- A database owner must first run `deploy/create_readonly_role.sql`
 - A reverse proxy such as Nginx/Caddy if using Telegram webhook mode
 
 ## Files
@@ -248,6 +286,34 @@ This repository includes only example config files.
 - `config.example.json` — example Telegram user ID to Sub2API key-name bindings
 - `.env.example` — example environment variables
 - `sub2api-tg-bot.service.example` — example systemd unit
+- `deploy/create_readonly_role.sql` — restricted login and fixed query function
+
+## Create the restricted database login
+
+Before installing the bot, run this as the Sub2API database owner:
+
+```bash
+docker exec -i sub2api-postgres \
+  psql -U sub2api -d sub2api \
+  < deploy/create_readonly_role.sql
+
+docker exec -it sub2api-postgres \
+  psql -U sub2api -d sub2api \
+  -c '\password sub2api_tg_bot'
+```
+
+The second command prompts for the password without recording it in shell history. The login cannot read `api_keys` or `usage_logs`; it can only execute `sub2api_tg_bot_api.usage(text)`.
+
+If PostgreSQL is not reachable from the host, publish it on loopback only, for example in Compose:
+
+```yaml
+ports:
+  - "127.0.0.1:5432:5432"
+```
+
+Never expose PostgreSQL port `5432` publicly.
+
+When upgrading from the legacy Docker-backed runtime, create the function and login above, install `postgresql-client`, verify loopback connectivity, and then rerun the installer. The new service needs no Docker access; do not add the `sub2api-tg-bot` system user to the `docker` group.
 
 ## Configuration
 
@@ -270,6 +336,7 @@ The installer will ask for:
 - Telegram Bot Token
 - Telegram user ID to bind
 - Sub2API key name
+- Password for the restricted `sub2api_tg_bot` PostgreSQL login
 - Public webhook URL
 
 It will install the bot, generate config/env files, create a systemd service, start it, and print an Nginx reverse proxy example.
@@ -281,6 +348,7 @@ sudo env \
   TELEGRAM_BOT_TOKEN="123456:replace_me" \
   TELEGRAM_USER_ID="123456789" \
   SUB2API_KEY_NAME="example-key-name" \
+  PGPASSWORD="replace_with_restricted_database_password" \
   PUBLIC_WEBHOOK_URL="https://example.com/tg-sub2api-bot/replace_me" \
   NON_INTERACTIVE=1 \
   bash ./install.sh
@@ -290,11 +358,15 @@ Copy examples and edit them for your environment:
 
 ```bash
 sudo mkdir -p /opt/sub2api-tg-bot /etc
-sudo install -d -m 0700 /var/lib/sub2api-tg-bot
+sudo groupadd --system sub2api-tg-bot
+sudo useradd --system --gid sub2api-tg-bot --home-dir /nonexistent --shell /usr/sbin/nologin sub2api-tg-bot
+sudo install -d -o sub2api-tg-bot -g sub2api-tg-bot -m 0700 /var/lib/sub2api-tg-bot
 sudo cp sub2api_tg_bot.py /opt/sub2api-tg-bot/
 sudo cp config.example.json /opt/sub2api-tg-bot/config.json
 sudo cp .env.example /etc/sub2api-tg-bot.env
-sudo chmod 600 /etc/sub2api-tg-bot.env /opt/sub2api-tg-bot/config.json
+sudo chown root:sub2api-tg-bot /opt/sub2api-tg-bot/config.json
+sudo chmod 600 /etc/sub2api-tg-bot.env
+sudo chmod 640 /opt/sub2api-tg-bot/config.json
 ```
 
 Example `config.json`:
@@ -322,6 +394,13 @@ LISTEN_PORT=8099
 ALERT_CHECK_INTERVAL=600
 ALERT_STATE_PATH=/var/lib/sub2api-tg-bot/alert_state.json
 SUB2API_TG_BOT_CONFIG=/opt/sub2api-tg-bot/config.json
+PSQL_BIN=/usr/bin/psql
+PGHOST=127.0.0.1
+PGPORT=5432
+PGDATABASE=sub2api
+PGUSER=sub2api_tg_bot
+PGPASSWORD=replace_with_the_restricted_role_password
+PGSSLMODE=prefer
 MAX_WEBHOOK_BODY=65536
 WEBHOOK_WORKERS=4
 WEBHOOK_MAX_PENDING=16

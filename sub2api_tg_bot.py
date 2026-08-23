@@ -24,6 +24,13 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
 ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
 ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
 PUBLIC_WEBHOOK_URL = os.environ.get("PUBLIC_WEBHOOK_URL", "").strip()
+PSQL_BIN = os.environ.get("PSQL_BIN", "/usr/bin/psql").strip()
+PGHOST = os.environ.get("PGHOST", "127.0.0.1").strip()
+PGPORT = os.environ.get("PGPORT", "5432").strip()
+PGDATABASE = os.environ.get("PGDATABASE", "sub2api").strip()
+PGUSER = os.environ.get("PGUSER", "sub2api_tg_bot").strip()
+PGPASSWORD = os.environ.get("PGPASSWORD", "")
+PGSSLMODE = os.environ.get("PGSSLMODE", "prefer").strip()
 MAX_WEBHOOK_BODY = int(os.environ.get("MAX_WEBHOOK_BODY", "65536"))
 WEBHOOK_WORKERS = int(os.environ.get("WEBHOOK_WORKERS", "4"))
 WEBHOOK_MAX_PENDING = int(os.environ.get("WEBHOOK_MAX_PENDING", "16"))
@@ -32,6 +39,8 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 KEY_NAME_RE = re.compile(r"^[\w .:@+-]{1,100}$")
 WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 WEBHOOK_PATH_RE = re.compile(r"^/[A-Za-z0-9/_-]{16,256}$")
+PG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,62}$")
+PSQL_VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_CHECK_BY_USER = {}
 
@@ -46,7 +55,7 @@ def masked_id(value):
 
 
 def validate_runtime_config():
-    if not TOKEN or ":" not in TOKEN:
+    if not TOKEN or ":" not in TOKEN or "replace_me" in TOKEN.lower():
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing or invalid")
     if not WEBHOOK_SECRET_RE.fullmatch(WEBHOOK_SECRET) or "replace_me" in WEBHOOK_SECRET.lower():
         raise RuntimeError("WEBHOOK_SECRET must be a random 32-256 character A-Z/a-z/0-9/_/- value")
@@ -71,6 +80,20 @@ def validate_runtime_config():
         raise RuntimeError("WEBHOOK_MAX_PENDING must be between WEBHOOK_WORKERS and 256")
     if not 1 <= CHECK_COOLDOWN <= 3600:
         raise RuntimeError("CHECK_COOLDOWN must be between 1 and 3600 seconds")
+    if not os.path.isabs(PSQL_BIN) or not os.path.isfile(PSQL_BIN) or not os.access(PSQL_BIN, os.X_OK):
+        raise RuntimeError("PSQL_BIN must point to an executable psql client")
+    if not PGHOST or any(char in PGHOST for char in "\r\n\0"):
+        raise RuntimeError("PGHOST is missing or invalid")
+    if not PGPORT.isdigit() or not 1 <= int(PGPORT) <= 65535:
+        raise RuntimeError("PGPORT must be between 1 and 65535")
+    if not PG_NAME_RE.fullmatch(PGDATABASE) or not PG_NAME_RE.fullmatch(PGUSER):
+        raise RuntimeError("PGDATABASE and PGUSER contain invalid characters")
+    if not PGPASSWORD or "replace_me" in PGPASSWORD.lower() or any(char in PGPASSWORD for char in "\r\n\0"):
+        raise RuntimeError("PGPASSWORD must contain the read-only bot database password")
+    if PGSSLMODE not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+        raise RuntimeError("PGSSLMODE is invalid")
+    if PGHOST not in {"127.0.0.1", "::1", "localhost"} and not PGHOST.startswith("/") and PGSSLMODE not in {"require", "verify-ca", "verify-full"}:
+        raise RuntimeError("Remote PostgreSQL connections must use PGSSLMODE=require, verify-ca, or verify-full")
 
 
 def load_config():
@@ -90,13 +113,30 @@ def tg(method, params=None, timeout=10):
     return payload.get("result")
 
 
-def sql_quote(value):
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def run_psql_json(sql):
-    cmd = ["docker", "exec", "sub2api-postgres", "psql", "-U", "sub2api", "-d", "sub2api", "-tAX", "-c", sql]
-    out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, timeout=10).strip()
+def run_psql_json(sql, variables=None):
+    cmd = [PSQL_BIN, "-X", "--set=ON_ERROR_STOP=1", "-tAX"]
+    for name, value in sorted((variables or {}).items()):
+        if not PSQL_VARIABLE_RE.fullmatch(name):
+            raise ValueError("Invalid psql variable name")
+        cmd.append(f"--set={name}={value}")
+    cmd.extend(["--command", sql])
+    env = {
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PGAPPNAME": "sub2api-tg-bot",
+        "PGCLIENTENCODING": "UTF8",
+        "PGCONNECT_TIMEOUT": "5",
+        "PGDATABASE": PGDATABASE,
+        "PGHOST": PGHOST,
+        "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000",
+        "PGPASSFILE": "/dev/null",
+        "PGPASSWORD": PGPASSWORD,
+        "PGPORT": PGPORT,
+        "PGSSLMODE": PGSSLMODE,
+        "PGUSER": PGUSER,
+    }
+    out = subprocess.check_output(cmd, env=env, encoding="utf-8", stderr=subprocess.STDOUT, timeout=12).strip()
     if not out:
         return None
     return json.loads(out)
@@ -124,52 +164,8 @@ def num(v):
 def query_key_usage(key_name):
     if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
         raise ValueError("Invalid key name in binding config")
-    q = sql_quote(key_name)
-    sql = f"""
-WITH k AS (
-  SELECT id, name, status, quota, quota_used,
-         rate_limit_5h, rate_limit_1d, rate_limit_7d,
-         usage_5h, usage_1d, usage_7d,
-         window_5h_start, window_1d_start, window_7d_start,
-         last_used_at, created_at, expires_at
-  FROM api_keys
-  WHERE name = {q} AND deleted_at IS NULL
-  ORDER BY id ASC
-  LIMIT 1
-), agg_all AS (
-  SELECT count(*)::bigint requests,
-         coalesce(sum(input_tokens),0)::bigint input_tokens,
-         coalesce(sum(output_tokens),0)::bigint output_tokens,
-         coalesce(sum(cache_creation_tokens),0)::bigint cache_creation_tokens,
-         coalesce(sum(cache_read_tokens),0)::bigint cache_read_tokens,
-         coalesce(sum(actual_cost),0)::numeric(20,10) actual_cost
-  FROM usage_logs WHERE api_key_id = (SELECT id FROM k)
-), agg_today AS (
-  SELECT count(*)::bigint requests,
-         coalesce(sum(input_tokens),0)::bigint input_tokens,
-         coalesce(sum(output_tokens),0)::bigint output_tokens,
-         coalesce(sum(actual_cost),0)::numeric(20,10) actual_cost
-  FROM usage_logs
-  WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
-), models AS (
-  SELECT coalesce(nullif(requested_model,''), model) model,
-         count(*)::bigint requests,
-         coalesce(sum(actual_cost),0)::numeric(20,10) actual_cost
-  FROM usage_logs
-  WHERE api_key_id = (SELECT id FROM k)
-  GROUP BY 1
-  ORDER BY requests DESC, actual_cost DESC
-  LIMIT 5
-)
-SELECT json_build_object(
-  'key', (SELECT row_to_json(k) FROM k),
-  'all', (SELECT row_to_json(agg_all) FROM agg_all),
-  'today', (SELECT row_to_json(agg_today) FROM agg_today),
-  'models', coalesce((SELECT json_agg(models) FROM models), '[]'::json)
-)::text;
-"""
-    return run_psql_json(sql)
+    sql = "SELECT sub2api_tg_bot_api.usage(:'key_name')::text;"
+    return run_psql_json(sql, {"key_name": key_name})
 
 
 def load_alert_state():
