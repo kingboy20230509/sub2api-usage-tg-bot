@@ -2,6 +2,7 @@
 .env
 *.env
 config.json
+alert_state.json
 *.bak
 *.log
 

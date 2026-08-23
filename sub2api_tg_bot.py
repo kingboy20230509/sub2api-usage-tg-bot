@@ -3,6 +3,7 @@ import json
 import os
 import re
 import signal
+import threading
 import subprocess
 import sys
 import time
@@ -18,6 +19,8 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/tg-sub2api-bot").strip()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
+ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
+ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
 PUBLIC_WEBHOOK_URL = os.environ.get("PUBLIC_WEBHOOK_URL", "").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
 KEY_NAME_RE = re.compile(r"^[\w .:@+-]{1,100}$")
@@ -80,6 +83,7 @@ WITH k AS (
   SELECT id, name, status, quota, quota_used,
          rate_limit_5h, rate_limit_1d, rate_limit_7d,
          usage_5h, usage_1d, usage_7d,
+         window_5h_start, window_1d_start, window_7d_start,
          last_used_at, created_at, expires_at
   FROM api_keys
   WHERE name = {q} AND deleted_at IS NULL
@@ -119,6 +123,71 @@ SELECT json_build_object(
 )::text;
 """
     return run_psql_json(sql)
+
+
+def load_alert_state():
+    try:
+        with open(ALERT_STATE_PATH, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"alert state load failed: {e}", file=sys.stderr, flush=True)
+        return {}
+
+
+def save_alert_state(state):
+    tmp = ALERT_STATE_PATH + ".tmp"
+    os.makedirs(os.path.dirname(ALERT_STATE_PATH) or ".", exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ALERT_STATE_PATH)
+
+
+def check_weekly_alerts():
+    try:
+        cfg = load_config()
+        bindings = cfg.get("bindings") or {}
+        state = load_alert_state()
+        changed = False
+        for user_id, key_name in bindings.items():
+            try:
+                data = query_key_usage(key_name) or {}
+                key = data.get("key") or {}
+                limit = dec(key.get("rate_limit_7d"))
+                used = dec(key.get("usage_7d"))
+                if limit <= 0:
+                    continue
+                remaining = limit - used
+                ratio = remaining / limit
+                window = str(key.get("window_7d_start") or "unknown")
+                state_key = f"{user_id}:{key_name}:{window}"
+                if ratio <= Decimal("0.20") and state_key not in state:
+                    text = (
+                        f"⚠️ 周限额提醒\n"
+                        f"Key：{key_name}\n"
+                        f"周限额：{money(limit)}\n"
+                        f"已用：{money(used)}\n"
+                        f"剩余：{money(max(remaining, Decimal('0')))}（{money(max(ratio, Decimal('0')) * 100)}%）"
+                    )
+                    tg("sendMessage", {"chat_id": user_id, "text": text})
+                    state[state_key] = {"alerted_at": time.time()}
+                    changed = True
+                    print(f"weekly alert sent user={user_id} key={key_name} remaining={ratio:.4f}", flush=True)
+            except Exception as e:
+                print(f"weekly alert check failed user={user_id} key={key_name}: {e}", file=sys.stderr, flush=True)
+        if changed:
+            save_alert_state(state)
+    except Exception as e:
+        print(f"weekly alert scan failed: {e}", file=sys.stderr, flush=True)
+
+
+def alert_loop():
+    time.sleep(10)
+    while True:
+        check_weekly_alerts()
+        time.sleep(max(ALERT_CHECK_INTERVAL, 60))
 
 
 def format_usage(key_name, data):
@@ -244,6 +313,7 @@ def main():
     if PUBLIC_WEBHOOK_URL:
         tg("setWebhook", {"url": PUBLIC_WEBHOOK_URL, "secret_token": WEBHOOK_SECRET, "allowed_updates": json.dumps(["message"])})
     print(f"sub2api tg bot webhook started on {LISTEN_HOST}:{LISTEN_PORT}{WEBHOOK_PATH}", flush=True)
+    threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     httpd.serve_forever()
 

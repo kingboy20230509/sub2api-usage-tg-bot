@@ -12,6 +12,7 @@ A small Telegram bot for checking Sub2API API key usage from Telegram.
 
 - Telegram 用户发送 `/check`，查询自己绑定的 Sub2API key 用量。
 - 同时显示 5 小时、日、周限额，以及对应已用量和剩余额度；未设置的限制显示为“不限”。
+- 后台定时检查周限额，剩余不超过 20% 时主动通知绑定的 Telegram 用户；同一周窗口只提醒一次。
 - 支持 Telegram webhook 模式，可配置 webhook secret token。
 - 使用 JSON 文件维护「Telegram 用户 ID → Sub2API key 名称」绑定关系。
 - 通过 Docker 容器 `sub2api-postgres` 查询 Sub2API 的 PostgreSQL 数据库。
@@ -76,6 +77,7 @@ sudo bash /tmp/sub2api-tg-bot-install.sh
 - 生成 `/opt/sub2api-tg-bot/config.json`
 - 生成 `/etc/sub2api-tg-bot.env`
 - 生成并启用 `sub2api-tg-bot.service`
+- 开启周限额后台巡检（默认每 10 分钟）
 - 输出 Nginx 反代示例
 
 也可以用环境变量非交互安装：
@@ -121,6 +123,8 @@ PUBLIC_WEBHOOK_URL=https://example.com/tg-sub2api-bot/replace_me
 WEBHOOK_PATH=/tg-sub2api-bot/replace_me
 LISTEN_HOST=127.0.0.1
 LISTEN_PORT=8099
+ALERT_CHECK_INTERVAL=600
+ALERT_STATE_PATH=/opt/sub2api-tg-bot/alert_state.json
 SUB2API_TG_BOT_CONFIG=/opt/sub2api-tg-bot/config.json
 ```
 
@@ -181,6 +185,7 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
 
 - `/check` returns usage for the Telegram user’s bound Sub2API key.
 - Shows configured 5-hour, daily, and weekly limits, current usage, and remaining allowance.
+- Periodically checks weekly limits and proactively notifies the bound Telegram user when 20% or less remains; one alert per weekly window.
 - Webhook mode with optional Telegram webhook secret token.
 - Reads bindings from a JSON config file.
 - Queries the Sub2API PostgreSQL database through the `sub2api-postgres` Docker container.
@@ -282,6 +287,8 @@ PUBLIC_WEBHOOK_URL=https://example.com/tg-sub2api-bot/replace_me
 WEBHOOK_PATH=/tg-sub2api-bot/replace_me
 LISTEN_HOST=127.0.0.1
 LISTEN_PORT=8099
+ALERT_CHECK_INTERVAL=600
+ALERT_STATE_PATH=/opt/sub2api-tg-bot/alert_state.json
 SUB2API_TG_BOT_CONFIG=/opt/sub2api-tg-bot/config.json
 ```
 
