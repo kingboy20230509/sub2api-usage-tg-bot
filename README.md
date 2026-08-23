@@ -53,6 +53,43 @@ A small Telegram bot for checking Sub2API API key usage from Telegram.
 
 ### 安装
 
+### 一键安装
+
+在服务器上执行：
+
+```bash
+curl -fsSLo /tmp/sub2api-tg-bot-install.sh https://raw.githubusercontent.com/chainfix/sub2api-usage-tg-bot/main/install.sh
+sudo bash /tmp/sub2api-tg-bot-install.sh
+```
+
+脚本会交互式询问：
+
+- Telegram Bot Token
+- 要绑定的 Telegram 用户 ID
+- 对应的 Sub2API key 名称
+- 公开 webhook URL
+
+安装脚本会自动完成：
+
+- 下载 `sub2api_tg_bot.py` 到 `/opt/sub2api-tg-bot/`
+- 生成 `/opt/sub2api-tg-bot/config.json`
+- 生成 `/etc/sub2api-tg-bot.env`
+- 生成并启用 `sub2api-tg-bot.service`
+- 输出 Nginx 反代示例
+
+也可以用环境变量非交互安装：
+
+```bash
+curl -fsSLo /tmp/sub2api-tg-bot-install.sh https://raw.githubusercontent.com/chainfix/sub2api-usage-tg-bot/main/install.sh
+sudo env \
+  TELEGRAM_BOT_TOKEN="123456:replace_me" \
+  TELEGRAM_USER_ID="123456789" \
+  SUB2API_KEY_NAME="example-key-name" \
+  PUBLIC_WEBHOOK_URL="https://example.com/tg-sub2api-bot/replace_me" \
+  NON_INTERACTIVE=1 \
+  bash /tmp/sub2api-tg-bot-install.sh
+```
+
 ```bash
 sudo mkdir -p /opt/sub2api-tg-bot /etc
 sudo cp sub2api_tg_bot.py /opt/sub2api-tg-bot/
@@ -179,6 +216,37 @@ This repository includes only example config files.
 - `sub2api-tg-bot.service.example` — example systemd unit
 
 ## Configuration
+
+## One-line install
+
+Run this on your server:
+
+```bash
+curl -fsSLo /tmp/sub2api-tg-bot-install.sh https://raw.githubusercontent.com/chainfix/sub2api-usage-tg-bot/main/install.sh
+sudo bash /tmp/sub2api-tg-bot-install.sh
+```
+
+The installer will ask for:
+
+- Telegram Bot Token
+- Telegram user ID to bind
+- Sub2API key name
+- Public webhook URL
+
+It will install the bot, generate config/env files, create a systemd service, start it, and print an Nginx reverse proxy example.
+
+For non-interactive install:
+
+```bash
+curl -fsSLo /tmp/sub2api-tg-bot-install.sh https://raw.githubusercontent.com/chainfix/sub2api-usage-tg-bot/main/install.sh
+sudo env \
+  TELEGRAM_BOT_TOKEN="123456:replace_me" \
+  TELEGRAM_USER_ID="123456789" \
+  SUB2API_KEY_NAME="example-key-name" \
+  PUBLIC_WEBHOOK_URL="https://example.com/tg-sub2api-bot/replace_me" \
+  NON_INTERACTIVE=1 \
+  bash /tmp/sub2api-tg-bot-install.sh
+```
 
 Copy examples and edit them for your environment:
 
