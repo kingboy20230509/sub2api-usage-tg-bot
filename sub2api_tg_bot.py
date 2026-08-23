@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import hmac
 import os
 import re
 import signal
@@ -9,6 +10,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -22,8 +24,53 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
 ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
 ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
 PUBLIC_WEBHOOK_URL = os.environ.get("PUBLIC_WEBHOOK_URL", "").strip()
+MAX_WEBHOOK_BODY = int(os.environ.get("MAX_WEBHOOK_BODY", "65536"))
+WEBHOOK_WORKERS = int(os.environ.get("WEBHOOK_WORKERS", "4"))
+WEBHOOK_MAX_PENDING = int(os.environ.get("WEBHOOK_MAX_PENDING", "16"))
+CHECK_COOLDOWN = int(os.environ.get("CHECK_COOLDOWN", "10"))
 API = f"https://api.telegram.org/bot{TOKEN}"
 KEY_NAME_RE = re.compile(r"^[\w .:@+-]{1,100}$")
+WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+WEBHOOK_PATH_RE = re.compile(r"^/[A-Za-z0-9/_-]{16,256}$")
+_RATE_LIMIT_LOCK = threading.Lock()
+_LAST_CHECK_BY_USER = {}
+
+
+def log_failure(event, error):
+    print(f"{event} failed error={type(error).__name__}", file=sys.stderr, flush=True)
+
+
+def masked_id(value):
+    value = str(value or "")
+    return "***" + value[-4:] if value else "unknown"
+
+
+def validate_runtime_config():
+    if not TOKEN or ":" not in TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing or invalid")
+    if not WEBHOOK_SECRET_RE.fullmatch(WEBHOOK_SECRET) or "replace_me" in WEBHOOK_SECRET.lower():
+        raise RuntimeError("WEBHOOK_SECRET must be a random 32-256 character A-Z/a-z/0-9/_/- value")
+    if not WEBHOOK_PATH_RE.fullmatch(WEBHOOK_PATH) or WEBHOOK_PATH == "/tg-sub2api-bot":
+        raise RuntimeError("WEBHOOK_PATH must contain a long, unguessable path")
+    parsed = urllib.parse.urlsplit(PUBLIC_WEBHOOK_URL)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != WEBHOOK_PATH
+    ):
+        raise RuntimeError("PUBLIC_WEBHOOK_URL must be an HTTPS URL whose path exactly matches WEBHOOK_PATH")
+    if not 1024 <= MAX_WEBHOOK_BODY <= 1048576:
+        raise RuntimeError("MAX_WEBHOOK_BODY must be between 1024 and 1048576")
+    if not 1 <= WEBHOOK_WORKERS <= 32:
+        raise RuntimeError("WEBHOOK_WORKERS must be between 1 and 32")
+    if not WEBHOOK_WORKERS <= WEBHOOK_MAX_PENDING <= 256:
+        raise RuntimeError("WEBHOOK_MAX_PENDING must be between WEBHOOK_WORKERS and 256")
+    if not 1 <= CHECK_COOLDOWN <= 3600:
+        raise RuntimeError("CHECK_COOLDOWN must be between 1 and 3600 seconds")
 
 
 def load_config():
@@ -75,7 +122,7 @@ def num(v):
 
 
 def query_key_usage(key_name):
-    if not KEY_NAME_RE.match(key_name):
+    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
         raise ValueError("Invalid key name in binding config")
     q = sql_quote(key_name)
     sql = f"""
@@ -133,16 +180,21 @@ def load_alert_state():
     except FileNotFoundError:
         return {}
     except Exception as e:
-        print(f"alert state load failed: {e}", file=sys.stderr, flush=True)
+        log_failure("alert state load", e)
         return {}
 
 
 def save_alert_state(state):
     tmp = ALERT_STATE_PATH + ".tmp"
     os.makedirs(os.path.dirname(ALERT_STATE_PATH) or ".", exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, ALERT_STATE_PATH)
+    os.chmod(ALERT_STATE_PATH, 0o600)
 
 
 def check_weekly_alerts():
@@ -174,13 +226,13 @@ def check_weekly_alerts():
                     tg("sendMessage", {"chat_id": user_id, "text": text})
                     state[state_key] = {"alerted_at": time.time()}
                     changed = True
-                    print(f"weekly alert sent user={user_id} key={key_name} remaining={ratio:.4f}", flush=True)
+                    print(f"weekly alert sent user={masked_id(user_id)} remaining={ratio:.4f}", flush=True)
             except Exception as e:
-                print(f"weekly alert check failed user={user_id} key={key_name}: {e}", file=sys.stderr, flush=True)
+                log_failure(f"weekly alert check user={masked_id(user_id)}", e)
         if changed:
             save_alert_state(state)
     except Exception as e:
-        print(f"weekly alert scan failed: {e}", file=sys.stderr, flush=True)
+        log_failure("weekly alert scan", e)
 
 
 def alert_loop():
@@ -231,6 +283,27 @@ def format_usage(key_name, data):
     return "\n".join(lines)
 
 
+def is_private_user_chat(chat, user):
+    chat_id = chat.get("id")
+    user_id = user.get("id")
+    return chat.get("type") == "private" and chat_id is not None and str(chat_id) == str(user_id)
+
+
+def allow_check(user_id, now=None):
+    now = time.monotonic() if now is None else now
+    with _RATE_LIMIT_LOCK:
+        last = _LAST_CHECK_BY_USER.get(user_id)
+        if last is not None and now - last < CHECK_COOLDOWN:
+            return False, max(1, int(CHECK_COOLDOWN - (now - last) + 0.999))
+        _LAST_CHECK_BY_USER[user_id] = now
+        if len(_LAST_CHECK_BY_USER) > 4096:
+            cutoff = now - max(CHECK_COOLDOWN * 2, 60)
+            stale = [key for key, value in _LAST_CHECK_BY_USER.items() if value < cutoff]
+            for key in stale:
+                _LAST_CHECK_BY_USER.pop(key, None)
+        return True, 0
+
+
 def handle_message(msg):
     chat = msg.get("chat", {})
     user = msg.get("from", {})
@@ -239,12 +312,18 @@ def handle_message(msg):
     user_id = str(user.get("id"))
     if not chat_id or not text_in:
         return
-    print(f"received chat={chat_id} user={user_id} text={text_in!r}", flush=True)
     cmd = text_in.split()[0].split("@", 1)[0].lower()
+    if cmd not in ("/start", "/check"):
+        return
+    if not is_private_user_chat(chat, user):
+        tg("sendMessage", {"chat_id": chat_id, "text": "为保护用量信息，请私聊机器人查询。"})
+        return
     if cmd == "/start":
         tg("sendMessage", {"chat_id": chat_id, "text": "发送 /check 查询你绑定的 Sub2API key 用量。"})
         return
-    if cmd != "/check":
+    allowed, retry_after = allow_check(user_id)
+    if not allowed:
+        tg("sendMessage", {"chat_id": chat_id, "text": f"查询过于频繁，请 {retry_after} 秒后再试。"})
         return
     cfg = load_config()
     key_name = (cfg.get("bindings") or {}).get(user_id)
@@ -259,50 +338,130 @@ def handle_message(msg):
         t2 = time.perf_counter()
         tg("sendMessage", {"chat_id": chat_id, "text": reply})
         t3 = time.perf_counter()
-        print(f"check timing user={user_id} key={key_name} query={t1-t0:.3f}s format={t2-t1:.3f}s send={t3-t2:.3f}s total={t3-t0:.3f}s", flush=True)
+        print(f"check completed user={masked_id(user_id)} query={t1-t0:.3f}s format={t2-t1:.3f}s send={t3-t2:.3f}s total={t3-t0:.3f}s", flush=True)
     except Exception as e:
-        print(f"check failed user={user_id}: {e}", file=sys.stderr, flush=True)
+        log_failure(f"check user={masked_id(user_id)}", e)
         tg("sendMessage", {"chat_id": chat_id, "text": "查询失败，请稍后再试。"})
 
 
+class UpdateDispatcher:
+    def __init__(self, workers, max_pending):
+        self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="telegram-update")
+        self.slots = threading.BoundedSemaphore(max_pending)
+        self.seen_lock = threading.Lock()
+        self.seen_updates = {}
+
+    def submit(self, update_id, message):
+        now = time.monotonic()
+        with self.seen_lock:
+            cutoff = now - 86400
+            stale = [key for key, value in self.seen_updates.items() if value < cutoff]
+            for key in stale:
+                self.seen_updates.pop(key, None)
+            if update_id in self.seen_updates:
+                return "duplicate"
+            if len(self.seen_updates) >= 4096:
+                oldest = min(self.seen_updates, key=self.seen_updates.get)
+                self.seen_updates.pop(oldest, None)
+            if not self.slots.acquire(blocking=False):
+                return "busy"
+            self.seen_updates[update_id] = now
+        try:
+            future = self.executor.submit(handle_message, message)
+        except Exception:
+            with self.seen_lock:
+                self.seen_updates.pop(update_id, None)
+            self.slots.release()
+            raise
+        future.add_done_callback(self._completed)
+        return "accepted"
+
+    def _completed(self, future):
+        self.slots.release()
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error is not None:
+            log_failure("webhook update", error)
+
+    def shutdown(self):
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Sub2ApiTgBot/1.0"
+    server_version = "Sub2ApiTgBot/1.1"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
+    def respond(self, status, body=b""):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
 
     def do_GET(self):
         if self.path == "/health":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
+            self.respond(200, b"ok")
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.respond(404)
 
     def do_POST(self):
         if self.path != WEBHOOK_PATH:
-            self.send_response(404)
-            self.end_headers()
+            self.respond(404)
             return
-        if WEBHOOK_SECRET and self.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            self.send_response(403)
-            self.end_headers()
+        supplied_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(supplied_secret.encode("utf-8"), WEBHOOK_SECRET.encode("ascii")):
+            self.respond(403)
             return
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(min(length, 1048576))
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self.respond(415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except (TypeError, ValueError):
+            self.respond(400)
+            return
+        if length <= 0:
+            self.respond(400)
+            return
+        if length > MAX_WEBHOOK_BODY:
+            self.respond(413)
+            return
+        try:
+            body = self.rfile.read(length)
+        except (OSError, TimeoutError):
+            self.respond(408)
+            return
         try:
             upd = json.loads(body.decode("utf-8"))
-            if "message" in upd:
-                handle_message(upd["message"])
-        except Exception as e:
-            print(f"webhook update failed: {e}", file=sys.stderr, flush=True)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.respond(400)
+            return
+        if not isinstance(upd, dict) or type(upd.get("update_id")) is not int:
+            self.respond(400)
+            return
+        message = upd.get("message")
+        if not isinstance(message, dict):
+            self.respond(200, b"ok")
+            return
+        result = self.server.dispatcher.submit(upd["update_id"], message)
+        if result == "busy":
+            self.respond(503)
+            return
+        self.respond(200, b"ok")
 
     def log_message(self, fmt, *args):
         return
 
 
 def main():
+    validate_runtime_config()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     tg("deleteWebhook", {"drop_pending_updates": "false"})
@@ -310,12 +469,17 @@ def main():
         {"command": "check", "description": "查询绑定 key 的用量"},
         {"command": "start", "description": "使用说明"},
     ], ensure_ascii=False)})
-    if PUBLIC_WEBHOOK_URL:
-        tg("setWebhook", {"url": PUBLIC_WEBHOOK_URL, "secret_token": WEBHOOK_SECRET, "allowed_updates": json.dumps(["message"])})
+    tg("setWebhook", {"url": PUBLIC_WEBHOOK_URL, "secret_token": WEBHOOK_SECRET, "allowed_updates": json.dumps(["message"])})
     print(f"sub2api tg bot webhook started on {LISTEN_HOST}:{LISTEN_PORT}{WEBHOOK_PATH}", flush=True)
     threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    httpd.serve_forever()
+    httpd.daemon_threads = True
+    httpd.dispatcher = UpdateDispatcher(WEBHOOK_WORKERS, WEBHOOK_MAX_PENDING)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        httpd.dispatcher.shutdown()
 
 
 if __name__ == "__main__":
