@@ -1,0 +1,17 @@
+# Secrets / real runtime config
+.env
+*.env
+config.json
+*.bak
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,6 @@
+{
+  "bindings": {
+    "123456789": "example-key-name"
+  },
+  "timezone": "Asia/Shanghai"
+}
