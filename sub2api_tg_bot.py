@@ -14,10 +14,30 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
+def read_secret(name):
+    value = os.environ.get(name, "")
+    file_path = os.environ.get(f"{name}_FILE", "").strip()
+    if value and file_path:
+        raise RuntimeError(f"Set only one of {name} or {name}_FILE")
+    if not file_path:
+        return value
+    if not os.path.isabs(file_path):
+        raise RuntimeError(f"{name}_FILE must be an absolute path")
+    try:
+        with open(file_path, "r", encoding="utf-8") as secret_file:
+            value = secret_file.read(4097)
+    except OSError as error:
+        raise RuntimeError(f"Unable to read {name}_FILE") from error
+    if len(value) > 4096:
+        raise RuntimeError(f"{name}_FILE is too large")
+    return value.rstrip("\r\n")
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("SUB2API_TG_BOT_CONFIG", os.path.join(BASE_DIR, "config.json"))
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+TOKEN = read_secret("TELEGRAM_BOT_TOKEN").strip()
+WEBHOOK_SECRET = read_secret("WEBHOOK_SECRET").strip()
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/tg-sub2api-bot").strip()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
@@ -29,8 +49,9 @@ PGHOST = os.environ.get("PGHOST", "127.0.0.1").strip()
 PGPORT = os.environ.get("PGPORT", "5432").strip()
 PGDATABASE = os.environ.get("PGDATABASE", "sub2api").strip()
 PGUSER = os.environ.get("PGUSER", "sub2api_tg_bot").strip()
-PGPASSWORD = os.environ.get("PGPASSWORD", "")
+PGPASSWORD = read_secret("PGPASSWORD")
 PGSSLMODE = os.environ.get("PGSSLMODE", "prefer").strip()
+PG_ALLOW_INSECURE_PRIVATE_NETWORK = os.environ.get("PG_ALLOW_INSECURE_PRIVATE_NETWORK", "0").strip()
 MAX_WEBHOOK_BODY = int(os.environ.get("MAX_WEBHOOK_BODY", "65536"))
 WEBHOOK_WORKERS = int(os.environ.get("WEBHOOK_WORKERS", "4"))
 WEBHOOK_MAX_PENDING = int(os.environ.get("WEBHOOK_MAX_PENDING", "16"))
@@ -40,6 +61,7 @@ KEY_NAME_RE = re.compile(r"^[\w .:@+-]{1,100}$")
 WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 WEBHOOK_PATH_RE = re.compile(r"^/[A-Za-z0-9/_-]{16,256}$")
 PG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,62}$")
+COMPOSE_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
 PSQL_VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_CHECK_BY_USER = {}
@@ -92,8 +114,20 @@ def validate_runtime_config():
         raise RuntimeError("PGPASSWORD must contain the read-only bot database password")
     if PGSSLMODE not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
         raise RuntimeError("PGSSLMODE is invalid")
-    if PGHOST not in {"127.0.0.1", "::1", "localhost"} and not PGHOST.startswith("/") and PGSSLMODE not in {"require", "verify-ca", "verify-full"}:
-        raise RuntimeError("Remote PostgreSQL connections must use PGSSLMODE=require, verify-ca, or verify-full")
+    if PG_ALLOW_INSECURE_PRIVATE_NETWORK not in {"0", "1"}:
+        raise RuntimeError("PG_ALLOW_INSECURE_PRIVATE_NETWORK must be 0 or 1")
+    database_is_local = PGHOST in {"127.0.0.1", "::1", "localhost"} or PGHOST.startswith("/")
+    database_uses_tls = PGSSLMODE in {"require", "verify-ca", "verify-full"}
+    if not database_is_local and not database_uses_tls:
+        if (
+            PG_ALLOW_INSECURE_PRIVATE_NETWORK != "1"
+            or PGSSLMODE != "disable"
+            or not COMPOSE_SERVICE_NAME_RE.fullmatch(PGHOST)
+        ):
+            raise RuntimeError(
+                "Remote PostgreSQL must use TLS, or explicitly allow a single-label Compose service "
+                "on a trusted private network with PGSSLMODE=disable"
+            )
 
 
 def load_config():

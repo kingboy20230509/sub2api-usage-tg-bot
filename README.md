@@ -24,6 +24,7 @@ A small Telegram bot for checking Sub2API API key usage from Telegram.
 请不要把真实运行配置提交到 Git 仓库，包括：
 
 - `.env` 或 `/etc/sub2api-tg-bot.env`
+- `secrets/` 目录
 - `config.json`
 - Telegram Bot Token
 - webhook secret
@@ -34,22 +35,27 @@ A small Telegram bot for checking Sub2API API key usage from Telegram.
 本仓库只提供示例配置文件：
 
 - `.env.example`
+- `.env.docker.example`
 - `config.example.json`
+- `compose.example.yaml`
 - `sub2api-tg-bot.service.example`
 
 ### 环境要求
 
-- Python 3.10+
-- PostgreSQL `psql` 客户端（Debian/Ubuntu 软件包：`postgresql-client`）
-- 主机可以通过回环地址或 Unix socket 访问 Sub2API PostgreSQL
+- 推荐：Docker Engine 和 Docker Compose v2
+- systemd 部署：Python 3.10+ 和 PostgreSQL `psql` 客户端
 - 数据库所有者需要先运行 `deploy/create_readonly_role.sql`
 - 如果使用 webhook，需要 Nginx/Caddy 等反向代理和 HTTPS 域名
 
 ### 文件说明
 
 - `sub2api_tg_bot.py`：bot 主程序
+- `Dockerfile`：非 root 生产镜像
+- `compose.example.yaml`：合并到现有 Sub2API Compose 的安全示例
+- `docker-healthcheck.py`：容器存活检查
 - `config.example.json`：绑定配置示例
 - `.env.example`：环境变量示例
+- `.env.docker.example`：Docker 非敏感环境变量示例
 - `sub2api-tg-bot.service.example`：systemd 服务示例
 - `deploy/create_readonly_role.sql`：创建受限登录和固定查询函数
 
@@ -69,7 +75,7 @@ docker exec -it sub2api-postgres \
 
 第二条命令会安全地提示输入密码，不会把密码写进命令历史。该账号没有 `api_keys` 或 `usage_logs` 的表读取权限，只能执行 `sub2api_tg_bot_api.usage(text)`。
 
-如果 PostgreSQL 容器尚未向主机开放端口，只绑定到回环地址，例如在 Compose 中配置：
+Docker 部署不需要发布 PostgreSQL 端口。只有 systemd 部署确实需要从宿主机访问数据库时，才将它绑定到回环地址，例如：
 
 ```yaml
 ports:
@@ -80,9 +86,78 @@ ports:
 
 从旧版升级时，先创建上述数据库函数和账号、安装 `postgresql-client`、确认回环连接可用，再重新运行安装脚本。新版服务不再需要 Docker 权限；不要把 `sub2api-tg-bot` 系统用户加入 `docker` 组。
 
-### 安装
+### Docker Compose 部署（推荐）
 
-### 安全安装
+机器人镜像已经包含 Python 和 `psql`。容器以 UID/GID `10001` 运行，根文件系统只读，删除全部 Linux capabilities，不挂载 Docker Socket，也不发布宿主机端口。
+
+先准备配置与 Docker secrets：
+
+```bash
+cp config.example.json config.json
+mkdir -m 700 secrets
+printf '%s' '123456789:替换为BotFather提供的Token' > secrets/telegram_bot_token
+openssl rand -hex 32 > secrets/webhook_secret
+printf '%s' '替换为受限数据库账号密码' > secrets/postgres_password
+chmod 600 .env secrets/*
+sudo chown 10001:10001 config.json
+sudo chmod 600 config.json
+```
+
+如果现有 Compose 项目已经有 `.env`，把 `.env.docker.example` 中以 `SUB2API_TG_BOT_` 开头的变量合并进去，不要覆盖原文件；新项目才直接复制为 `.env`。bot 服务只接收这些明确列出的变量，不会继承 Sub2API 的管理员数据库凭据。编辑 `config.json`，把 Telegram 用户 ID 绑定到对应的 `api_keys.name`。编辑 `.env` 时注意：
+
+- `PUBLIC_WEBHOOK_URL` 必须为 HTTPS，且路径与 `WEBHOOK_PATH` 完全一致。
+- `PGHOST` 必须等于 PostgreSQL 在同一 Compose 文件中的服务名，例如 `sub2api-postgres`。
+- 示例设置 `PGSSLMODE=disable` 和 `PG_ALLOW_INSECURE_PRIVATE_NETWORK=1`，只允许单段 Compose 服务名；必须配合隔离的内部数据库网络使用。
+
+把 `compose.example.yaml` 中的 bot 服务、三个 secret、状态卷以及网络合并进你的 Sub2API Compose。现有服务的网络关系应类似：
+
+```yaml
+services:
+  sub2api-postgres:
+    networks: [sub2api-db]
+    # 不要配置 ports
+
+  sub2api:
+    networks: [sub2api-edge, sub2api-db]
+
+  nginx:
+    networks: [sub2api-edge]
+
+  sub2api-tg-bot:
+    networks: [sub2api-edge, sub2api-db]
+
+networks:
+  sub2api-edge:
+  sub2api-db:
+    internal: true
+```
+
+如果你现有的服务名或网络名不同，修改示例而不是重复定义。PostgreSQL、Sub2API 和 bot 共享 `sub2api-db`；Nginx、Sub2API 和 bot 共享 `sub2api-edge`。bot 需要通过非内部的 `sub2api-edge` 访问 Telegram API。
+
+容器内 Nginx 反代使用服务名，不使用宿主机端口：
+
+```nginx
+location /tg-sub2api-bot/replace_me {
+    client_max_body_size 64k;
+    proxy_pass http://sub2api-tg-bot:8099/tg-sub2api-bot/replace_me;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 15s;
+    proxy_send_timeout 15s;
+}
+```
+
+构建并启动：
+
+```bash
+docker compose build --pull sub2api-tg-bot
+docker compose up -d sub2api-tg-bot
+docker compose ps sub2api-tg-bot
+docker compose logs --tail=100 sub2api-tg-bot
+```
+
+`/health` 只用于判断进程是否存活。数据库或 Telegram 暂时不可用不会把健康状态误判为进程故障。
+
+### systemd 安全安装
 
 从完整仓库安装。不要直接执行从 `main` 下载、未经检查的 root 脚本：
 
@@ -263,6 +338,7 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
 Do **not** commit real runtime files:
 
 - `.env` or `/etc/sub2api-tg-bot.env`
+- the `secrets/` directory
 - `config.json`
 - Telegram bot tokens
 - webhook secrets
@@ -274,17 +350,20 @@ This repository includes only example config files.
 
 ## Requirements
 
-- Python 3.10+
-- The PostgreSQL `psql` client (`postgresql-client` on Debian/Ubuntu)
-- Host access to Sub2API PostgreSQL through loopback or a Unix socket
+- Recommended: Docker Engine and Docker Compose v2
+- For systemd: Python 3.10+ and the PostgreSQL `psql` client
 - A database owner must first run `deploy/create_readonly_role.sql`
 - A reverse proxy such as Nginx/Caddy if using Telegram webhook mode
 
 ## Files
 
 - `sub2api_tg_bot.py` — bot program
+- `Dockerfile` — unprivileged production image
+- `compose.example.yaml` — secure fragment for an existing Sub2API Compose project
+- `docker-healthcheck.py` — container liveness check
 - `config.example.json` — example Telegram user ID to Sub2API key-name bindings
 - `.env.example` — example environment variables
+- `.env.docker.example` — non-secret Docker environment example
 - `sub2api-tg-bot.service.example` — example systemd unit
 - `deploy/create_readonly_role.sql` — restricted login and fixed query function
 
@@ -304,7 +383,7 @@ docker exec -it sub2api-postgres \
 
 The second command prompts for the password without recording it in shell history. The login cannot read `api_keys` or `usage_logs`; it can only execute `sub2api_tg_bot_api.usage(text)`.
 
-If PostgreSQL is not reachable from the host, publish it on loopback only, for example in Compose:
+Docker deployment does not need to publish PostgreSQL. Only a systemd deployment that must reach the database from the host should bind it to loopback:
 
 ```yaml
 ports:
@@ -315,9 +394,37 @@ Never expose PostgreSQL port `5432` publicly.
 
 When upgrading from the legacy Docker-backed runtime, create the function and login above, install `postgresql-client`, verify loopback connectivity, and then rerun the installer. The new service needs no Docker access; do not add the `sub2api-tg-bot` system user to the `docker` group.
 
-## Configuration
+## Docker Compose deployment (recommended)
 
-## Safe installation
+The image includes Python and `psql`. It runs as UID/GID `10001`, uses a read-only root filesystem, drops all Linux capabilities, mounts no Docker socket, and publishes no host port.
+
+Prepare configuration and file-backed Docker secrets:
+
+```bash
+cp config.example.json config.json
+mkdir -m 700 secrets
+printf '%s' '123456789:replace_with_BotFather_token' > secrets/telegram_bot_token
+openssl rand -hex 32 > secrets/webhook_secret
+printf '%s' 'replace_with_restricted_database_password' > secrets/postgres_password
+chmod 600 .env secrets/*
+sudo chown 10001:10001 config.json
+sudo chmod 600 config.json
+```
+
+Merge the namespaced `SUB2API_TG_BOT_` variables from `.env.docker.example` into an existing Compose `.env` instead of overwriting it. The bot service receives only explicitly mapped variables, so it does not inherit Sub2API administrator database credentials. Set `SUB2API_TG_BOT_PGHOST` to the PostgreSQL service name in the same Compose project. Merge the bot service, secrets, state volume, and networks from `compose.example.yaml` into the existing Sub2API Compose file. PostgreSQL, Sub2API, and the bot share the internal database network. The reverse proxy, Sub2API, and the bot share the edge network; the bot needs that non-internal network for Telegram API access. Do not publish PostgreSQL or bot ports.
+
+An Nginx container can proxy directly to `http://sub2api-tg-bot:8099`. Build and start the bot with:
+
+```bash
+docker compose build --pull sub2api-tg-bot
+docker compose up -d sub2api-tg-bot
+docker compose ps sub2api-tg-bot
+docker compose logs --tail=100 sub2api-tg-bot
+```
+
+`PG_ALLOW_INSECURE_PRIVATE_NETWORK=1` is accepted only with `PGSSLMODE=disable` and a single-label Compose service name. Use it only on the isolated `internal: true` database network shown in the example.
+
+## Safe systemd installation
 
 Install from a complete checkout. Do not execute an unreviewed root script downloaded from a floating `main` branch:
 
@@ -429,7 +536,7 @@ location /tg-sub2api-bot/replace_me {
 }
 ```
 
-## systemd
+## Start the systemd service
 
 ```bash
 sudo cp sub2api-tg-bot.service.example /etc/systemd/system/sub2api-tg-bot.service
