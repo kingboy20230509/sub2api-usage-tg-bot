@@ -180,6 +180,8 @@ class DataSafetyTests(unittest.TestCase):
                 "status": "active",
                 "quota": 100,
                 "quota_used": 25,
+                "rate_limit_5h": 100,
+                "usage_5h": 25,
                 "last_used_at": "2026-08-21T15:31:41.722896+08:00",
             },
             "today": {
@@ -218,14 +220,35 @@ class DataSafetyTests(unittest.TestCase):
             }],
         }
         output = bot.format_usage("example-key", data)
-        self.assertIn("[███░░░░░░░░░] 25%", output)
+        self.assertIn("• 5 小时：已用 25 / 限额 100 / 剩余 75", output)
+        self.assertIn("  [███░░░░░░░░░] 25%", output)
+        self.assertEqual(output.count("["), 1)
+        self.assertNotIn("💰 额度", output)
+        self.assertNotIn("总额", output)
+        self.assertIn("状态：正常", output)
         self.assertIn("2026-08-21 15:31:41", output)
         self.assertIn("今日模型 Top 5", output)
         self.assertIn("累计模型 Top 5", output)
         self.assertIn("gpt-today", output)
         self.assertIn("gpt-all", output)
-        self.assertIn("缓存：写入 3 / 读取 4", output)
+        self.assertIn("缓存占比：读取 23.53%｜写入 17.65%", output)
         self.assertLess(len(output), 4096)
+
+    def test_numbers_use_at_most_two_decimal_places(self):
+        self.assertEqual(bot.money("0.000468"), "0")
+        self.assertEqual(bot.money("0.05398224"), "0.05")
+        self.assertEqual(bot.money("0.125653"), "0.13")
+        self.assertEqual(bot.money("12.50"), "12.5")
+        self.assertEqual(bot.money("100.00"), "100")
+
+    def test_cache_percentages_hide_raw_token_counts(self):
+        values = {
+            "input_tokens": 248597,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 304128,
+        }
+        self.assertEqual(bot.cache_percentage_text(values), "读取 55.02%｜写入 0%")
+        self.assertEqual(bot.cache_percentage_text({}), "暂无数据")
 
     def test_alert_state_is_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
