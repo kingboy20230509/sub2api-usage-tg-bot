@@ -1,5 +1,4 @@
 import http.client
-import json
 import os
 import stat
 import tempfile
@@ -15,9 +14,6 @@ class RuntimeConfigTests(unittest.TestCase):
         return mock.patch.multiple(
             bot,
             TOKEN="123456:valid-token",
-            WEBHOOK_SECRET="A" * 32,
-            WEBHOOK_PATH="/tg-sub2api-bot/" + "B" * 32,
-            PUBLIC_WEBHOOK_URL="https://bot.example/tg-sub2api-bot/" + "B" * 32,
             PSQL_BIN="/usr/bin/true",
             PGHOST="127.0.0.1",
             PGPORT="5432",
@@ -26,29 +22,19 @@ class RuntimeConfigTests(unittest.TestCase):
             PGPASSWORD="a-valid-restricted-password",
             PGSSLMODE="prefer",
             PG_ALLOW_INSECURE_PRIVATE_NETWORK="0",
-            MAX_WEBHOOK_BODY=65536,
-            WEBHOOK_WORKERS=4,
-            WEBHOOK_MAX_PENDING=16,
+            UPDATE_WORKERS=4,
+            UPDATE_MAX_PENDING=16,
             CHECK_COOLDOWN=10,
+            POLL_TIMEOUT=10,
         )
 
     def test_valid_runtime_configuration(self):
         with self.valid_runtime():
             bot.validate_runtime_config()
 
-    def test_empty_webhook_secret_is_rejected(self):
-        with self.valid_runtime(), mock.patch.object(bot, "WEBHOOK_SECRET", ""):
-            with self.assertRaisesRegex(RuntimeError, "WEBHOOK_SECRET"):
-                bot.validate_runtime_config()
-
-    def test_placeholder_webhook_secret_is_rejected(self):
-        with self.valid_runtime(), mock.patch.object(bot, "WEBHOOK_SECRET", "replace_me_with_a_long_random_string"):
-            with self.assertRaisesRegex(RuntimeError, "WEBHOOK_SECRET"):
-                bot.validate_runtime_config()
-
-    def test_webhook_url_path_must_match(self):
-        with self.valid_runtime(), mock.patch.object(bot, "PUBLIC_WEBHOOK_URL", "https://bot.example/wrong"):
-            with self.assertRaisesRegex(RuntimeError, "PUBLIC_WEBHOOK_URL"):
+    def test_poll_timeout_is_bounded(self):
+        with self.valid_runtime(), mock.patch.object(bot, "POLL_TIMEOUT", 0):
+            with self.assertRaisesRegex(RuntimeError, "POLL_TIMEOUT"):
                 bot.validate_runtime_config()
 
     def test_remote_database_requires_tls(self):
@@ -159,7 +145,6 @@ class DataSafetyTests(unittest.TestCase):
             PGPASSWORD="database-secret",
             PGSSLMODE="prefer",
             TOKEN="telegram-secret",
-            WEBHOOK_SECRET="webhook-secret",
         ), mock.patch.object(bot.subprocess, "check_output", return_value='{"ok": true}\n') as check:
             result = bot.run_psql_json("SELECT :'key_name';", {"key_name": "example-key"})
         self.assertEqual(result, {"ok": True})
@@ -170,7 +155,6 @@ class DataSafetyTests(unittest.TestCase):
         self.assertEqual(environment["PGUSER"], "sub2api_tg_bot")
         self.assertIn("default_transaction_read_only=on", environment["PGOPTIONS"])
         self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
-        self.assertNotIn("WEBHOOK_SECRET", environment)
 
     def test_database_setup_exposes_only_fixed_function(self):
         with open("deploy/create_readonly_role.sql", "r", encoding="utf-8") as file:
@@ -209,6 +193,8 @@ class ContainerPackagingTests(unittest.TestCase):
         self.assertNotIn("docker.sock", compose)
         self.assertNotIn("ports:", compose)
         self.assertNotIn("env_file:", compose)
+        self.assertNotIn("WEBHOOK", compose)
+        self.assertNotIn("PUBLIC_WEBHOOK", compose)
 
 
 class DispatcherTests(unittest.TestCase):
@@ -231,21 +217,58 @@ class DispatcherTests(unittest.TestCase):
                 release.set()
                 dispatcher.shutdown()
 
+    def test_poll_batch_advances_offset_after_accepted_update(self):
+        dispatcher = mock.Mock()
+        dispatcher.submit.return_value = "accepted"
+        offset, busy = bot.dispatch_update_batch(
+            [{"update_id": 10, "message": {"text": "/start"}}],
+            dispatcher,
+        )
+        self.assertEqual(offset, 11)
+        self.assertFalse(busy)
+        dispatcher.submit.assert_called_once_with(10, {"text": "/start"})
+
+    def test_busy_poll_update_is_not_acknowledged(self):
+        dispatcher = mock.Mock()
+        dispatcher.submit.side_effect = ["accepted", "busy"]
+        offset, busy = bot.dispatch_update_batch(
+            [
+                {"update_id": 10, "message": {"text": "/start"}},
+                {"update_id": 11, "message": {"text": "/check"}},
+            ],
+            dispatcher,
+        )
+        self.assertEqual(offset, 11)
+        self.assertTrue(busy)
+
+    def test_non_message_update_is_acknowledged(self):
+        dispatcher = mock.Mock()
+        offset, busy = bot.dispatch_update_batch([{"update_id": 20, "callback_query": {}}], dispatcher)
+        self.assertEqual(offset, 21)
+        self.assertFalse(busy)
+        dispatcher.submit.assert_not_called()
+
+    def test_poll_loop_uses_get_updates_and_stops_cleanly(self):
+        dispatcher = mock.Mock()
+        stop_event = threading.Event()
+
+        def fake_tg(method, params, timeout):
+            stop_event.set()
+            self.assertEqual(method, "getUpdates")
+            self.assertEqual(params["timeout"], "7")
+            self.assertEqual(timeout, 12)
+            return []
+
+        with mock.patch.object(bot, "POLL_TIMEOUT", 7), mock.patch.object(bot, "tg", fake_tg):
+            bot.poll_updates(dispatcher, stop_event)
+        dispatcher.submit.assert_not_called()
+
 
 @unittest.skipUnless(os.environ.get("RUN_NETWORK_TESTS") == "1", "set RUN_NETWORK_TESTS=1 to bind a loopback test server")
-class WebhookHandlerTests(unittest.TestCase):
+class HealthHandlerTests(unittest.TestCase):
     def setUp(self):
-        self.runtime = mock.patch.multiple(
-            bot,
-            WEBHOOK_SECRET="A" * 32,
-            WEBHOOK_PATH="/tg-sub2api-bot/" + "B" * 32,
-            MAX_WEBHOOK_BODY=128,
-        )
-        self.runtime.start()
         self.server = bot.ThreadingHTTPServer(("127.0.0.1", 0), bot.Handler)
         self.server.daemon_threads = True
-        self.server.dispatcher = mock.Mock()
-        self.server.dispatcher.submit.return_value = "accepted"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -253,36 +276,21 @@ class WebhookHandlerTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=1)
-        self.runtime.stop()
 
-    def request(self, body, secret=None, content_type="application/json"):
+    def request(self, path):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
-        headers = {"Content-Type": content_type}
-        if secret is not None:
-            headers["X-Telegram-Bot-Api-Secret-Token"] = secret
-        connection.request("POST", bot.WEBHOOK_PATH, body=body, headers=headers)
+        connection.request("GET", path)
         response = connection.getresponse()
         status = response.status
-        response.read()
+        body = response.read()
         connection.close()
-        return status
+        return status, body
 
-    def test_wrong_secret_is_forbidden(self):
-        self.assertEqual(self.request(b"{}", secret="wrong"), 403)
-        self.server.dispatcher.submit.assert_not_called()
+    def test_health_endpoint(self):
+        self.assertEqual(self.request("/health"), (200, b"ok"))
 
-    def test_oversized_request_is_rejected(self):
-        self.assertEqual(self.request(b"x" * 129, secret="A" * 32), 413)
-        self.server.dispatcher.submit.assert_not_called()
-
-    def test_invalid_json_is_rejected(self):
-        self.assertEqual(self.request(b"not-json", secret="A" * 32), 400)
-        self.server.dispatcher.submit.assert_not_called()
-
-    def test_valid_update_is_dispatched(self):
-        body = json.dumps({"update_id": 123, "message": {"text": "/start"}}).encode()
-        self.assertEqual(self.request(body, secret="A" * 32), 200)
-        self.server.dispatcher.submit.assert_called_once_with(123, {"text": "/start"})
+    def test_other_endpoint_is_not_found(self):
+        self.assertEqual(self.request("/anything-else"), (404, b""))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SUB2API_TG_BOT_CONFIG=/etc/sub2api-tg-bot/config.json \
     ALERT_STATE_PATH=/var/lib/sub2api-tg-bot/alert_state.json \
     PSQL_BIN=/usr/bin/psql \
-    LISTEN_HOST=0.0.0.0 \
+    LISTEN_HOST=127.0.0.1 \
     LISTEN_PORT=8099
 
 RUN apt-get update \
@@ -19,7 +19,6 @@ WORKDIR /app
 COPY --chown=10001:10001 sub2api_tg_bot.py docker-healthcheck.py ./
 
 USER 10001:10001
-EXPOSE 8099
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["python3", "/app/docker-healthcheck.py"]
 

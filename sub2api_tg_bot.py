@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import json
-import hmac
 import os
 import re
 import signal
@@ -37,13 +36,10 @@ def read_secret(name):
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("SUB2API_TG_BOT_CONFIG", os.path.join(BASE_DIR, "config.json"))
 TOKEN = read_secret("TELEGRAM_BOT_TOKEN").strip()
-WEBHOOK_SECRET = read_secret("WEBHOOK_SECRET").strip()
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/tg-sub2api-bot").strip()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
 ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
 ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
-PUBLIC_WEBHOOK_URL = os.environ.get("PUBLIC_WEBHOOK_URL", "").strip()
 PSQL_BIN = os.environ.get("PSQL_BIN", "/usr/bin/psql").strip()
 PGHOST = os.environ.get("PGHOST", "127.0.0.1").strip()
 PGPORT = os.environ.get("PGPORT", "5432").strip()
@@ -52,14 +48,12 @@ PGUSER = os.environ.get("PGUSER", "sub2api_tg_bot").strip()
 PGPASSWORD = read_secret("PGPASSWORD")
 PGSSLMODE = os.environ.get("PGSSLMODE", "prefer").strip()
 PG_ALLOW_INSECURE_PRIVATE_NETWORK = os.environ.get("PG_ALLOW_INSECURE_PRIVATE_NETWORK", "0").strip()
-MAX_WEBHOOK_BODY = int(os.environ.get("MAX_WEBHOOK_BODY", "65536"))
-WEBHOOK_WORKERS = int(os.environ.get("WEBHOOK_WORKERS", "4"))
-WEBHOOK_MAX_PENDING = int(os.environ.get("WEBHOOK_MAX_PENDING", "16"))
+UPDATE_WORKERS = int(os.environ.get("UPDATE_WORKERS", "4"))
+UPDATE_MAX_PENDING = int(os.environ.get("UPDATE_MAX_PENDING", "16"))
 CHECK_COOLDOWN = int(os.environ.get("CHECK_COOLDOWN", "10"))
+POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "10"))
 API = f"https://api.telegram.org/bot{TOKEN}"
 KEY_NAME_RE = re.compile(r"^[\w .:@+-]{1,100}$")
-WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
-WEBHOOK_PATH_RE = re.compile(r"^/[A-Za-z0-9/_-]{16,256}$")
 PG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,62}$")
 COMPOSE_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
 PSQL_VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -79,29 +73,14 @@ def masked_id(value):
 def validate_runtime_config():
     if not TOKEN or ":" not in TOKEN or "replace_me" in TOKEN.lower():
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing or invalid")
-    if not WEBHOOK_SECRET_RE.fullmatch(WEBHOOK_SECRET) or "replace_me" in WEBHOOK_SECRET.lower():
-        raise RuntimeError("WEBHOOK_SECRET must be a random 32-256 character A-Z/a-z/0-9/_/- value")
-    if not WEBHOOK_PATH_RE.fullmatch(WEBHOOK_PATH) or WEBHOOK_PATH == "/tg-sub2api-bot":
-        raise RuntimeError("WEBHOOK_PATH must contain a long, unguessable path")
-    parsed = urllib.parse.urlsplit(PUBLIC_WEBHOOK_URL)
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-        or parsed.path != WEBHOOK_PATH
-    ):
-        raise RuntimeError("PUBLIC_WEBHOOK_URL must be an HTTPS URL whose path exactly matches WEBHOOK_PATH")
-    if not 1024 <= MAX_WEBHOOK_BODY <= 1048576:
-        raise RuntimeError("MAX_WEBHOOK_BODY must be between 1024 and 1048576")
-    if not 1 <= WEBHOOK_WORKERS <= 32:
-        raise RuntimeError("WEBHOOK_WORKERS must be between 1 and 32")
-    if not WEBHOOK_WORKERS <= WEBHOOK_MAX_PENDING <= 256:
-        raise RuntimeError("WEBHOOK_MAX_PENDING must be between WEBHOOK_WORKERS and 256")
+    if not 1 <= UPDATE_WORKERS <= 32:
+        raise RuntimeError("UPDATE_WORKERS must be between 1 and 32")
+    if not UPDATE_WORKERS <= UPDATE_MAX_PENDING <= 256:
+        raise RuntimeError("UPDATE_MAX_PENDING must be between UPDATE_WORKERS and 256")
     if not 1 <= CHECK_COOLDOWN <= 3600:
         raise RuntimeError("CHECK_COOLDOWN must be between 1 and 3600 seconds")
+    if not 1 <= POLL_TIMEOUT <= 50:
+        raise RuntimeError("POLL_TIMEOUT must be between 1 and 50 seconds")
     if not os.path.isabs(PSQL_BIN) or not os.path.isfile(PSQL_BIN) or not os.access(PSQL_BIN, os.X_OK):
         raise RuntimeError("PSQL_BIN must point to an executable psql client")
     if not PGHOST or any(char in PGHOST for char in "\r\n\0"):
@@ -419,7 +398,7 @@ class UpdateDispatcher:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Sub2ApiTgBot/1.1"
+    server_version = "Sub2ApiTgBot/1.2"
 
     def setup(self):
         super().setup()
@@ -440,76 +419,76 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.respond(404)
 
-    def do_POST(self):
-        if self.path != WEBHOOK_PATH:
-            self.respond(404)
-            return
-        supplied_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if not hmac.compare_digest(supplied_secret.encode("utf-8"), WEBHOOK_SECRET.encode("ascii")):
-            self.respond(403)
-            return
-        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        if content_type != "application/json":
-            self.respond(415)
-            return
-        try:
-            length = int(self.headers.get("Content-Length", ""))
-        except (TypeError, ValueError):
-            self.respond(400)
-            return
-        if length <= 0:
-            self.respond(400)
-            return
-        if length > MAX_WEBHOOK_BODY:
-            self.respond(413)
-            return
-        try:
-            body = self.rfile.read(length)
-        except (OSError, TimeoutError):
-            self.respond(408)
-            return
-        try:
-            upd = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self.respond(400)
-            return
-        if not isinstance(upd, dict) or type(upd.get("update_id")) is not int:
-            self.respond(400)
-            return
-        message = upd.get("message")
-        if not isinstance(message, dict):
-            self.respond(200, b"ok")
-            return
-        result = self.server.dispatcher.submit(upd["update_id"], message)
-        if result == "busy":
-            self.respond(503)
-            return
-        self.respond(200, b"ok")
-
     def log_message(self, fmt, *args):
         return
 
 
+def dispatch_update_batch(updates, dispatcher, offset=None):
+    for update in updates:
+        if not isinstance(update, dict) or type(update.get("update_id")) is not int:
+            continue
+        update_id = update["update_id"]
+        next_offset = max(offset or 0, update_id + 1)
+        message = update.get("message")
+        if not isinstance(message, dict):
+            offset = next_offset
+            continue
+        result = dispatcher.submit(update_id, message)
+        if result == "busy":
+            return offset, True
+        offset = next_offset
+    return offset, False
+
+
+def poll_updates(dispatcher, stop_event):
+    offset = None
+    failures = 0
+    while not stop_event.is_set():
+        params = {
+            "timeout": str(POLL_TIMEOUT),
+            "limit": "100",
+            "allowed_updates": json.dumps(["message"]),
+        }
+        if offset is not None:
+            params["offset"] = str(offset)
+        try:
+            updates = tg("getUpdates", params, timeout=POLL_TIMEOUT + 5)
+            if not isinstance(updates, list):
+                raise RuntimeError("Telegram getUpdates returned a non-list result")
+            offset, busy = dispatch_update_batch(updates, dispatcher, offset)
+            failures = 0
+            if busy:
+                stop_event.wait(1)
+        except Exception as error:
+            log_failure("telegram polling", error)
+            failures += 1
+            stop_event.wait(min(30, 2 ** min(failures - 1, 5)))
+
+
 def main():
     validate_runtime_config()
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    stop_event = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
     tg("deleteWebhook", {"drop_pending_updates": "false"})
     tg("setMyCommands", {"commands": json.dumps([
         {"command": "check", "description": "查询绑定 key 的用量"},
         {"command": "start", "description": "使用说明"},
     ], ensure_ascii=False)})
-    tg("setWebhook", {"url": PUBLIC_WEBHOOK_URL, "secret_token": WEBHOOK_SECRET, "allowed_updates": json.dumps(["message"])})
-    print(f"sub2api tg bot webhook started on {LISTEN_HOST}:{LISTEN_PORT}{WEBHOOK_PATH}", flush=True)
+    print("sub2api tg bot long polling started", flush=True)
     threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
+    dispatcher = UpdateDispatcher(UPDATE_WORKERS, UPDATE_MAX_PENDING)
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     httpd.daemon_threads = True
-    httpd.dispatcher = UpdateDispatcher(WEBHOOK_WORKERS, WEBHOOK_MAX_PENDING)
+    health_thread = threading.Thread(target=httpd.serve_forever, name="health-server", daemon=True)
+    health_thread.start()
     try:
-        httpd.serve_forever()
+        poll_updates(dispatcher, stop_event)
     finally:
+        httpd.shutdown()
         httpd.server_close()
-        httpd.dispatcher.shutdown()
+        health_thread.join(timeout=2)
+        dispatcher.shutdown()
 
 
 if __name__ == "__main__":

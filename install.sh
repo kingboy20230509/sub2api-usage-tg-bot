@@ -15,9 +15,6 @@ LISTEN_PORT="${LISTEN_PORT:-8099}"
 ALERT_CHECK_INTERVAL="${ALERT_CHECK_INTERVAL:-600}"
 ALERT_STATE_PATH="${ALERT_STATE_PATH:-/var/lib/sub2api-tg-bot/alert_state.json}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
-WEBHOOK_PATH="${WEBHOOK_PATH:-}"
-WEBHOOK_SECRET="${WEBHOOK_SECRET:-}"
-PUBLIC_WEBHOOK_URL="${PUBLIC_WEBHOOK_URL:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
 SUB2API_KEY_NAME="${SUB2API_KEY_NAME:-}"
@@ -28,8 +25,11 @@ PGDATABASE="${PGDATABASE:-sub2api}"
 PGUSER="${PGUSER:-sub2api_tg_bot}"
 PGPASSWORD="${PGPASSWORD:-}"
 PGSSLMODE="${PGSSLMODE:-prefer}"
+POLL_TIMEOUT="${POLL_TIMEOUT:-10}"
+UPDATE_WORKERS="${UPDATE_WORKERS:-4}"
+UPDATE_MAX_PENDING="${UPDATE_MAX_PENDING:-16}"
+CHECK_COOLDOWN="${CHECK_COOLDOWN:-10}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
-SKIP_NGINX_HINT="${SKIP_NGINX_HINT:-0}"
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -101,38 +101,21 @@ validate_inputs() {
       exit 1
     fi
   fi
-  if [[ ! "$WEBHOOK_SECRET" =~ ^[A-Za-z0-9_-]{32,256}$ ]]; then
-    echo "WEBHOOK_SECRET must contain 32-256 A-Z, a-z, 0-9, underscore, or dash characters" >&2
+  if [[ ! "$POLL_TIMEOUT" =~ ^[0-9]{1,2}$ ]] || (( POLL_TIMEOUT < 1 || POLL_TIMEOUT > 50 )); then
+    echo "POLL_TIMEOUT must be between 1 and 50 seconds" >&2
     exit 1
   fi
-  if [[ ! "$WEBHOOK_PATH" =~ ^/[A-Za-z0-9/_-]{16,256}$ ]]; then
-    echo "WEBHOOK_PATH must be a long, unguessable absolute path" >&2
+  if [[ ! "$UPDATE_WORKERS" =~ ^[0-9]{1,2}$ ]] || (( UPDATE_WORKERS < 1 || UPDATE_WORKERS > 32 )); then
+    echo "UPDATE_WORKERS must be between 1 and 32" >&2
     exit 1
   fi
-  python3 - "$PUBLIC_WEBHOOK_URL" "$WEBHOOK_PATH" <<'PY'
-import sys
-from urllib.parse import urlsplit
-
-url, expected_path = sys.argv[1:]
-parsed = urlsplit(url)
-if (
-    parsed.scheme != "https"
-    or not parsed.netloc
-    or parsed.username
-    or parsed.password
-    or parsed.query
-    or parsed.fragment
-    or parsed.path != expected_path
-):
-    raise SystemExit("PUBLIC_WEBHOOK_URL must be HTTPS and its path must exactly match WEBHOOK_PATH")
-PY
-}
-
-random_secret() {
-  if have openssl; then
-    openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | cut -c1-48
-  else
-    tr -dc 'A-Za-z0-9_-'< /dev/urandom | head -c 48
+  if [[ ! "$UPDATE_MAX_PENDING" =~ ^[0-9]{1,3}$ ]] || (( UPDATE_MAX_PENDING < UPDATE_WORKERS || UPDATE_MAX_PENDING > 256 )); then
+    echo "UPDATE_MAX_PENDING must be between UPDATE_WORKERS and 256" >&2
+    exit 1
+  fi
+  if [[ ! "$CHECK_COOLDOWN" =~ ^[0-9]{1,4}$ ]] || (( CHECK_COOLDOWN < 1 || CHECK_COOLDOWN > 3600 )); then
+    echo "CHECK_COOLDOWN must be between 1 and 3600 seconds" >&2
+    exit 1
   fi
 }
 
@@ -188,13 +171,6 @@ main() {
   read_prompt SUB2API_KEY_NAME "Sub2API key name for this Telegram user"
   read_prompt PGPASSWORD "Password for the restricted PostgreSQL role $PGUSER" "" 1
 
-  if [[ -z "$WEBHOOK_SECRET" ]]; then
-    WEBHOOK_SECRET="$(random_secret)"
-  fi
-  if [[ -z "$WEBHOOK_PATH" ]]; then
-    WEBHOOK_PATH="/tg-sub2api-bot/$(random_secret)"
-  fi
-  read_prompt PUBLIC_WEBHOOK_URL "Public webhook URL, e.g. https://example.com${WEBHOOK_PATH}" "${PUBLIC_WEBHOOK_URL:-}"
   validate_inputs
 
   if [[ ! -f "$BOT_SOURCE_FILE" ]]; then
@@ -257,12 +233,9 @@ JSON
   chown root:"$BOT_GROUP" "$CONFIG_FILE"
   chmod 0640 "$CONFIG_FILE"
 
-  local token_env secret_env public_url_env webhook_path_env listen_host_env config_env state_env
+  local token_env listen_host_env config_env state_env
   local psql_bin_env pghost_env pgdatabase_env pguser_env pgpassword_env pgsslmode_env
   token_env="$(env_quote "$TELEGRAM_BOT_TOKEN")"
-  secret_env="$(env_quote "$WEBHOOK_SECRET")"
-  public_url_env="$(env_quote "$PUBLIC_WEBHOOK_URL")"
-  webhook_path_env="$(env_quote "$WEBHOOK_PATH")"
   listen_host_env="$(env_quote "$LISTEN_HOST")"
   config_env="$(env_quote "$CONFIG_FILE")"
   state_env="$(env_quote "$ALERT_STATE_PATH")"
@@ -274,9 +247,6 @@ JSON
   pgsslmode_env="$(env_quote "$PGSSLMODE")"
   cat > "$ENV_FILE" <<ENV
 TELEGRAM_BOT_TOKEN=$token_env
-WEBHOOK_SECRET=$secret_env
-PUBLIC_WEBHOOK_URL=$public_url_env
-WEBHOOK_PATH=$webhook_path_env
 LISTEN_HOST=$listen_host_env
 LISTEN_PORT=$LISTEN_PORT
 SUB2API_TG_BOT_CONFIG=$config_env
@@ -289,10 +259,10 @@ PGDATABASE=$pgdatabase_env
 PGUSER=$pguser_env
 PGPASSWORD=$pgpassword_env
 PGSSLMODE=$pgsslmode_env
-MAX_WEBHOOK_BODY=65536
-WEBHOOK_WORKERS=4
-WEBHOOK_MAX_PENDING=16
-CHECK_COOLDOWN=10
+POLL_TIMEOUT=$POLL_TIMEOUT
+UPDATE_WORKERS=$UPDATE_WORKERS
+UPDATE_MAX_PENDING=$UPDATE_MAX_PENDING
+CHECK_COOLDOWN=$CHECK_COOLDOWN
 ENV
   chmod 0600 "$ENV_FILE"
 
@@ -347,28 +317,9 @@ SERVICE
   echo "Installed $SERVICE_NAME"
   echo "Config: $CONFIG_FILE"
   echo "Env:    $ENV_FILE"
-  echo "Listen: http://$LISTEN_HOST:$LISTEN_PORT"
+  echo "Mode:   Telegram long polling (no public domain or reverse proxy required)"
   echo "Health: curl http://$LISTEN_HOST:$LISTEN_PORT/health"
   echo
-  if [[ "$SKIP_NGINX_HINT" != "1" ]]; then
-    echo "Reverse proxy example:"
-    echo "# Put this in the nginx http block once:"
-    echo "limit_req_zone \$binary_remote_addr zone=sub2api_bot:10m rate=2r/s;"
-    echo
-    echo "location $WEBHOOK_PATH {"
-    echo "    client_max_body_size 64k;"
-    echo "    limit_req zone=sub2api_bot burst=5 nodelay;"
-    echo "    proxy_pass http://$LISTEN_HOST:$LISTEN_PORT$WEBHOOK_PATH;"
-    echo "    proxy_connect_timeout 5s;"
-    echo "    proxy_read_timeout 15s;"
-    echo "    proxy_send_timeout 15s;"
-    echo '    proxy_set_header Host $host;'
-    echo '    proxy_set_header X-Real-IP $remote_addr;'
-    echo '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
-    echo '    proxy_set_header X-Forwarded-Proto $scheme;'
-    echo "}"
-    echo
-  fi
   echo "Check logs: journalctl -u $SERVICE_NAME.service -f"
 }
 
