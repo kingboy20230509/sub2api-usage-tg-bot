@@ -149,9 +149,14 @@ class DataSafetyTests(unittest.TestCase):
             result = bot.run_psql_json("SELECT :'key_name';", {"key_name": "example-key"})
         self.assertEqual(result, {"ok": True})
         command = check.call_args.args[0]
+        stdin_sql = check.call_args.kwargs["input"]
         environment = check.call_args.kwargs["env"]
         self.assertNotIn("docker", command)
         self.assertIn("--set=key_name=example-key", command)
+        self.assertIn("--file", command)
+        self.assertIn("-", command)
+        self.assertNotIn("--command", command)
+        self.assertEqual(stdin_sql, "SELECT :'key_name';")
         self.assertEqual(environment["PGUSER"], "sub2api_tg_bot")
         self.assertIn("default_transaction_read_only=on", environment["PGOPTIONS"])
         self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
