@@ -227,13 +227,17 @@ def cache_percentage_text(values):
     return f"读取 {money(read_percent)}%｜写入 {money(creation_percent)}%"
 
 
-def limit_line(label, limit_value, used_value):
+def append_limit(lines, label, limit_value, used_value):
     limit = dec(limit_value)
     used = dec(used_value)
     if limit <= 0:
-        return f"• {label}：不限（已用 {money(used)}）"
+        lines.append(f"• {label}：不限（已用 {money(used)}）")
+        return
     remaining = max(limit - used, Decimal("0"))
-    return f"• {label}：{money(used)} / {money(limit)}，剩余 {money(remaining)}"
+    summary = f"• {label}：已用 {money(used)} / 限额 {money(limit)} / 剩余 {money(remaining)}"
+    if used > limit:
+        summary += f" / 超出 {money(used - limit)}"
+    lines.extend([summary, f"  {progress_bar(used, limit)}"])
 
 
 def append_model_section(lines, title, models):
@@ -336,26 +340,16 @@ def format_usage(key_name, data):
     today = data.get("today") or {}
     models_today = data.get("models_today") or []
     models_all = data.get("models") or []
-    quota = dec(k.get("quota"))
-    used = dec(k.get("quota_used"))
     lines = [
         f"🔑 Key：{k.get('name')}",
         f"状态：{format_status(k.get('status'))}",
-    ]
-    if quota > 0:
-        remaining = max(quota - used, Decimal("0"))
-        quota_summary = f"已用 {money(used)} / 总额 {money(quota)} / 剩余 {money(remaining)}"
-        if used > quota:
-            quota_summary += f" / 超出 {money(used - quota)}"
-        lines.extend(["", "💰 额度", progress_bar(used, quota), quota_summary])
-    else:
-        lines.extend(["", "💰 额度", f"未设置总额度｜累计费用 {money(all_.get('actual_cost'))}"])
-    lines.extend([
         "",
         "⏱ 限额",
-        limit_line("5 小时", k.get("rate_limit_5h"), k.get("usage_5h")),
-        limit_line("每日", k.get("rate_limit_1d"), k.get("usage_1d")),
-        limit_line("每周", k.get("rate_limit_7d"), k.get("usage_7d")),
+    ]
+    append_limit(lines, "5 小时", k.get("rate_limit_5h"), k.get("usage_5h"))
+    append_limit(lines, "每日", k.get("rate_limit_1d"), k.get("usage_1d"))
+    append_limit(lines, "每周", k.get("rate_limit_7d"), k.get("usage_7d"))
+    lines.extend([
         "",
         "📅 今日用量",
         f"• 请求：{num(today.get('requests'))}",

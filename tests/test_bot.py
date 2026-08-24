@@ -180,6 +180,8 @@ class DataSafetyTests(unittest.TestCase):
                 "status": "active",
                 "quota": 100,
                 "quota_used": 25,
+                "rate_limit_5h": 100,
+                "usage_5h": 25,
                 "last_used_at": "2026-08-21T15:31:41.722896+08:00",
             },
             "today": {
@@ -218,7 +220,11 @@ class DataSafetyTests(unittest.TestCase):
             }],
         }
         output = bot.format_usage("example-key", data)
-        self.assertIn("[███░░░░░░░░░] 25%", output)
+        self.assertIn("• 5 小时：已用 25 / 限额 100 / 剩余 75", output)
+        self.assertIn("  [███░░░░░░░░░] 25%", output)
+        self.assertEqual(output.count("["), 1)
+        self.assertNotIn("💰 额度", output)
+        self.assertNotIn("总额", output)
         self.assertIn("状态：正常", output)
         self.assertIn("2026-08-21 15:31:41", output)
         self.assertIn("今日模型 Top 5", output)
