@@ -132,7 +132,10 @@ def run_psql_json(sql, variables=None):
         if not PSQL_VARIABLE_RE.fullmatch(name):
             raise ValueError("Invalid psql variable name")
         cmd.append(f"--set={name}={value}")
-    cmd.extend(["--command", sql])
+    # psql does not interpolate :'name' variables in text passed with --command.
+    # Reading the fixed query from stdin keeps values in psql variables while
+    # ensuring interpolation happens before PostgreSQL receives the statement.
+    cmd.extend(["--file", "-"])
     env = {
         "HOME": "/nonexistent",
         "LANG": "C",
@@ -149,7 +152,14 @@ def run_psql_json(sql, variables=None):
         "PGSSLMODE": PGSSLMODE,
         "PGUSER": PGUSER,
     }
-    out = subprocess.check_output(cmd, env=env, encoding="utf-8", stderr=subprocess.STDOUT, timeout=12).strip()
+    out = subprocess.check_output(
+        cmd,
+        input=sql,
+        env=env,
+        encoding="utf-8",
+        stderr=subprocess.STDOUT,
+        timeout=12,
+    ).strip()
     if not out:
         return None
     return json.loads(out)
