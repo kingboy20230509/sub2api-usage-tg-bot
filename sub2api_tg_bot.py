@@ -10,6 +10,7 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -184,6 +185,48 @@ def num(v):
     return str(int(v or 0))
 
 
+def progress_bar(used, total, width=12):
+    used = max(dec(used), Decimal("0"))
+    total = dec(total)
+    if total <= 0:
+        return ""
+    ratio = min(used / total, Decimal("1"))
+    filled = min(width, max(0, int(ratio * width + Decimal("0.5"))))
+    return f"[{'█' * filled}{'░' * (width - filled)}] {money(ratio * 100)}%"
+
+
+def format_timestamp(value):
+    if not value:
+        return "-"
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text
+
+
+def limit_line(label, limit_value, used_value):
+    limit = dec(limit_value)
+    used = dec(used_value)
+    if limit <= 0:
+        return f"• {label}：不限（已用 {money(used)}）"
+    remaining = max(limit - used, Decimal("0"))
+    return f"• {label}：{money(used)} / {money(limit)}，剩余 {money(remaining)}"
+
+
+def append_model_section(lines, title, models):
+    lines.extend(["", title])
+    if not models:
+        lines.append("• 暂无使用记录")
+        return
+    for model in models:
+        lines.extend([
+            f"• {model.get('model') or '-'}：{num(model.get('requests'))} 次｜费用 {money(model.get('actual_cost'))}",
+            f"  Tokens：输入 {num(model.get('input_tokens'))} / 输出 {num(model.get('output_tokens'))}",
+            f"  缓存：写入 {num(model.get('cache_creation_tokens'))} / 读取 {num(model.get('cache_read_tokens'))}",
+        ])
+
+
 def query_key_usage(key_name):
     if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
         raise ValueError("Invalid key name in binding config")
@@ -267,38 +310,47 @@ def format_usage(key_name, data):
         return f"未找到绑定的 key：{key_name}"
     all_ = data.get("all") or {}
     today = data.get("today") or {}
-    models = data.get("models") or []
+    models_today = data.get("models_today") or []
+    models_all = data.get("models") or []
     quota = dec(k.get("quota"))
     used = dec(k.get("quota_used"))
-    quota_line = f"额度：{money(used)} / {money(quota)}，剩余 {money(quota - used)}" if quota > 0 else f"累计扣费：{money(all_.get('actual_cost'))}"
-    def limit_text(value):
-        return "不限" if dec(value) <= 0 else money(value)
     lines = [
-        f"🔑 Key：{k.get('name')}（状态：{k.get('status')}）",
-        quota_line,
-        "限额：",
-        f"• 5 小时限额：{limit_text(k.get('rate_limit_5h'))}，已用 {money(k.get('usage_5h'))}，剩余 {money(dec(k.get('rate_limit_5h')) - dec(k.get('usage_5h'))) if dec(k.get('rate_limit_5h')) > 0 else '不限'}",
-        f"• 日限额：{limit_text(k.get('rate_limit_1d'))}，已用 {money(k.get('usage_1d'))}，剩余 {money(dec(k.get('rate_limit_1d')) - dec(k.get('usage_1d'))) if dec(k.get('rate_limit_1d')) > 0 else '不限'}",
-        f"• 周限额：{limit_text(k.get('rate_limit_7d'))}，已用 {money(k.get('usage_7d'))}，剩余 {money(dec(k.get('rate_limit_7d')) - dec(k.get('usage_7d'))) if dec(k.get('rate_limit_7d')) > 0 else '不限'}",
-
+        f"🔑 Key：{k.get('name')}",
+        f"状态：{k.get('status')}",
+    ]
+    if quota > 0:
+        remaining = max(quota - used, Decimal("0"))
+        quota_summary = f"已用 {money(used)} / 总额 {money(quota)} / 剩余 {money(remaining)}"
+        if used > quota:
+            quota_summary += f" / 超出 {money(used - quota)}"
+        lines.extend(["", "💰 额度", progress_bar(used, quota), quota_summary])
+    else:
+        lines.extend(["", "💰 额度", f"未设置总额度｜累计费用 {money(all_.get('actual_cost'))}"])
+    lines.extend([
         "",
-        "今日用量：",
+        "⏱ 限额",
+        limit_line("5 小时", k.get("rate_limit_5h"), k.get("usage_5h")),
+        limit_line("每日", k.get("rate_limit_1d"), k.get("usage_1d")),
+        limit_line("每周", k.get("rate_limit_7d"), k.get("usage_7d")),
+        "",
+        "📅 今日用量",
         f"• 请求：{num(today.get('requests'))}",
         f"• Tokens：输入 {num(today.get('input_tokens'))} / 输出 {num(today.get('output_tokens'))}",
+        f"• 缓存：写入 {num(today.get('cache_creation_tokens'))} / 读取 {num(today.get('cache_read_tokens'))}",
         f"• 费用：{money(today.get('actual_cost'))}",
+    ])
+    append_model_section(lines, "🤖 今日模型 Top 5", models_today)
+    lines.extend([
         "",
-        "累计用量：",
+        "📊 累计用量",
         f"• 请求：{num(all_.get('requests'))}",
         f"• Tokens：输入 {num(all_.get('input_tokens'))} / 输出 {num(all_.get('output_tokens'))}",
-        f"• Cache：写入 {num(all_.get('cache_creation_tokens'))} / 读取 {num(all_.get('cache_read_tokens'))}",
+        f"• 缓存：写入 {num(all_.get('cache_creation_tokens'))} / 读取 {num(all_.get('cache_read_tokens'))}",
         f"• 费用：{money(all_.get('actual_cost'))}",
-    ]
+    ])
     if k.get("last_used_at"):
-        lines.append(f"• 最近使用：{k.get('last_used_at')}")
-    if models:
-        lines += ["", "模型 Top："]
-        for m in models:
-            lines.append(f"• {m.get('model') or '-'}：{num(m.get('requests'))} 次 / {money(m.get('actual_cost'))}")
+        lines.append(f"• 最近使用：{format_timestamp(k.get('last_used_at'))}")
+    append_model_section(lines, "🤖 累计模型 Top 5", models_all)
     return "\n".join(lines)
 
 

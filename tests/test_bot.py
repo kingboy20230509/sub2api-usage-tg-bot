@@ -168,7 +168,64 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("SET search_path = pg_catalog", sql)
         self.assertIn("REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text)", sql)
+        self.assertIn("'models_today'", sql)
+        self.assertIn("sum(cache_creation_tokens)", sql)
+        self.assertIn("sum(cache_read_tokens)", sql)
         self.assertNotIn("GRANT SELECT", sql)
+
+    def test_usage_output_has_progress_time_and_model_cache_details(self):
+        data = {
+            "key": {
+                "name": "example-key",
+                "status": "active",
+                "quota": 100,
+                "quota_used": 25,
+                "last_used_at": "2026-08-21T15:31:41.722896+08:00",
+            },
+            "today": {
+                "requests": 1,
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_creation_tokens": 3,
+                "cache_read_tokens": 4,
+                "actual_cost": "0.01",
+            },
+            "all": {
+                "requests": 2,
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "cache_creation_tokens": 6,
+                "cache_read_tokens": 8,
+                "actual_cost": "0.02",
+            },
+            "models_today": [{
+                "model": "gpt-today",
+                "requests": 1,
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_creation_tokens": 3,
+                "cache_read_tokens": 4,
+                "actual_cost": "0.01",
+            }],
+            "models": [{
+                "model": "gpt-all",
+                "requests": 2,
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "cache_creation_tokens": 6,
+                "cache_read_tokens": 8,
+                "actual_cost": "0.02",
+            }],
+        }
+        output = bot.format_usage("example-key", data)
+        self.assertIn("[███░░░░░░░░░] 25%", output)
+        self.assertIn("2026-08-21 15:31:41", output)
+        self.assertIn("今日模型 Top 5", output)
+        self.assertIn("累计模型 Top 5", output)
+        self.assertIn("gpt-today", output)
+        self.assertIn("gpt-all", output)
+        self.assertIn("缓存：写入 3 / 读取 4", output)
+        self.assertLess(len(output), 4096)
 
     def test_alert_state_is_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:

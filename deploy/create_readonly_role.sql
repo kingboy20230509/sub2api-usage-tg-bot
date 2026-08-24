@@ -54,16 +54,36 @@ WITH k AS (
   SELECT count(*)::bigint requests,
          coalesce(sum(input_tokens), 0)::bigint input_tokens,
          coalesce(sum(output_tokens), 0)::bigint output_tokens,
+         coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
+         coalesce(sum(cache_read_tokens), 0)::bigint cache_read_tokens,
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
     AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
 ), models AS (
-  SELECT coalesce(nullif(requested_model, ''), model) model,
+  SELECT coalesce(nullif(requested_model, ''), nullif(model, ''), 'unknown') model,
          count(*)::bigint requests,
+         coalesce(sum(input_tokens), 0)::bigint input_tokens,
+         coalesce(sum(output_tokens), 0)::bigint output_tokens,
+         coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
+         coalesce(sum(cache_read_tokens), 0)::bigint cache_read_tokens,
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
+  GROUP BY 1
+  ORDER BY requests DESC, actual_cost DESC
+  LIMIT 5
+), models_today AS (
+  SELECT coalesce(nullif(requested_model, ''), nullif(model, ''), 'unknown') model,
+         count(*)::bigint requests,
+         coalesce(sum(input_tokens), 0)::bigint input_tokens,
+         coalesce(sum(output_tokens), 0)::bigint output_tokens,
+         coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
+         coalesce(sum(cache_read_tokens), 0)::bigint cache_read_tokens,
+         coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
+  FROM public.usage_logs
+  WHERE api_key_id = (SELECT id FROM k)
+    AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
   GROUP BY 1
   ORDER BY requests DESC, actual_cost DESC
   LIMIT 5
@@ -72,7 +92,8 @@ SELECT json_build_object(
   'key', (SELECT row_to_json(k) FROM k),
   'all', (SELECT row_to_json(agg_all) FROM agg_all),
   'today', (SELECT row_to_json(agg_today) FROM agg_today),
-  'models', coalesce((SELECT json_agg(models) FROM models), '[]'::json)
+  'models', coalesce((SELECT json_agg(models) FROM models), '[]'::json),
+  'models_today', coalesce((SELECT json_agg(models_today) FROM models_today), '[]'::json)
 );
 $function$;
 
