@@ -8,13 +8,10 @@ services:
     init: true
     environment:
       TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
-      WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret
       PGPASSWORD_FILE: /run/secrets/postgres_password
-      PUBLIC_WEBHOOK_URL: ${SUB2API_TG_BOT_PUBLIC_WEBHOOK_URL:?set in Compose .env}
-      WEBHOOK_PATH: ${SUB2API_TG_BOT_WEBHOOK_PATH:?set in Compose .env}
       SUB2API_TG_BOT_CONFIG: /etc/sub2api-tg-bot/config.json
       ALERT_STATE_PATH: /var/lib/sub2api-tg-bot/alert_state.json
-      LISTEN_HOST: 0.0.0.0
+      LISTEN_HOST: 127.0.0.1
       LISTEN_PORT: "8099"
       PSQL_BIN: /usr/bin/psql
       PGHOST: ${SUB2API_TG_BOT_PGHOST:-sub2api-postgres}
@@ -24,13 +21,12 @@ services:
       PGSSLMODE: disable
       PG_ALLOW_INSECURE_PRIVATE_NETWORK: "1"
       ALERT_CHECK_INTERVAL: ${SUB2API_TG_BOT_ALERT_CHECK_INTERVAL:-600}
-      MAX_WEBHOOK_BODY: ${SUB2API_TG_BOT_MAX_WEBHOOK_BODY:-65536}
-      WEBHOOK_WORKERS: ${SUB2API_TG_BOT_WEBHOOK_WORKERS:-4}
-      WEBHOOK_MAX_PENDING: ${SUB2API_TG_BOT_WEBHOOK_MAX_PENDING:-16}
+      POLL_TIMEOUT: ${SUB2API_TG_BOT_POLL_TIMEOUT:-10}
+      UPDATE_WORKERS: ${SUB2API_TG_BOT_UPDATE_WORKERS:-4}
+      UPDATE_MAX_PENDING: ${SUB2API_TG_BOT_UPDATE_MAX_PENDING:-16}
       CHECK_COOLDOWN: ${SUB2API_TG_BOT_CHECK_COOLDOWN:-10}
     secrets:
       - telegram_bot_token
-      - webhook_secret
       - postgres_password
     volumes:
       - type: bind
@@ -38,10 +34,8 @@ services:
         target: /etc/sub2api-tg-bot/config.json
         read_only: true
       - sub2api-tg-bot-state:/var/lib/sub2api-tg-bot
-    expose:
-      - "8099"
     networks:
-      - sub2api-edge
+      - sub2api-bot-egress
       - sub2api-db
     read_only: true
     tmpfs:
@@ -61,8 +55,6 @@ services:
 secrets:
   telegram_bot_token:
     file: ./secrets/telegram_bot_token
-  webhook_secret:
-    file: ./secrets/webhook_secret
   postgres_password:
     file: ./secrets/postgres_password
 
@@ -70,8 +62,8 @@ volumes:
   sub2api-tg-bot-state:
 
 networks:
-  # Attach the reverse proxy, Sub2API app, and bot to this network.
-  sub2api-edge:
+  # Gives the bot outbound access to the Telegram Bot API.
+  sub2api-bot-egress:
   # Attach only PostgreSQL, the Sub2API app, and the bot to this network.
   sub2api-db:
     internal: true
