@@ -273,6 +273,15 @@ def format_datetime_range(start, end):
     return f"{format_timestamp(start)[:16]} ～ {format_timestamp(end)[:16]}"
 
 
+def format_refresh_timestamp(config):
+    timezone_name = config.get("timezone") or "Asia/Shanghai"
+    try:
+        timezone = ZoneInfo(str(timezone_name))
+    except (KeyError, TypeError, ValueError):
+        timezone = ZoneInfo("Asia/Shanghai")
+    return datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def format_status(value):
     status = str(value or "-")
     return {
@@ -576,10 +585,12 @@ def handle_callback_query(callback):
             return
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
         data = query_key_usage(key_name)
+        reply = format_usage(key_name, data or {})
+        reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
         tg("editMessageText", {
             "chat_id": chat.get("id"),
             "message_id": message.get("message_id"),
-            "text": format_usage(key_name, data or {}),
+            "text": reply,
             "reply_markup": admin_keyboard(bindings),
         })
     except Exception as error:
