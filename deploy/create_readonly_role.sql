@@ -31,18 +31,29 @@ STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $function$
-WITH k AS (
+WITH bounds AS (
+  SELECT
+    (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') - interval '6 days')
+      AT TIME ZONE 'Asia/Shanghai' AS seven_days_start,
+    date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')
+      AT TIME ZONE 'Asia/Shanghai' AS today_start
+), k AS (
   SELECT id, name, status, quota, quota_used,
          rate_limit_5h, rate_limit_1d, rate_limit_7d,
          usage_5h, usage_1d, usage_7d,
          window_5h_start, window_1d_start, window_7d_start,
+         CASE WHEN window_7d_start IS NOT NULL
+              THEN window_7d_start + interval '7 days'
+         END AS window_7d_end,
          last_used_at, created_at, expires_at
   FROM public.api_keys
   WHERE name = p_key_name AND deleted_at IS NULL
   ORDER BY id ASC
   LIMIT 1
 ), agg_7d AS (
-  SELECT count(*)::bigint requests,
+  SELECT (SELECT seven_days_start FROM bounds) AS window_start,
+         (SELECT today_start FROM bounds) AS window_end,
+         count(*)::bigint requests,
          coalesce(sum(input_tokens), 0)::bigint input_tokens,
          coalesce(sum(output_tokens), 0)::bigint output_tokens,
          coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
@@ -50,7 +61,8 @@ WITH k AS (
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= now() - interval '7 days'
+    AND created_at >= (SELECT seven_days_start FROM bounds)
+    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
 ), agg_today AS (
   SELECT count(*)::bigint requests,
          coalesce(sum(input_tokens), 0)::bigint input_tokens,
@@ -60,7 +72,8 @@ WITH k AS (
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
+    AND created_at >= (SELECT today_start FROM bounds)
+    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
 ), models_7d AS (
   SELECT coalesce(nullif(requested_model, ''), nullif(model, ''), 'unknown') model,
          count(*)::bigint requests,
@@ -71,7 +84,8 @@ WITH k AS (
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= now() - interval '7 days'
+    AND created_at >= (SELECT seven_days_start FROM bounds)
+    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
   GROUP BY 1
   ORDER BY requests DESC, actual_cost DESC
   LIMIT 5
@@ -85,7 +99,8 @@ WITH k AS (
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
+    AND created_at >= (SELECT today_start FROM bounds)
+    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
   GROUP BY 1
   ORDER BY requests DESC, actual_cost DESC
   LIMIT 5
