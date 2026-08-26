@@ -1,3 +1,4 @@
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 27: /bin/ps: Operation not permitted
 #!/usr/bin/env python3
 import json
 import os
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from zoneinfo import ZoneInfo
 
 
 def read_secret(name):
@@ -220,9 +222,24 @@ def format_timestamp(value):
         return "-"
     text = str(value)
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(ZoneInfo("Asia/Shanghai"))
+        return timestamp.strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return text
+
+
+def format_date_range(start, end):
+    if not start or not end:
+        return None
+    return f"{format_timestamp(start)[:10]} ～ {format_timestamp(end)[:10]}"
+
+
+def format_datetime_range(start, end):
+    if not start or not end:
+        return None
+    return f"{format_timestamp(start)[:16]} ～ {format_timestamp(end)[:16]}"
 
 
 def format_status(value):
@@ -258,6 +275,13 @@ def append_limit(lines, label, limit_value, used_value):
     if used > limit:
         summary += f" / 超出 {money(used - limit)}"
     lines.extend([summary, f"  {progress_bar(used, limit)}"])
+
+
+def append_weekly_limit(lines, key):
+    append_limit(lines, "每周", key.get("rate_limit_7d"), key.get("usage_7d"))
+    reset_period = format_datetime_range(key.get("window_7d_start"), key.get("window_7d_end"))
+    if reset_period:
+        lines.append(f"  重置周期：{reset_period}")
 
 
 def append_model_section(lines, title, models):
@@ -368,7 +392,7 @@ def format_usage(key_name, data):
     ]
     append_limit(lines, "5 小时", k.get("rate_limit_5h"), k.get("usage_5h"))
     append_limit(lines, "每日", k.get("rate_limit_1d"), k.get("usage_1d"))
-    append_limit(lines, "每周", k.get("rate_limit_7d"), k.get("usage_7d"))
+    append_weekly_limit(lines, k)
     lines.extend([
         "",
         "📅 今日用量",
@@ -383,6 +407,11 @@ def format_usage(key_name, data):
         "━━━━━━━━━━━━━━━━",
         "",
         "📊 7天用量",
+    ])
+    seven_days_range = format_date_range(seven_days.get("window_start"), seven_days.get("window_end"))
+    if seven_days_range:
+        lines.append(f"统计范围：{seven_days_range}")
+    lines.extend([
         f"• 请求：{num(seven_days.get('requests'))}",
         f"• Tokens：输入 {format_tokens(seven_days.get('input_tokens'))} / 输出 {format_tokens(seven_days.get('output_tokens'))}",
         f"• 缓存占比：{cache_percentage_text(seven_days)}",
