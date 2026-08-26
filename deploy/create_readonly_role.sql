@@ -41,7 +41,7 @@ WITH k AS (
   WHERE name = p_key_name AND deleted_at IS NULL
   ORDER BY id ASC
   LIMIT 1
-), agg_all AS (
+), agg_7d AS (
   SELECT count(*)::bigint requests,
          coalesce(sum(input_tokens), 0)::bigint input_tokens,
          coalesce(sum(output_tokens), 0)::bigint output_tokens,
@@ -50,6 +50,7 @@ WITH k AS (
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
+    AND created_at >= now() - interval '7 days'
 ), agg_today AS (
   SELECT count(*)::bigint requests,
          coalesce(sum(input_tokens), 0)::bigint input_tokens,
@@ -60,7 +61,7 @@ WITH k AS (
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
     AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
-), models AS (
+), models_7d AS (
   SELECT coalesce(nullif(requested_model, ''), nullif(model, ''), 'unknown') model,
          count(*)::bigint requests,
          coalesce(sum(input_tokens), 0)::bigint input_tokens,
@@ -70,6 +71,7 @@ WITH k AS (
          coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
   FROM public.usage_logs
   WHERE api_key_id = (SELECT id FROM k)
+    AND created_at >= now() - interval '7 days'
   GROUP BY 1
   ORDER BY requests DESC, actual_cost DESC
   LIMIT 5
@@ -90,9 +92,9 @@ WITH k AS (
 )
 SELECT json_build_object(
   'key', (SELECT row_to_json(k) FROM k),
-  'all', (SELECT row_to_json(agg_all) FROM agg_all),
+  'seven_days', (SELECT row_to_json(agg_7d) FROM agg_7d),
   'today', (SELECT row_to_json(agg_today) FROM agg_today),
-  'models', coalesce((SELECT json_agg(models) FROM models), '[]'::json),
+  'models_7d', coalesce((SELECT json_agg(models_7d) FROM models_7d), '[]'::json),
   'models_today', coalesce((SELECT json_agg(models_today) FROM models_today), '[]'::json)
 );
 $function$;

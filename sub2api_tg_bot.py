@@ -336,10 +336,10 @@ def format_usage(key_name, data):
     k = data.get("key")
     if not k:
         return f"未找到绑定的 key：{key_name}"
-    all_ = data.get("all") or {}
+    seven_days = data.get("seven_days") or {}
     today = data.get("today") or {}
     models_today = data.get("models_today") or []
-    models_all = data.get("models") or []
+    models_7d = data.get("models_7d") or []
     lines = [
         f"🔑 Key：{k.get('name')}",
         f"状态：{format_status(k.get('status'))}",
@@ -360,15 +360,15 @@ def format_usage(key_name, data):
     append_model_section(lines, "🤖 今日模型 Top 5", models_today)
     lines.extend([
         "",
-        "📊 累计用量",
-        f"• 请求：{num(all_.get('requests'))}",
-        f"• Tokens：输入 {num(all_.get('input_tokens'))} / 输出 {num(all_.get('output_tokens'))}",
-        f"• 缓存占比：{cache_percentage_text(all_)}",
-        f"• 费用：{money(all_.get('actual_cost'))}",
+        "📊 7天用量",
+        f"• 请求：{num(seven_days.get('requests'))}",
+        f"• Tokens：输入 {num(seven_days.get('input_tokens'))} / 输出 {num(seven_days.get('output_tokens'))}",
+        f"• 缓存占比：{cache_percentage_text(seven_days)}",
+        f"• 费用：{money(seven_days.get('actual_cost'))}",
     ])
     if k.get("last_used_at"):
         lines.append(f"• 最近使用：{format_timestamp(k.get('last_used_at'))}")
-    append_model_section(lines, "🤖 累计模型 Top 5", models_all)
+    append_model_section(lines, "🤖 7天模型 Top 5", models_7d)
     return "\n".join(lines)
 
 
