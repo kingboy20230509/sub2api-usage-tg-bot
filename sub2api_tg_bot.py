@@ -185,6 +185,26 @@ def num(v):
     return str(int(v or 0))
 
 
+def format_tokens(v):
+    value = max(dec(v), Decimal("0"))
+    if value >= Decimal("1000000000"):
+        scaled = value / Decimal("1000000000")
+        suffix = "B"
+        decimals = 2
+    elif value >= Decimal("1000000"):
+        scaled = value / Decimal("1000000")
+        suffix = "M"
+        decimals = 2
+    else:
+        scaled = value / Decimal("1000")
+        suffix = "k"
+        decimals = 1 if value >= Decimal("1000") else 2
+        if scaled < Decimal("0.01"):
+            decimals = 3
+    text = f"{scaled:.{decimals}f}".rstrip("0").rstrip(".")
+    return f"{text or '0'}{suffix}"
+
+
 def progress_bar(used, total, width=12):
     used = max(dec(used), Decimal("0"))
     total = dec(total)
@@ -250,7 +270,7 @@ def append_model_section(lines, title, models):
             lines.append("")
         lines.extend([
             f"• {model.get('model') or '-'}：{num(model.get('requests'))} 次｜费用 {money(model.get('actual_cost'))}",
-            f"  Tokens：输入 {num(model.get('input_tokens'))} / 输出 {num(model.get('output_tokens'))}",
+            f"  Tokens：输入 {format_tokens(model.get('input_tokens'))} / 输出 {format_tokens(model.get('output_tokens'))}",
             f"  缓存占比：{cache_percentage_text(model)}",
         ])
 
@@ -353,16 +373,18 @@ def format_usage(key_name, data):
         "",
         "📅 今日用量",
         f"• 请求：{num(today.get('requests'))}",
-        f"• Tokens：输入 {num(today.get('input_tokens'))} / 输出 {num(today.get('output_tokens'))}",
+        f"• Tokens：输入 {format_tokens(today.get('input_tokens'))} / 输出 {format_tokens(today.get('output_tokens'))}",
         f"• 缓存占比：{cache_percentage_text(today)}",
         f"• 费用：{money(today.get('actual_cost'))}",
     ])
     append_model_section(lines, "🤖 今日模型 Top 5", models_today)
     lines.extend([
         "",
+        "━━━━━━━━━━━━━━━━",
+        "",
         "📊 7天用量",
         f"• 请求：{num(seven_days.get('requests'))}",
-        f"• Tokens：输入 {num(seven_days.get('input_tokens'))} / 输出 {num(seven_days.get('output_tokens'))}",
+        f"• Tokens：输入 {format_tokens(seven_days.get('input_tokens'))} / 输出 {format_tokens(seven_days.get('output_tokens'))}",
         f"• 缓存占比：{cache_percentage_text(seven_days)}",
         f"• 费用：{money(seven_days.get('actual_cost'))}",
     ])
