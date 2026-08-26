@@ -1,4 +1,3 @@
-/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 27: /bin/ps: Operation not permitted
 \set ON_ERROR_STOP on
 
 -- Run this file as the Sub2API database owner. It creates a login that can
