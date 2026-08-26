@@ -260,7 +260,7 @@ class DataSafetyTests(unittest.TestCase):
         self.assertEqual(bot.format_tokens(531), "0.53k")
         self.assertEqual(bot.format_tokens(618561), "618.6k")
         self.assertEqual(bot.format_tokens(1250000), "1.25M")
-        self.assertEqual(bot.format_tokens(1200000000), "1.20B")
+        self.assertEqual(bot.format_tokens(1200000000), "1.2B")
 
     def test_alert_state_is_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
