@@ -37,6 +37,17 @@ WITH bounds AS (
       AT TIME ZONE 'Asia/Shanghai' AS seven_days_start,
     date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')
       AT TIME ZONE 'Asia/Shanghai' AS today_start
+), matching_keys AS (
+  SELECT id, name, status, quota, quota_used,
+         rate_limit_5h, rate_limit_1d, rate_limit_7d,
+         usage_5h, usage_1d, usage_7d,
+         window_5h_start, window_1d_start, window_7d_start,
+         last_used_at, created_at, expires_at
+  FROM public.api_keys
+  WHERE name = p_key_name AND deleted_at IS NULL
+), match_count AS (
+  SELECT count(*)::integer AS total
+  FROM matching_keys
 ), k AS (
   SELECT id, name, status, quota, quota_used,
          rate_limit_5h, rate_limit_1d, rate_limit_7d,
@@ -46,10 +57,8 @@ WITH bounds AS (
               THEN window_7d_start + interval '7 days'
          END AS window_7d_end,
          last_used_at, created_at, expires_at
-  FROM public.api_keys
-  WHERE name = p_key_name AND deleted_at IS NULL
-  ORDER BY id ASC
-  LIMIT 1
+  FROM matching_keys
+  WHERE (SELECT total FROM match_count) = 1
 ), agg_7d AS (
   SELECT (SELECT seven_days_start FROM bounds) AS window_start,
          (SELECT today_start FROM bounds) AS window_end,
@@ -105,13 +114,19 @@ WITH bounds AS (
   ORDER BY requests DESC, actual_cost DESC
   LIMIT 5
 )
-SELECT json_build_object(
-  'key', (SELECT row_to_json(k) FROM k),
-  'seven_days', (SELECT row_to_json(agg_7d) FROM agg_7d),
-  'today', (SELECT row_to_json(agg_today) FROM agg_today),
-  'models_7d', coalesce((SELECT json_agg(models_7d) FROM models_7d), '[]'::json),
-  'models_today', coalesce((SELECT json_agg(models_today) FROM models_today), '[]'::json)
-);
+SELECT CASE
+  WHEN (SELECT total FROM match_count) = 0
+    THEN json_build_object('error', 'not_found')
+  WHEN (SELECT total FROM match_count) > 1
+    THEN json_build_object('error', 'duplicate_key_name')
+  ELSE json_build_object(
+    'key', (SELECT row_to_json(k) FROM k),
+    'seven_days', (SELECT row_to_json(agg_7d) FROM agg_7d),
+    'today', (SELECT row_to_json(agg_today) FROM agg_today),
+    'models_7d', coalesce((SELECT json_agg(models_7d) FROM models_7d), '[]'::json),
+    'models_today', coalesce((SELECT json_agg(models_today) FROM models_today), '[]'::json)
+  )
+END;
 $function$;
 
 REVOKE ALL PRIVILEGES ON DATABASE sub2api FROM sub2api_tg_bot;
