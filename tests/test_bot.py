@@ -234,6 +234,8 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("gpt-today", output)
         self.assertIn("gpt-all", output)
         self.assertIn("📊 7天用量", output)
+        self.assertIn("━━━━━━━━━━━━━━━━", output)
+        self.assertIn("Tokens：输入 0.02k / 输出 0.004k", output)
         self.assertIn("缓存占比：读取 23.53%｜写入 17.65%", output)
         self.assertLess(len(output), 4096)
 
@@ -252,6 +254,13 @@ class DataSafetyTests(unittest.TestCase):
         }
         self.assertEqual(bot.cache_percentage_text(values), "读取 55.02%｜写入 0%")
         self.assertEqual(bot.cache_percentage_text({}), "暂无数据")
+
+    def test_token_counts_use_compact_units(self):
+        self.assertEqual(bot.format_tokens(4), "0.004k")
+        self.assertEqual(bot.format_tokens(531), "0.53k")
+        self.assertEqual(bot.format_tokens(618561), "618.6k")
+        self.assertEqual(bot.format_tokens(1250000), "1.25M")
+        self.assertEqual(bot.format_tokens(1200000000), "1.20B")
 
     def test_alert_state_is_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
