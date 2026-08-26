@@ -197,7 +197,36 @@ class MessageAuthorizationTests(unittest.TestCase):
         edit = tg.call_args_list[1].args[1]
         self.assertEqual(edit["message_id"], 9)
         self.assertIn("未找到绑定的 key：User A", edit["text"])
+        self.assertIn("🔄 刷新时间：", edit["text"])
         self.assertIn("inline_keyboard", bot.json.loads(edit["reply_markup"]))
+
+    @mock.patch.object(bot, "format_refresh_timestamp", side_effect=[
+        "2026-08-27 10:00:00",
+        "2026-08-27 10:00:10",
+    ])
+    @mock.patch.object(bot, "allow_check", return_value=(True, 0))
+    @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
+    @mock.patch.object(bot, "tg")
+    def test_admin_can_refresh_the_same_binding(self, tg, query, _allow, _refresh_time):
+        config = {
+            "admins": [123],
+            "bindings": {"123": "Administrator", "456": "User A"},
+            "timezone": "Asia/Shanghai",
+        }
+        callback = {
+            "id": "callback-refresh",
+            "from": {"id": 123},
+            "data": "usage:456",
+            "message": {"message_id": 10, "chat": {"id": 123, "type": "private"}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query(callback)
+            bot.handle_callback_query(callback)
+        self.assertEqual(query.call_count, 2)
+        edits = [call.args[1]["text"] for call in tg.call_args_list if call.args[0] == "editMessageText"]
+        self.assertEqual(len(edits), 2)
+        self.assertNotEqual(edits[0], edits[1])
+        self.assertIn("刷新时间：2026-08-27 10:00:10", edits[1])
 
 
 class DataSafetyTests(unittest.TestCase):
