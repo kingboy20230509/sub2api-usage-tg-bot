@@ -118,6 +118,87 @@ class MessageAuthorizationTests(unittest.TestCase):
             self.assertEqual(retry_after, 9)
             self.assertEqual(bot.allow_check("123", now=111), (True, 0))
 
+    @mock.patch.object(bot, "query_key_usage")
+    @mock.patch.object(bot, "tg")
+    def test_admin_check_shows_two_column_key_menu_without_querying(self, tg, query):
+        config = {
+            "admins": [123],
+            "bindings": {
+                "123": "Administrator",
+                "456": "User A",
+                "789": "User B",
+            },
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_message({
+                "chat": {"id": 123, "type": "private"},
+                "from": {"id": 123},
+                "text": "/check",
+            })
+        query.assert_not_called()
+        params = tg.call_args.args[1]
+        self.assertEqual(params["text"], "请选择要查看的 Key：")
+        keyboard = bot.json.loads(params["reply_markup"])["inline_keyboard"]
+        self.assertEqual([len(row) for row in keyboard], [2, 1])
+        buttons = [button for row in keyboard for button in row]
+        self.assertEqual({button["text"] for button in buttons}, {"Administrator", "User A", "User B"})
+        self.assertEqual({button["callback_data"] for button in buttons}, {"usage:123", "usage:456", "usage:789"})
+
+    @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
+    @mock.patch.object(bot, "tg")
+    def test_regular_user_check_queries_only_own_binding(self, tg, query):
+        config = {
+            "admins": [123],
+            "bindings": {"123": "Administrator", "456": "User A"},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_message({
+                "chat": {"id": 456, "type": "private"},
+                "from": {"id": 456},
+                "text": "/check",
+            })
+        query.assert_called_once_with("User A")
+        self.assertEqual(tg.call_args.args[0], "sendMessage")
+
+    @mock.patch.object(bot, "query_key_usage")
+    @mock.patch.object(bot, "tg")
+    def test_non_admin_cannot_use_admin_callback(self, tg, query):
+        config = {
+            "admins": [123],
+            "bindings": {"123": "Administrator", "456": "User A"},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "callback-1",
+                "from": {"id": 456},
+                "data": "usage:123",
+                "message": {"message_id": 8, "chat": {"id": 456, "type": "private"}},
+            })
+        query.assert_not_called()
+        self.assertEqual(tg.call_args.args[0], "answerCallbackQuery")
+        self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
+
+    @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
+    @mock.patch.object(bot, "tg")
+    def test_admin_callback_queries_selected_binding_and_keeps_menu(self, tg, query):
+        config = {
+            "admins": [123],
+            "bindings": {"123": "Administrator", "456": "User A"},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "callback-2",
+                "from": {"id": 123},
+                "data": "usage:456",
+                "message": {"message_id": 9, "chat": {"id": 123, "type": "private"}},
+            })
+        query.assert_called_once_with("User A")
+        self.assertEqual([call.args[0] for call in tg.call_args_list], ["answerCallbackQuery", "editMessageText"])
+        edit = tg.call_args_list[1].args[1]
+        self.assertEqual(edit["message_id"], 9)
+        self.assertIn("未找到绑定的 key：User A", edit["text"])
+        self.assertIn("inline_keyboard", bot.json.loads(edit["reply_markup"]))
+
 
 class DataSafetyTests(unittest.TestCase):
     def test_invalid_key_name_is_rejected_before_subprocess(self):
@@ -175,7 +256,15 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("AS window_end", sql)
         self.assertIn("sum(cache_creation_tokens)", sql)
         self.assertIn("sum(cache_read_tokens)", sql)
+        self.assertIn("match_count AS", sql)
+        self.assertIn("'duplicate_key_name'", sql)
+        self.assertNotIn("ORDER BY id ASC", sql)
         self.assertNotIn("GRANT SELECT", sql)
+
+    def test_duplicate_key_name_returns_a_safe_error(self):
+        output = bot.format_usage("same-name", {"error": "duplicate_key_name"})
+        self.assertIn("检测到多个同名 Key：same-name", output)
+        self.assertIn("名称修改为唯一名称", output)
 
     def test_usage_output_has_progress_time_and_model_cache_details(self):
         data = {
@@ -309,11 +398,11 @@ class DispatcherTests(unittest.TestCase):
         started = threading.Event()
         release = threading.Event()
 
-        def blocked_handler(_message):
+        def blocked_handler(_update):
             started.set()
             release.wait(timeout=2)
 
-        with mock.patch.object(bot, "handle_message", blocked_handler):
+        with mock.patch.object(bot, "handle_update", blocked_handler):
             dispatcher = bot.UpdateDispatcher(workers=1, max_pending=1)
             try:
                 self.assertEqual(dispatcher.submit(1, {}), "accepted")
@@ -333,7 +422,7 @@ class DispatcherTests(unittest.TestCase):
         )
         self.assertEqual(offset, 11)
         self.assertFalse(busy)
-        dispatcher.submit.assert_called_once_with(10, {"text": "/start"})
+        dispatcher.submit.assert_called_once_with(10, {"update_id": 10, "message": {"text": "/start"}})
 
     def test_busy_poll_update_is_not_acknowledged(self):
         dispatcher = mock.Mock()
@@ -348,12 +437,13 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(offset, 11)
         self.assertTrue(busy)
 
-    def test_non_message_update_is_acknowledged(self):
+    def test_callback_update_is_submitted(self):
         dispatcher = mock.Mock()
+        dispatcher.submit.return_value = "accepted"
         offset, busy = bot.dispatch_update_batch([{"update_id": 20, "callback_query": {}}], dispatcher)
         self.assertEqual(offset, 21)
         self.assertFalse(busy)
-        dispatcher.submit.assert_not_called()
+        dispatcher.submit.assert_called_once_with(20, {"update_id": 20, "callback_query": {}})
 
     def test_poll_loop_uses_get_updates_and_stops_cleanly(self):
         dispatcher = mock.Mock()
@@ -363,6 +453,7 @@ class DispatcherTests(unittest.TestCase):
             stop_event.set()
             self.assertEqual(method, "getUpdates")
             self.assertEqual(params["timeout"], "7")
+            self.assertEqual(bot.json.loads(params["allowed_updates"]), ["message", "callback_query"])
             self.assertEqual(timeout, 12)
             return []
 

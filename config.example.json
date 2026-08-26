@@ -1,6 +1,10 @@
 {
+  "admins": [
+    "123456789"
+  ],
   "bindings": {
-    "123456789": "example-key-name"
+    "123456789": "Administrator",
+    "987654321": "example-key-name"
   },
   "timezone": "Asia/Shanghai"
 }

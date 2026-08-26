@@ -20,8 +20,8 @@ Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API
 
 ## 功能与安全边界
 
-- `/start` 显示使用提示，`/check` 查询用量。
-- 显示总额度、5 小时/日/周限额、今日及 7 天用量和模型统计；周限额显示账号实际重置周期，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
+- `/start` 显示使用提示，`/check` 查询用量；管理员可以通过按钮选择配置中的不同 Key。
+- 显示总额度、5 小时/日/周限额、今日及 7 天用量和模型统计；周限额显示该 Key 的本地限额窗口，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
 - 周额度剩余不超过 20% 时主动提醒，每个周窗口只提醒一次。
 - 仅允许绑定用户在与 Bot 的私聊中查询；群聊不返回用量。
 - 限制并发、待处理消息数和每用户查询频率。
@@ -85,14 +85,20 @@ chmod 600 secrets/telegram_bot_token secrets/postgres_password
 
 ```json
 {
+  "admins": [
+    "123456789"
+  ],
   "bindings": {
-    "123456789": "example-key-name"
+    "123456789": "Administrator",
+    "987654321": "example-key-name"
   },
   "timezone": "Asia/Shanghai"
 }
 ```
 
-左边是 Telegram 数字用户 ID 字符串；右边是 Sub2API 数据库中准确的 `api_keys.name`。生产 Linux 主机使用：
+`admins` 中填写管理员的 Telegram 数字用户 ID；`bindings` 左边是 Telegram 数字用户 ID 字符串，右边是 Sub2API 数据库中准确的 `api_keys.name`。管理员发送 `/check` 后会看到所有 `bindings` 的 Key 按钮，普通用户只能查询自己的绑定。按钮文字直接使用 Key 名称，不需要额外的 `label`。
+
+Key 名称必须唯一。如果数据库中存在多个未删除且同名的 Key，Bot 会拒绝返回数据并提示先改成唯一名称，避免误显示其他 Key 的用量。生产 Linux 主机使用：
 
 ```bash
 chown 10001:10001 config.json
@@ -161,7 +167,7 @@ sub2api tg bot long polling started
 /check
 ```
 
-`/check` 默认每个用户 10 秒只能执行一次。
+普通用户直接查询自己的 Key；管理员会先看到 Key 选择按钮，点击后查询对应 Key。实际数据库查询默认每个用户 10 秒只能执行一次。
 
 ## 容器更新
 
@@ -186,6 +192,7 @@ docker compose logs --tail=200 sub2api-tg-bot
 - `permission denied`：`config.json` 没有设置为 UID/GID `10001` 可读。
 - 未绑定：`config.json` 的 Telegram ID 不匹配。
 - 查不到 Key：绑定值不是准确的 `api_keys.name`。
+- 同名 Key：Sub2API 中有多个未删除的 Key 使用了相同名称，请先修改为唯一名称。
 
 容器健康检查访问 `127.0.0.1:8099/health`，该端口只在容器内部监听且不发布到宿主机。
 
