@@ -1,3 +1,4 @@
+/opt/homebrew/Library/Homebrew/cmd/shellenv.sh: line 27: /bin/ps: Operation not permitted
 import http.client
 import os
 import stat
@@ -170,7 +171,9 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text)", sql)
         self.assertIn("'models_today'", sql)
         self.assertIn("'models_7d'", sql)
-        self.assertIn("now() - interval '7 days'", sql)
+        self.assertIn("interval '6 days'", sql)
+        self.assertIn("AS window_start", sql)
+        self.assertIn("AS window_end", sql)
         self.assertIn("sum(cache_creation_tokens)", sql)
         self.assertIn("sum(cache_read_tokens)", sql)
         self.assertNotIn("GRANT SELECT", sql)
@@ -184,6 +187,10 @@ class DataSafetyTests(unittest.TestCase):
                 "quota_used": 25,
                 "rate_limit_5h": 100,
                 "usage_5h": 25,
+                "rate_limit_7d": 600,
+                "usage_7d": 25,
+                "window_7d_start": "2026-08-24T00:00:00+00:00",
+                "window_7d_end": "2026-08-31T00:00:00+00:00",
                 "last_used_at": "2026-08-21T15:31:41.722896+08:00",
             },
             "today": {
@@ -201,6 +208,8 @@ class DataSafetyTests(unittest.TestCase):
                 "cache_creation_tokens": 6,
                 "cache_read_tokens": 8,
                 "actual_cost": "0.02",
+                "window_start": "2026-08-19T16:00:00+00:00",
+                "window_end": "2026-08-25T16:00:00+00:00",
             },
             "models_today": [{
                 "model": "gpt-today",
@@ -223,8 +232,9 @@ class DataSafetyTests(unittest.TestCase):
         }
         output = bot.format_usage("example-key", data)
         self.assertIn("• 5 小时：已用 25 / 限额 100 / 剩余 75", output)
+        self.assertIn("重置周期：2026-08-24 08:00 ～ 2026-08-31 08:00", output)
         self.assertIn("  [███░░░░░░░░░] 25%", output)
-        self.assertEqual(output.count("["), 1)
+        self.assertEqual(output.count("["), 2)
         self.assertNotIn("💰 额度", output)
         self.assertNotIn("总额", output)
         self.assertIn("状态：正常", output)
@@ -234,6 +244,7 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("gpt-today", output)
         self.assertIn("gpt-all", output)
         self.assertIn("📊 7天用量", output)
+        self.assertIn("统计范围：2026-08-20 ～ 2026-08-26", output)
         self.assertIn("━━━━━━━━━━━━━━━━", output)
         self.assertIn("Tokens：输入 0.02k / 输出 0.004k", output)
         self.assertIn("缓存占比：读取 23.53%｜写入 17.65%", output)
