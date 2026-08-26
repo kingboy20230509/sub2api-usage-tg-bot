@@ -116,6 +116,38 @@ def load_config():
         return json.load(f)
 
 
+def config_bindings(config):
+    bindings = config.get("bindings") or {}
+    if not isinstance(bindings, dict):
+        raise ValueError("bindings must be an object")
+    normalized = {}
+    for user_id, key_name in bindings.items():
+        user_id = str(user_id)
+        if not user_id.isdigit() or not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
+            raise ValueError("Invalid Telegram ID or key name in binding config")
+        normalized[user_id] = key_name
+    return normalized
+
+
+def config_admins(config):
+    admins = config.get("admins") or []
+    if not isinstance(admins, list):
+        raise ValueError("admins must be an array")
+    normalized = {str(user_id) for user_id in admins}
+    if any(not user_id.isdigit() for user_id in normalized):
+        raise ValueError("Invalid Telegram ID in admins config")
+    return normalized
+
+
+def admin_keyboard(bindings):
+    buttons = []
+    for user_id, key_name in sorted(bindings.items(), key=lambda item: (item[1].casefold(), item[0])):
+        button_text = key_name if len(key_name) <= 64 else key_name[:61] + "..."
+        buttons.append({"text": button_text, "callback_data": f"usage:{user_id}"})
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
 def tg(method, params=None, timeout=10):
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
@@ -333,7 +365,7 @@ def save_alert_state(state):
 def check_weekly_alerts():
     try:
         cfg = load_config()
-        bindings = cfg.get("bindings") or {}
+        bindings = config_bindings(cfg)
         state = load_alert_state()
         changed = False
         for user_id, key_name in bindings.items():
@@ -376,6 +408,11 @@ def alert_loop():
 
 
 def format_usage(key_name, data):
+    if data.get("error") == "duplicate_key_name":
+        return (
+            f"⚠️ 检测到多个同名 Key：{key_name}\n\n"
+            "为避免显示错误用户的数据，请先在 Sub2API 中将 Key 名称修改为唯一名称。"
+        )
     k = data.get("key")
     if not k:
         return f"未找到绑定的 key：{key_name}"
@@ -460,12 +497,23 @@ def handle_message(msg):
     if cmd == "/start":
         tg("sendMessage", {"chat_id": chat_id, "text": "发送 /check 查询你绑定的 Sub2API key 用量。"})
         return
+    cfg = load_config()
+    bindings = config_bindings(cfg)
+    if user_id in config_admins(cfg):
+        if not bindings:
+            tg("sendMessage", {"chat_id": chat_id, "text": "当前没有配置任何用户绑定。"})
+            return
+        tg("sendMessage", {
+            "chat_id": chat_id,
+            "text": "请选择要查看的 Key：",
+            "reply_markup": admin_keyboard(bindings),
+        })
+        return
     allowed, retry_after = allow_check(user_id)
     if not allowed:
         tg("sendMessage", {"chat_id": chat_id, "text": f"查询过于频繁，请 {retry_after} 秒后再试。"})
         return
-    cfg = load_config()
-    key_name = (cfg.get("bindings") or {}).get(user_id)
+    key_name = bindings.get(user_id)
     if not key_name:
         tg("sendMessage", {"chat_id": chat_id, "text": "你的 Telegram ID 还没有绑定 key。"})
         return
@@ -483,6 +531,72 @@ def handle_message(msg):
         tg("sendMessage", {"chat_id": chat_id, "text": "查询失败，请稍后再试。"})
 
 
+def handle_callback_query(callback):
+    callback_id = callback.get("id")
+    callback_data = callback.get("data") or ""
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    user = callback.get("from") or {}
+    user_id = str(user.get("id"))
+    if not callback_id or not callback_data.startswith("usage:"):
+        return
+    if not is_private_user_chat(chat, user):
+        tg("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "为保护用量信息，请私聊机器人查询。",
+            "show_alert": "true",
+        })
+        return
+    try:
+        cfg = load_config()
+        bindings = config_bindings(cfg)
+        if user_id not in config_admins(cfg):
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": "你没有管理员权限。",
+                "show_alert": "true",
+            })
+            return
+        target_user_id = callback_data.removeprefix("usage:")
+        key_name = bindings.get(target_user_id)
+        if not key_name:
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": "该绑定已不存在，请重新发送 /check。",
+                "show_alert": "true",
+            })
+            return
+        allowed, retry_after = allow_check(user_id)
+        if not allowed:
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": f"查询过于频繁，请 {retry_after} 秒后再试。",
+                "show_alert": "true",
+            })
+            return
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+        data = query_key_usage(key_name)
+        tg("editMessageText", {
+            "chat_id": chat.get("id"),
+            "message_id": message.get("message_id"),
+            "text": format_usage(key_name, data or {}),
+            "reply_markup": admin_keyboard(bindings),
+        })
+    except Exception as error:
+        log_failure(f"admin check user={masked_id(user_id)}", error)
+        tg("sendMessage", {"chat_id": chat.get("id"), "text": "查询失败，请稍后再试。"})
+
+
+def handle_update(update):
+    message = update.get("message")
+    if isinstance(message, dict):
+        handle_message(message)
+        return
+    callback = update.get("callback_query")
+    if isinstance(callback, dict):
+        handle_callback_query(callback)
+
+
 class UpdateDispatcher:
     def __init__(self, workers, max_pending):
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="telegram-update")
@@ -490,7 +604,7 @@ class UpdateDispatcher:
         self.seen_lock = threading.Lock()
         self.seen_updates = {}
 
-    def submit(self, update_id, message):
+    def submit(self, update_id, update):
         now = time.monotonic()
         with self.seen_lock:
             cutoff = now - 86400
@@ -506,7 +620,7 @@ class UpdateDispatcher:
                 return "busy"
             self.seen_updates[update_id] = now
         try:
-            future = self.executor.submit(handle_message, message)
+            future = self.executor.submit(handle_update, update)
         except Exception:
             with self.seen_lock:
                 self.seen_updates.pop(update_id, None)
@@ -559,11 +673,10 @@ def dispatch_update_batch(updates, dispatcher, offset=None):
             continue
         update_id = update["update_id"]
         next_offset = max(offset or 0, update_id + 1)
-        message = update.get("message")
-        if not isinstance(message, dict):
+        if not isinstance(update.get("message"), dict) and not isinstance(update.get("callback_query"), dict):
             offset = next_offset
             continue
-        result = dispatcher.submit(update_id, message)
+        result = dispatcher.submit(update_id, update)
         if result == "busy":
             return offset, True
         offset = next_offset
@@ -577,7 +690,7 @@ def poll_updates(dispatcher, stop_event):
         params = {
             "timeout": str(POLL_TIMEOUT),
             "limit": "100",
-            "allowed_updates": json.dumps(["message"]),
+            "allowed_updates": json.dumps(["message", "callback_query"]),
         }
         if offset is not None:
             params["offset"] = str(offset)
