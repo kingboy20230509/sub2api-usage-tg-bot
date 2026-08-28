@@ -3,8 +3,14 @@
     "123456789"
   ],
   "bindings": {
-    "123456789": "Administrator",
-    "987654321": "example-key-name"
+    "123456789": {
+      "key_name": "Administrator",
+      "account_id": 12
+    },
+    "987654321": {
+      "key_name": "example-key-name",
+      "account_id": 15
+    }
   },
   "timezone": "Asia/Shanghai"
 }
