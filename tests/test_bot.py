@@ -124,6 +124,22 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertEqual(bot.allow_check("123", now=101, cooldown=2), (False, 1))
         self.assertEqual(bot.allow_check("123", now=102, cooldown=2), (True, 0))
 
+    def test_bindings_accept_account_id_objects_and_legacy_strings(self):
+        bindings = bot.config_bindings({
+            "bindings": {
+                "123": {"key_name": "Administrator", "account_id": 12},
+                "456": "legacy-key",
+            },
+        })
+        self.assertEqual(bindings["123"], {"key_name": "Administrator", "account_id": 12})
+        self.assertEqual(bindings["456"], {"key_name": "legacy-key", "account_id": None})
+
+    def test_binding_rejects_invalid_account_id(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            bot.config_bindings({
+                "bindings": {"123": {"key_name": "Administrator", "account_id": "12"}},
+            })
+
     @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "tg")
     def test_admin_check_shows_two_column_key_menu_without_querying(self, tg, query):
@@ -163,7 +179,7 @@ class MessageAuthorizationTests(unittest.TestCase):
                 "from": {"id": 456},
                 "text": "/check",
             })
-        query.assert_called_once_with("User A")
+        query.assert_called_once_with("User A", None)
         self.assertEqual(tg.call_args.args[0], "sendMessage")
 
     @mock.patch.object(bot, "query_key_usage")
@@ -198,7 +214,7 @@ class MessageAuthorizationTests(unittest.TestCase):
                 "data": "usage:456",
                 "message": {"message_id": 9, "chat": {"id": 123, "type": "private"}},
             })
-        query.assert_called_once_with("User A")
+        query.assert_called_once_with("User A", None)
         self.assertEqual([call.args[0] for call in tg.call_args_list], ["answerCallbackQuery", "editMessageText"])
         edit = tg.call_args_list[1].args[1]
         self.assertEqual(edit["message_id"], 9)
@@ -257,6 +273,21 @@ class DataSafetyTests(unittest.TestCase):
             {"key_name": "example-key"},
         )
 
+    def test_account_binding_uses_fixed_account_snapshot_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_key_usage("example-key", 12)
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.usage_with_account(:'key_name', :'account_id'::bigint)::text;",
+            {"key_name": "example-key", "account_id": "12"},
+        )
+
+    def test_invalid_account_id_is_rejected_before_subprocess(self):
+        for value in (True, 0, -1, "12"):
+            with self.subTest(value=value), mock.patch.object(bot, "run_psql_json") as run:
+                with self.assertRaises(ValueError):
+                    bot.query_key_usage("example-key", value)
+                run.assert_not_called()
+
     def test_psql_subprocess_gets_only_database_environment(self):
         with mock.patch.multiple(
             bot,
@@ -289,8 +320,13 @@ class DataSafetyTests(unittest.TestCase):
             sql = file.read()
         self.assertIn("SECURITY DEFINER", sql)
         self.assertIn("SET search_path = pg_catalog", sql)
-        self.assertIn("REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs", sql)
+        self.assertIn("REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
+        self.assertIn("FROM public.accounts", sql)
+        self.assertIn("extra->>'codex_usage_updated_at'", sql)
+        self.assertIn("extra->>'codex_5h_reset_at'", sql)
+        self.assertIn("extra->>'codex_7d_reset_at'", sql)
         self.assertIn("'models_today'", sql)
         self.assertIn("'models_7d'", sql)
         self.assertIn("interval '6 days'", sql)
@@ -359,10 +395,25 @@ class DataSafetyTests(unittest.TestCase):
                 "cache_read_tokens": 8,
                 "actual_cost": "0.02",
             }],
+            "upstream_account": {
+                "id": 12,
+                "platform": "openai",
+                "type": "codex",
+                "snapshot_updated_at": "2026-08-24T06:59:30Z",
+                "reset_5h_at": "2026-08-24T12:30:00Z",
+                "reset_7d_at": "2026-08-31T00:00:00Z",
+            },
         }
-        output = bot.format_usage("example-key", data)
+        output = bot.format_usage(
+            "example-key",
+            data,
+            now=bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00"),
+        )
         self.assertIn("• 5 小时：已用 25 / 限额 100 / 剩余 75", output)
-        self.assertIn("重置周期：2026-08-24 08:00 ～ 2026-08-31 08:00", output)
+        self.assertIn("上游重置：2026-08-24 20:30:00（剩余 5h 30m）", output)
+        self.assertIn("上游重置：2026-08-31 08:00:00（剩余 6d 17h）", output)
+        self.assertIn("上游账号：ID 12｜快照更新：2026-08-24 14:59:30", output)
+        self.assertNotIn("重置周期：", output)
         self.assertIn("  [███░░░░░░░░░] 25%", output)
         self.assertEqual(output.count("["), 2)
         self.assertNotIn("💰 额度", output)
@@ -379,6 +430,23 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("Tokens：输入 0.02k / 输出 0.004k", output)
         self.assertIn("缓存占比：读取 23.53%｜写入 17.65%", output)
         self.assertLess(len(output), 4096)
+
+    def test_missing_configured_account_is_visible_without_guessing_a_reset(self):
+        data = {
+            "key": {"name": "example-key", "status": "active"},
+            "upstream_account": {"error": "not_found", "id": 99},
+        }
+        output = bot.format_usage("example-key", data)
+        self.assertIn("未找到配置的上游账号 ID：99", output)
+        self.assertNotIn("上游重置：", output)
+
+    def test_upstream_reset_supports_unix_seconds_and_expired_snapshots(self):
+        reset_at = bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00").timestamp()
+        now = bot.datetime.fromisoformat("2026-08-24T07:00:01+00:00")
+        self.assertEqual(bot.reset_remaining_text(int(reset_at), now), "已到重置时间，等待快照更新")
+        lines = []
+        bot.append_account_reset(lines, int(reset_at), now)
+        self.assertEqual(lines, ["  上游重置：2026-08-24 15:00:00（已到重置时间，等待快照更新）"])
 
     def test_numbers_use_at_most_two_decimal_places(self):
         self.assertEqual(bot.money("0.000468"), "0")
@@ -413,6 +481,12 @@ class DataSafetyTests(unittest.TestCase):
 
 
 class ContainerPackagingTests(unittest.TestCase):
+    def test_example_config_binds_key_names_to_account_ids(self):
+        with open("config.example.json", "r", encoding="utf-8") as file:
+            config = bot.json.load(file)
+        bindings = bot.config_bindings(config)
+        self.assertEqual(bindings["123456789"], {"key_name": "Administrator", "account_id": 12})
+
     def test_image_runs_as_unprivileged_user_and_has_healthcheck(self):
         with open("Dockerfile", "r", encoding="utf-8") as file:
             dockerfile = file.read()
