@@ -410,9 +410,10 @@ class DataSafetyTests(unittest.TestCase):
             now=bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00"),
         )
         self.assertIn("• 5 小时：已用 25 / 限额 100 / 剩余 75", output)
-        self.assertIn("上游重置：2026-08-24 20:30:00（剩余 5h 30m）", output)
-        self.assertIn("上游重置：2026-08-31 08:00:00（剩余 6d 17h）", output)
-        self.assertIn("上游账号：ID 12｜快照更新：2026-08-24 14:59:30", output)
+        self.assertIn("重置时间：2026-08-24 20:30:00｜剩余：5h 30m", output)
+        self.assertIn("重置时间：2026-08-31 08:00:00｜剩余：6d 17h", output)
+        self.assertNotIn("上游账号：", output)
+        self.assertNotIn("快照更新：", output)
         self.assertNotIn("重置周期：", output)
         self.assertIn("  [███░░░░░░░░░] 25%", output)
         self.assertEqual(output.count("["), 2)
@@ -438,15 +439,38 @@ class DataSafetyTests(unittest.TestCase):
         }
         output = bot.format_usage("example-key", data)
         self.assertIn("未找到配置的上游账号 ID：99", output)
-        self.assertNotIn("上游重置：", output)
+        self.assertNotIn("重置时间：", output)
+
+    def test_unlimited_window_does_not_show_its_upstream_reset(self):
+        data = {
+            "key": {
+                "name": "example-key",
+                "status": "active",
+                "rate_limit_5h": 0,
+                "rate_limit_7d": 600,
+            },
+            "upstream_account": {
+                "id": 2,
+                "reset_5h_at": "2026-08-24T12:30:00Z",
+                "reset_7d_at": "2026-08-31T00:00:00Z",
+            },
+        }
+        output = bot.format_usage(
+            "example-key",
+            data,
+            now=bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00"),
+        )
+        self.assertIn("• 5 小时：不限", output)
+        self.assertNotIn("2026-08-24 20:30:00", output)
+        self.assertIn("重置时间：2026-08-31 08:00:00｜剩余：6d 17h", output)
 
     def test_upstream_reset_supports_unix_seconds_and_expired_snapshots(self):
         reset_at = bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00").timestamp()
         now = bot.datetime.fromisoformat("2026-08-24T07:00:01+00:00")
-        self.assertEqual(bot.reset_remaining_text(int(reset_at), now), "已到重置时间，等待快照更新")
+        self.assertEqual(bot.reset_remaining_text(int(reset_at), now), "等待快照更新")
         lines = []
         bot.append_account_reset(lines, int(reset_at), now)
-        self.assertEqual(lines, ["  上游重置：2026-08-24 15:00:00（已到重置时间，等待快照更新）"])
+        self.assertEqual(lines, ["  重置时间：2026-08-24 15:00:00｜剩余：等待快照更新"])
 
     def test_numbers_use_at_most_two_decimal_places(self):
         self.assertEqual(bot.money("0.000468"), "0")

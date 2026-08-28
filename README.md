@@ -111,7 +111,7 @@ docker compose exec -T postgres psql -U sub2api -d sub2api -P pager=off \
   -c "SELECT id, name, platform, type, status, extra->>'codex_usage_updated_at' AS snapshot_updated_at, extra->>'codex_7d_reset_at' AS reset_7d_at FROM accounts WHERE deleted_at IS NULL ORDER BY id;"
 ```
 
-`account_id` 必须按账号逐个绑定，不能用 Key 名称推断。Bot 使用 `accounts.extra` 中由 Sub2API 保存的 `codex_5h_reset_at`、`codex_7d_reset_at` 和 `codex_usage_updated_at`，并实时计算剩余时间。该快照可能在账号尚未使用或后台尚未刷新时为空或过期；Bot 会显示快照更新时间，不会伪造重置周期，也不会使用管理员 Token 强制刷新。旧版字符串绑定仍可继续使用，但不会显示上游账号重置时间。
+`account_id` 必须按账号逐个绑定，不能用 Key 名称推断。Bot 使用 `accounts.extra` 中由 Sub2API 保存的 `codex_5h_reset_at` 和 `codex_7d_reset_at`，并实时计算剩余时间；只有对应 Key 配置了该项限额时才会显示。该快照可能在账号尚未使用或后台尚未刷新时为空或过期；Bot 不会伪造重置周期，也不会使用管理员 Token 强制刷新。旧版字符串绑定仍可继续使用，但不会显示上游账号重置时间。
 
 Key 名称必须唯一。如果数据库中存在多个未删除且同名的 Key，Bot 会拒绝返回数据并提示先改成唯一名称，避免误显示其他 Key 的用量。生产 Linux 主机使用：
 
