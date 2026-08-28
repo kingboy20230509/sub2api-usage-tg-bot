@@ -10,7 +10,7 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -124,11 +124,23 @@ def config_bindings(config):
     if not isinstance(bindings, dict):
         raise ValueError("bindings must be an object")
     normalized = {}
-    for user_id, key_name in bindings.items():
+    for user_id, value in bindings.items():
         user_id = str(user_id)
+        if isinstance(value, str):
+            key_name = value
+            account_id = None
+        elif isinstance(value, dict):
+            if set(value) != {"key_name", "account_id"}:
+                raise ValueError("Binding objects must contain only key_name and account_id")
+            key_name = value.get("key_name")
+            account_id = value.get("account_id")
+            if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+                raise ValueError("account_id must be a positive integer")
+        else:
+            raise ValueError("Binding must be a key name string or an object")
         if not user_id.isdigit() or not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
             raise ValueError("Invalid Telegram ID or key name in binding config")
-        normalized[user_id] = key_name
+        normalized[user_id] = {"key_name": key_name, "account_id": account_id}
     return normalized
 
 
@@ -144,7 +156,9 @@ def config_admins(config):
 
 def admin_keyboard(bindings):
     buttons = []
-    for user_id, key_name in sorted(bindings.items(), key=lambda item: (item[1].casefold(), item[0])):
+    sorted_bindings = sorted(bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0]))
+    for user_id, binding in sorted_bindings:
+        key_name = binding["key_name"]
         button_text = key_name if len(key_name) <= 64 else key_name[:61] + "..."
         buttons.append({"text": button_text, "callback_data": f"usage:{user_id}"})
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
@@ -270,12 +284,6 @@ def format_date_range(start, end):
     return f"{format_timestamp(start)[:10]} ～ {format_timestamp(end)[:10]}"
 
 
-def format_datetime_range(start, end):
-    if not start or not end:
-        return None
-    return f"{format_timestamp(start)[:16]} ～ {format_timestamp(end)[:16]}"
-
-
 def format_refresh_timestamp(config):
     timezone_name = config.get("timezone") or "Asia/Shanghai"
     try:
@@ -320,11 +328,46 @@ def append_limit(lines, label, limit_value, used_value):
     lines.extend([summary, f"  {progress_bar(used, limit)}"])
 
 
-def append_weekly_limit(lines, key):
-    append_limit(lines, "每周", key.get("rate_limit_7d"), key.get("usage_7d"))
-    reset_period = format_datetime_range(key.get("window_7d_start"), key.get("window_7d_end"))
-    if reset_period:
-        lines.append(f"  重置周期：{reset_period}")
+def parse_upstream_timestamp(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float, Decimal)) or re.fullmatch(r"\d+(?:\.\d+)?", str(value)):
+            epoch = float(value)
+            if epoch > 10_000_000_000:
+                epoch /= 1000
+            return datetime.fromtimestamp(epoch, timezone.utc)
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def reset_remaining_text(value, now=None):
+    reset_at = parse_upstream_timestamp(value)
+    if reset_at is None:
+        return None
+    current = datetime.now(timezone.utc) if now is None else now
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    seconds = int((reset_at - current).total_seconds())
+    if seconds <= 0:
+        return "已到重置时间，等待快照更新"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"剩余 {days}d" + (f" {hours}h" if hours else "")
+    if hours:
+        return f"剩余 {hours}h" + (f" {minutes}m" if minutes else "")
+    return f"剩余 {max(1, minutes)}m"
+
+
+def append_account_reset(lines, reset_at, now=None):
+    remaining = reset_remaining_text(reset_at, now)
+    if remaining:
+        timestamp = parse_upstream_timestamp(reset_at).astimezone(ZoneInfo("Asia/Shanghai"))
+        lines.append(f"  上游重置：{timestamp.strftime('%Y-%m-%d %H:%M:%S')}（{remaining}）")
 
 
 def append_model_section(lines, title, models):
@@ -342,11 +385,16 @@ def append_model_section(lines, title, models):
         ])
 
 
-def query_key_usage(key_name):
+def query_key_usage(key_name, account_id=None):
     if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
         raise ValueError("Invalid key name in binding config")
-    sql = "SELECT sub2api_tg_bot_api.usage(:'key_name')::text;"
-    return run_psql_json(sql, {"key_name": key_name})
+    if account_id is not None and (isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0):
+        raise ValueError("Invalid account ID in binding config")
+    if account_id is None:
+        sql = "SELECT sub2api_tg_bot_api.usage(:'key_name')::text;"
+        return run_psql_json(sql, {"key_name": key_name})
+    sql = "SELECT sub2api_tg_bot_api.usage_with_account(:'key_name', :'account_id'::bigint)::text;"
+    return run_psql_json(sql, {"key_name": key_name, "account_id": str(account_id)})
 
 
 def load_alert_state():
@@ -380,9 +428,10 @@ def check_weekly_alerts():
         bindings = config_bindings(cfg)
         state = load_alert_state()
         changed = False
-        for user_id, key_name in bindings.items():
+        for user_id, binding in bindings.items():
             try:
-                data = query_key_usage(key_name) or {}
+                key_name = binding["key_name"]
+                data = query_key_usage(key_name, binding["account_id"]) or {}
                 key = data.get("key") or {}
                 limit = dec(key.get("rate_limit_7d"))
                 used = dec(key.get("usage_7d"))
@@ -419,7 +468,7 @@ def alert_loop():
         time.sleep(max(ALERT_CHECK_INTERVAL, 60))
 
 
-def format_usage(key_name, data):
+def format_usage(key_name, data, now=None):
     if data.get("error") == "duplicate_key_name":
         return (
             f"⚠️ 检测到多个同名 Key：{key_name}\n\n"
@@ -432,6 +481,7 @@ def format_usage(key_name, data):
     today = data.get("today") or {}
     models_today = data.get("models_today") or []
     models_7d = data.get("models_7d") or []
+    upstream_account = data.get("upstream_account") or {}
     lines = [
         f"🔑 Key：{k.get('name')}",
         f"状态：{format_status(k.get('status'))}",
@@ -439,8 +489,16 @@ def format_usage(key_name, data):
         "⏱ 限额",
     ]
     append_limit(lines, "5 小时", k.get("rate_limit_5h"), k.get("usage_5h"))
+    append_account_reset(lines, upstream_account.get("reset_5h_at"), now)
     append_limit(lines, "每日", k.get("rate_limit_1d"), k.get("usage_1d"))
-    append_weekly_limit(lines, k)
+    append_limit(lines, "每周", k.get("rate_limit_7d"), k.get("usage_7d"))
+    append_account_reset(lines, upstream_account.get("reset_7d_at"), now)
+    if upstream_account.get("error") == "not_found":
+        lines.append(f"  ⚠️ 未找到配置的上游账号 ID：{upstream_account.get('id')}")
+    elif upstream_account.get("id"):
+        snapshot_updated_at = upstream_account.get("snapshot_updated_at")
+        snapshot_text = format_timestamp(snapshot_updated_at) if snapshot_updated_at else "暂无"
+        lines.append(f"  上游账号：ID {upstream_account.get('id')}｜快照更新：{snapshot_text}")
     lines.extend([
         "",
         "📅 今日用量",
@@ -526,13 +584,14 @@ def handle_message(msg):
     if not allowed:
         tg("sendMessage", {"chat_id": chat_id, "text": f"查询过于频繁，请 {retry_after} 秒后再试。"})
         return
-    key_name = bindings.get(user_id)
-    if not key_name:
+    binding = bindings.get(user_id)
+    if not binding:
         tg("sendMessage", {"chat_id": chat_id, "text": "你的 Telegram ID 还没有绑定 key。"})
         return
+    key_name = binding["key_name"]
     t0 = time.perf_counter()
     try:
-        data = query_key_usage(key_name)
+        data = query_key_usage(key_name, binding["account_id"])
         t1 = time.perf_counter()
         reply = format_usage(key_name, data or {})
         t2 = time.perf_counter()
@@ -571,14 +630,15 @@ def handle_callback_query(callback):
             })
             return
         target_user_id = callback_data.removeprefix("usage:")
-        key_name = bindings.get(target_user_id)
-        if not key_name:
+        binding = bindings.get(target_user_id)
+        if not binding:
             tg("answerCallbackQuery", {
                 "callback_query_id": callback_id,
                 "text": "该绑定已不存在，请重新发送 /check。",
                 "show_alert": "true",
             })
             return
+        key_name = binding["key_name"]
         allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
         if not allowed:
             tg("answerCallbackQuery", {
@@ -588,7 +648,7 @@ def handle_callback_query(callback):
             })
             return
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
-        data = query_key_usage(key_name)
+        data = query_key_usage(key_name, binding["account_id"])
         reply = format_usage(key_name, data or {})
         reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
         tg("editMessageText", {
