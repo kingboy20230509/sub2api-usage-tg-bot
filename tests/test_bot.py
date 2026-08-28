@@ -25,6 +25,7 @@ class RuntimeConfigTests(unittest.TestCase):
             UPDATE_WORKERS=4,
             UPDATE_MAX_PENDING=16,
             CHECK_COOLDOWN=10,
+            ADMIN_CHECK_COOLDOWN=2,
             POLL_TIMEOUT=10,
         )
 
@@ -117,6 +118,11 @@ class MessageAuthorizationTests(unittest.TestCase):
             self.assertFalse(allowed)
             self.assertEqual(retry_after, 9)
             self.assertEqual(bot.allow_check("123", now=111), (True, 0))
+
+    def test_admin_check_can_use_a_shorter_cooldown(self):
+        self.assertEqual(bot.allow_check("123", now=100, cooldown=2), (True, 0))
+        self.assertEqual(bot.allow_check("123", now=101, cooldown=2), (False, 1))
+        self.assertEqual(bot.allow_check("123", now=102, cooldown=2), (True, 0))
 
     @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "tg")
@@ -223,6 +229,13 @@ class MessageAuthorizationTests(unittest.TestCase):
             bot.handle_callback_query(callback)
             bot.handle_callback_query(callback)
         self.assertEqual(query.call_count, 2)
+        self.assertEqual(
+            _allow.call_args_list,
+            [
+                mock.call("123", cooldown=bot.ADMIN_CHECK_COOLDOWN),
+                mock.call("123", cooldown=bot.ADMIN_CHECK_COOLDOWN),
+            ],
+        )
         edits = [call.args[1]["text"] for call in tg.call_args_list if call.args[0] == "editMessageText"]
         self.assertEqual(len(edits), 2)
         self.assertNotEqual(edits[0], edits[1])
