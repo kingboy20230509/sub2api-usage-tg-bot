@@ -129,12 +129,51 @@ SELECT CASE
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.usage_with_account(
+  p_key_name text,
+  p_account_id bigint
+)
+RETURNS json
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+WITH base AS (
+  SELECT sub2api_tg_bot_api.usage(p_key_name)::jsonb AS payload
+), account_snapshot AS (
+  SELECT jsonb_build_object(
+    'id', id,
+    'platform', platform,
+    'type', type,
+    'snapshot_updated_at', extra->>'codex_usage_updated_at',
+    'reset_5h_at', extra->>'codex_5h_reset_at',
+    'reset_7d_at', extra->>'codex_7d_reset_at'
+  ) AS payload
+  FROM public.accounts
+  WHERE id = p_account_id
+    AND deleted_at IS NULL
+)
+SELECT (
+  base.payload || jsonb_build_object(
+    'upstream_account',
+    coalesce(
+      (SELECT payload FROM account_snapshot),
+      jsonb_build_object('error', 'not_found', 'id', p_account_id)
+    )
+  )
+)::json
+FROM base;
+$function$;
+
 REVOKE ALL PRIVILEGES ON DATABASE sub2api FROM sub2api_tg_bot;
-REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs FROM sub2api_tg_bot;
+REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts FROM sub2api_tg_bot;
 REVOKE CREATE ON SCHEMA public FROM sub2api_tg_bot;
 REVOKE ALL ON SCHEMA sub2api_tg_bot_api FROM sub2api_tg_bot;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) FROM PUBLIC;
 
 GRANT CONNECT ON DATABASE sub2api TO sub2api_tg_bot;
 GRANT USAGE ON SCHEMA sub2api_tg_bot_api TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) TO sub2api_tg_bot;

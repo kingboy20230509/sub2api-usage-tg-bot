@@ -9,23 +9,23 @@ Telegram 用户发送 /check
           ↓
 Bot 主动通过 HTTPS 长轮询 Telegram getUpdates
           ↓
-校验私聊用户并读取 Telegram ID → Key 名称绑定
+校验私聊用户并读取 Telegram ID → Key 名称和上游账号 ID 绑定
           ↓
 通过内部 Docker 网络调用 PostgreSQL 固定查询函数
           ↓
 Bot 通过 Telegram API 返回额度和用量
 ```
 
-Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API Key 的真实密钥；`config.json` 中绑定的是 `api_keys.name`。
+Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API Key 的真实密钥；`config.json` 中绑定的是 `api_keys.name` 和非敏感的 `accounts.id`。
 
 ## 功能与安全边界
 
 - `/start` 显示使用提示，`/check` 查询用量；管理员可以通过按钮选择配置中的不同 Key。
-- 显示总额度、5 小时/日/周限额、今日及 7 天用量和模型统计；周限额显示该 Key 的本地限额窗口，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
+- 显示总额度、5 小时/日/周限额、今日及 7 天用量和模型统计；5 小时与每周重置时间读取绑定账号的 Codex 上游快照，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
 - 周额度剩余不超过 20% 时主动提醒，每个周窗口只提醒一次。
 - 仅允许绑定用户在与 Bot 的私聊中查询；群聊不返回用量。
 - 限制并发、待处理消息数和每用户查询频率。
-- 使用专用 PostgreSQL 登录，只能执行固定的 `sub2api_tg_bot_api.usage(text)` 函数。
+- 使用专用 PostgreSQL 登录，只能执行固定的用量函数；账号查询只返回 ID、平台、类型和 Codex 重置快照，不返回凭据。
 - 不访问 Docker Socket，不需要 root，不直接读取或修改 Sub2API 数据表。
 - Docker 根文件系统只读、删除全部 capabilities，并使用 UID/GID `10001`。
 - Token 和数据库密码支持 Compose file-backed secrets。
@@ -36,24 +36,24 @@ Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API
 - `Dockerfile`：非 root 容器镜像。
 - `compose.example.yaml`：合并进现有 Sub2API Compose 的示例。
 - `docker-healthcheck.py`：仅在容器内部访问的存活检查。
-- `config.example.json`：Telegram ID 到 Key 名称的绑定示例。
+- `config.example.json`：Telegram ID 到 Key 名称和上游账号 ID 的绑定示例。
 - `.env.docker.example`：非敏感 Docker 参数。
 - `deploy/create_readonly_role.sql`：受限数据库账号与固定查询函数。
 - `install.sh`、`sub2api-tg-bot.service.example`：可选 systemd 部署。
 
 ## 1. 初始化 Sub2API 数据库
 
-必须先启动 Sub2API，让它完成数据库迁移。确认以下两张表存在：
+必须先启动 Sub2API，让它完成数据库迁移。确认以下三张表存在：
 
 ```bash
 docker compose exec -T postgres psql -U sub2api -d sub2api -tAc \
-  "SELECT to_regclass('public.api_keys'), to_regclass('public.usage_logs');"
+  "SELECT to_regclass('public.api_keys'), to_regclass('public.usage_logs'), to_regclass('public.accounts');"
 ```
 
 正常结果为：
 
 ```text
-api_keys|usage_logs
+api_keys|usage_logs|accounts
 ```
 
 然后以数据库所有者执行：
@@ -89,14 +89,29 @@ chmod 600 secrets/telegram_bot_token secrets/postgres_password
     "123456789"
   ],
   "bindings": {
-    "123456789": "Administrator",
-    "987654321": "example-key-name"
+    "123456789": {
+      "key_name": "Administrator",
+      "account_id": 12
+    },
+    "987654321": {
+      "key_name": "example-key-name",
+      "account_id": 15
+    }
   },
   "timezone": "Asia/Shanghai"
 }
 ```
 
-`admins` 中填写管理员的 Telegram 数字用户 ID；`bindings` 左边是 Telegram 数字用户 ID 字符串，右边是 Sub2API 数据库中准确的 `api_keys.name`。管理员发送 `/check` 后会看到所有 `bindings` 的 Key 按钮，普通用户只能查询自己的绑定。按钮文字直接使用 Key 名称，不需要额外的 `label`。
+`admins` 中填写管理员的 Telegram 数字用户 ID。`bindings` 左边是 Telegram 数字用户 ID 字符串；`key_name` 是 Sub2API 数据库中准确的 `api_keys.name`；`account_id` 是该 Key 要参考的上游账号 `accounts.id`。管理员发送 `/check` 后会看到所有 `bindings` 的 Key 按钮，普通用户只能查询自己的绑定。按钮文字直接使用 Key 名称，不需要额外的 `label`。
+
+在 Sub2API Compose 目录执行下面的只读查询，找到账号 ID：
+
+```bash
+docker compose exec -T postgres psql -U sub2api -d sub2api -P pager=off \
+  -c "SELECT id, name, platform, type, status, extra->>'codex_usage_updated_at' AS snapshot_updated_at, extra->>'codex_7d_reset_at' AS reset_7d_at FROM accounts WHERE deleted_at IS NULL ORDER BY id;"
+```
+
+`account_id` 必须按账号逐个绑定，不能用 Key 名称推断。Bot 使用 `accounts.extra` 中由 Sub2API 保存的 `codex_5h_reset_at`、`codex_7d_reset_at` 和 `codex_usage_updated_at`，并实时计算剩余时间。该快照可能在账号尚未使用或后台尚未刷新时为空或过期；Bot 会显示快照更新时间，不会伪造重置周期，也不会使用管理员 Token 强制刷新。旧版字符串绑定仍可继续使用，但不会显示上游账号重置时间。
 
 Key 名称必须唯一。如果数据库中存在多个未删除且同名的 Key，Bot 会拒绝返回数据并提示先改成唯一名称，避免误显示其他 Key 的用量。生产 Linux 主机使用：
 
@@ -173,6 +188,8 @@ sub2api tg bot long polling started
 
 ```bash
 git pull --ff-only
+docker compose exec -T postgres psql -U sub2api -d sub2api \
+  < deploy/create_readonly_role.sql
 docker compose build --pull sub2api-tg-bot
 docker compose up -d sub2api-tg-bot
 ```
@@ -193,6 +210,8 @@ docker compose logs --tail=200 sub2api-tg-bot
 - 未绑定：`config.json` 的 Telegram ID 不匹配。
 - 查不到 Key：绑定值不是准确的 `api_keys.name`。
 - 同名 Key：Sub2API 中有多个未删除的 Key 使用了相同名称，请先修改为唯一名称。
+- 找不到上游账号：`account_id` 不存在、账号已删除，或数据库函数尚未重新部署。
+- 没有重置时间：对应账号还没有 Codex 用量快照；先在 Sub2API 中确认该账号的用量数据已刷新。
 
 容器健康检查访问 `127.0.0.1:8099/health`，该端口只在容器内部监听且不发布到宿主机。
 
@@ -220,7 +239,7 @@ The bot calls Telegram `getUpdates` over outbound HTTPS, authorizes the private 
 
 1. Start Sub2API and let database migrations complete.
 2. Run `deploy/create_readonly_role.sql` as the database owner and set a unique password for `sub2api_tg_bot`.
-3. Copy `config.example.json` to `config.json` and bind Telegram IDs to exact key names.
+3. Copy `config.example.json` to `config.json` and bind Telegram IDs to exact key names and upstream account IDs.
 4. Create file-backed secrets for the Telegram Token and restricted database password.
 5. Merge `compose.example.yaml` into the existing Compose project.
 6. Attach PostgreSQL, Sub2API, and the bot to an `internal: true` database network. Give the bot a separate non-internal egress network for Telegram.
