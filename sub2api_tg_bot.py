@@ -53,6 +53,7 @@ PG_ALLOW_INSECURE_PRIVATE_NETWORK = os.environ.get("PG_ALLOW_INSECURE_PRIVATE_NE
 UPDATE_WORKERS = int(os.environ.get("UPDATE_WORKERS", "4"))
 UPDATE_MAX_PENDING = int(os.environ.get("UPDATE_MAX_PENDING", "16"))
 CHECK_COOLDOWN = int(os.environ.get("CHECK_COOLDOWN", "10"))
+ADMIN_CHECK_COOLDOWN = int(os.environ.get("ADMIN_CHECK_COOLDOWN", "2"))
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "10"))
 API = f"https://api.telegram.org/bot{TOKEN}"
 KEY_NAME_RE = re.compile(r"^[\w .:@+-]{1,100}$")
@@ -81,6 +82,8 @@ def validate_runtime_config():
         raise RuntimeError("UPDATE_MAX_PENDING must be between UPDATE_WORKERS and 256")
     if not 1 <= CHECK_COOLDOWN <= 3600:
         raise RuntimeError("CHECK_COOLDOWN must be between 1 and 3600 seconds")
+    if not 1 <= ADMIN_CHECK_COOLDOWN <= 3600:
+        raise RuntimeError("ADMIN_CHECK_COOLDOWN must be between 1 and 3600 seconds")
     if not 1 <= POLL_TIMEOUT <= 50:
         raise RuntimeError("POLL_TIMEOUT must be between 1 and 50 seconds")
     if not os.path.isabs(PSQL_BIN) or not os.path.isfile(PSQL_BIN) or not os.access(PSQL_BIN, os.X_OK):
@@ -474,15 +477,16 @@ def is_private_user_chat(chat, user):
     return chat.get("type") == "private" and chat_id is not None and str(chat_id) == str(user_id)
 
 
-def allow_check(user_id, now=None):
+def allow_check(user_id, now=None, cooldown=None):
     now = time.monotonic() if now is None else now
+    cooldown = CHECK_COOLDOWN if cooldown is None else cooldown
     with _RATE_LIMIT_LOCK:
         last = _LAST_CHECK_BY_USER.get(user_id)
-        if last is not None and now - last < CHECK_COOLDOWN:
-            return False, max(1, int(CHECK_COOLDOWN - (now - last) + 0.999))
+        if last is not None and now - last < cooldown:
+            return False, max(1, int(cooldown - (now - last) + 0.999))
         _LAST_CHECK_BY_USER[user_id] = now
         if len(_LAST_CHECK_BY_USER) > 4096:
-            cutoff = now - max(CHECK_COOLDOWN * 2, 60)
+            cutoff = now - max(max(CHECK_COOLDOWN, ADMIN_CHECK_COOLDOWN) * 2, 60)
             stale = [key for key, value in _LAST_CHECK_BY_USER.items() if value < cutoff]
             for key in stale:
                 _LAST_CHECK_BY_USER.pop(key, None)
@@ -575,7 +579,7 @@ def handle_callback_query(callback):
                 "show_alert": "true",
             })
             return
-        allowed, retry_after = allow_check(user_id)
+        allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
         if not allowed:
             tg("answerCallbackQuery", {
                 "callback_query_id": callback_id,
