@@ -167,7 +167,7 @@ sub2api tg bot long polling started
 /check
 ```
 
-普通用户直接查询自己的 Key；管理员会先看到 Key 选择按钮，点击后查询对应 Key。实际数据库查询默认每个用户 10 秒只能执行一次。
+普通用户直接查询自己的 Key；管理员会先看到 Key 选择按钮，点击后查询对应 Key。普通用户的数据库查询冷却默认是 10 秒，管理员切换或刷新 Key 的冷却默认是 2 秒。可分别通过 `.env` 中的 `SUB2API_TG_BOT_CHECK_COOLDOWN` 和 `SUB2API_TG_BOT_ADMIN_CHECK_COOLDOWN` 调整。
 
 ## 容器更新
 
