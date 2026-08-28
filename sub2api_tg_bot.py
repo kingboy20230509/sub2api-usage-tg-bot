@@ -352,22 +352,22 @@ def reset_remaining_text(value, now=None):
         current = current.replace(tzinfo=timezone.utc)
     seconds = int((reset_at - current).total_seconds())
     if seconds <= 0:
-        return "已到重置时间，等待快照更新"
+        return "等待快照更新"
     days, remainder = divmod(seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
     if days:
-        return f"剩余 {days}d" + (f" {hours}h" if hours else "")
+        return f"{days}d" + (f" {hours}h" if hours else "")
     if hours:
-        return f"剩余 {hours}h" + (f" {minutes}m" if minutes else "")
-    return f"剩余 {max(1, minutes)}m"
+        return f"{hours}h" + (f" {minutes}m" if minutes else "")
+    return f"{max(1, minutes)}m"
 
 
 def append_account_reset(lines, reset_at, now=None):
     remaining = reset_remaining_text(reset_at, now)
     if remaining:
         timestamp = parse_upstream_timestamp(reset_at).astimezone(ZoneInfo("Asia/Shanghai"))
-        lines.append(f"  上游重置：{timestamp.strftime('%Y-%m-%d %H:%M:%S')}（{remaining}）")
+        lines.append(f"  重置时间：{timestamp.strftime('%Y-%m-%d %H:%M:%S')}｜剩余：{remaining}")
 
 
 def append_model_section(lines, title, models):
@@ -489,16 +489,14 @@ def format_usage(key_name, data, now=None):
         "⏱ 限额",
     ]
     append_limit(lines, "5 小时", k.get("rate_limit_5h"), k.get("usage_5h"))
-    append_account_reset(lines, upstream_account.get("reset_5h_at"), now)
+    if dec(k.get("rate_limit_5h")) > 0:
+        append_account_reset(lines, upstream_account.get("reset_5h_at"), now)
     append_limit(lines, "每日", k.get("rate_limit_1d"), k.get("usage_1d"))
     append_limit(lines, "每周", k.get("rate_limit_7d"), k.get("usage_7d"))
-    append_account_reset(lines, upstream_account.get("reset_7d_at"), now)
+    if dec(k.get("rate_limit_7d")) > 0:
+        append_account_reset(lines, upstream_account.get("reset_7d_at"), now)
     if upstream_account.get("error") == "not_found":
         lines.append(f"  ⚠️ 未找到配置的上游账号 ID：{upstream_account.get('id')}")
-    elif upstream_account.get("id"):
-        snapshot_updated_at = upstream_account.get("snapshot_updated_at")
-        snapshot_text = format_timestamp(snapshot_updated_at) if snapshot_updated_at else "暂无"
-        lines.append(f"  上游账号：ID {upstream_account.get('id')}｜快照更新：{snapshot_text}")
     lines.extend([
         "",
         "📅 今日用量",
