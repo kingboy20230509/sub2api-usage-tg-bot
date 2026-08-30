@@ -17,11 +17,11 @@ Bot 通过 Telegram API 返回额度和用量
 ```
 
 Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API Key 的真实密钥；`config.json` 中绑定的是 `api_keys.name` 和非敏感的 `accounts.id`。
-管理员确认重置时，Bot 使用独立的 Sub2API Admin API Key 调用 Sub2API 内网管理接口，随后通过原只读数据库查询复查结果。
+管理员确认批量重置时，Bot 使用独立的 Sub2API Admin API Key 逐个调用 Sub2API 内网管理接口，随后通过原只读数据库查询复查每个 Key 的结果。
 
 ## 功能与安全边界
 
-- `/start` 显示使用提示，`/check` 查询用量；管理员可以通过按钮选择配置中的不同 Key，并在二次确认后重置所选 Key 的 5 小时/日/周限速用量。
+- `/start` 显示使用提示，`/check` 查询用量；管理员可以通过复选按钮选择一个或多个已绑定 Key，支持全选、清空和返回修改，并在最终确认后批量重置 5 小时/日/周限速用量。
 - 显示总额度、5 小时/日/周限额、今日及 7 天用量和模型统计；5 小时与每周重置时间读取绑定账号的 Codex 上游快照，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
 - 周额度剩余不超过 20% 时主动提醒，每个周窗口只提醒一次。
 - 仅允许绑定用户在与 Bot 的私聊中查询；群聊不返回用量。
@@ -185,9 +185,11 @@ sub2api tg bot long polling started
 /check
 ```
 
-普通用户直接查询自己的 Key；管理员会先看到 Key 选择按钮，点击后查询对应 Key。配置了 Sub2API 管理 API 后，管理员查询结果底部会显示“重置速率限制用量”：点击后还需再次确认，Bot 才会清零该 Key 的 5 小时、每日和 7 天限速计数并立即复查。
+普通用户直接查询自己的 Key；管理员会先看到 Key 查询按钮和“批量重置速率限制”按钮。进入批量重置后，可以逐项勾选或取消 Key，也可以全选或清空；点击“重置所选”后还需最终确认，Bot 才会逐个清零所选 Key 的 5 小时、每日和 7 天限速计数并立即复查。单个 Key 失败不会中断其余 Key，完成消息会分别汇总成功、需复查和失败数量。
 
 重置不会清零累计总额度 `quota_used`，也不会删除今日或近 7 天历史用量记录。普通用户不会看到重置按钮，即使伪造 Telegram 回调也会被管理员 ID 校验拒绝。
+
+批量选择会话只保存在 Bot 内存中，按管理员及当前 Telegram 消息隔离，并在 5 分钟后过期。Bot 重启、配置中的 Key 被移除或重复点击已执行的确认按钮，都不会再次执行旧批次。批量重置只使用现有 `bindings`，不需要修改 `config.json` 结构、数据库函数或 PostgreSQL 权限。
 
 普通用户的数据库查询冷却默认是 10 秒，管理员切换或刷新 Key 的冷却默认是 2 秒。可分别通过 `.env` 中的 `SUB2API_TG_BOT_CHECK_COOLDOWN` 和 `SUB2API_TG_BOT_ADMIN_CHECK_COOLDOWN` 调整。
 
@@ -222,6 +224,7 @@ docker compose logs --tail=200 sub2api-tg-bot
 - 没有重置按钮：检查 `SUB2API_BASE_URL` 和 `SUB2API_ADMIN_API_KEY_FILE` 是否同时配置，并确认 secret 文件存在。
 - 重置返回 `401`：`secrets/sub2api_admin_api_key` 与 Sub2API 系统设置中的 Admin API Key 不一致。
 - 无法连接重置接口：确认 Bot 与 Sub2API 服务位于同一个内部 Compose 网络，且 `SUB2API_TG_BOT_SUB2API_BASE_URL` 使用服务名和容器内部端口。
+- 批量选择已过期：重新发送 `/check`，再次进入批量重置；未确认的选择不会执行。
 
 容器健康检查访问 `127.0.0.1:8099/health`，该端口只在容器内部监听且不发布到宿主机。
 

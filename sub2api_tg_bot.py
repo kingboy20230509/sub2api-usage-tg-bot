@@ -65,6 +65,9 @@ COMPOSE_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
 PSQL_VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_CHECK_BY_USER = {}
+_BATCH_RESET_LOCK = threading.Lock()
+_BATCH_RESET_SESSIONS = {}
+BATCH_RESET_SESSION_TTL = 300
 
 
 def log_failure(event, error):
@@ -189,6 +192,161 @@ def config_admins(config):
     return normalized
 
 
+def reset_candidates(bindings):
+    candidates = []
+    seen_key_names = set()
+    sorted_bindings = sorted(bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0]))
+    for target_user_id, binding in sorted_bindings:
+        key_name = binding["key_name"]
+        if key_name in seen_key_names:
+            continue
+        seen_key_names.add(key_name)
+        candidates.append((target_user_id, binding))
+    return candidates
+
+
+def batch_reset_keyboard(bindings, selected_user_ids):
+    selected_user_ids = set(selected_user_ids)
+    candidate_ids = {target_user_id for target_user_id, _binding in reset_candidates(bindings)}
+    selected_user_ids.intersection_update(candidate_ids)
+    buttons = []
+    for target_user_id, binding in reset_candidates(bindings):
+        prefix = "✅ " if target_user_id in selected_user_ids else "⬜ "
+        key_name = binding["key_name"]
+        max_name_length = 64 - len(prefix)
+        button_text = prefix + (
+            key_name if len(key_name) <= max_name_length else key_name[:max_name_length - 3] + "..."
+        )
+        buttons.append({"text": button_text, "callback_data": f"batch_toggle:{target_user_id}"})
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.extend([
+        [
+            {"text": "☑️ 全选", "callback_data": "batch_all:0"},
+            {"text": "清空", "callback_data": "batch_clear:0"},
+        ],
+        [{
+            "text": f"🔴 重置所选（{len(selected_user_ids)}）",
+            "callback_data": "batch_review:0",
+        }],
+        [{"text": "取消", "callback_data": "batch_cancel:0"}],
+    ])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def batch_reset_selection_text(selected_count, total_count):
+    return (
+        "🔄 批量重置速率限制\n\n"
+        "请选择需要重置的 Key。再次点击可取消选择。\n"
+        f"已选择：{selected_count} / {total_count}"
+    )
+
+
+def batch_reset_review_text(bindings, selected_user_ids):
+    selected_user_ids = set(selected_user_ids)
+    selected_candidates = [
+        binding for target_user_id, binding in reset_candidates(bindings)
+        if target_user_id in selected_user_ids
+    ]
+    lines = [
+        "⚠️ 确认批量重置？",
+        "",
+        f"即将重置以下 {len(selected_candidates)} 个 Key：",
+        "",
+    ]
+    for binding in selected_candidates[:30]:
+        lines.append(f"• {binding['key_name']}")
+    if len(selected_candidates) > 30:
+        lines.append(f"• …另有 {len(selected_candidates) - 30} 个 Key")
+    lines.extend([
+        "",
+        "将清零 5 小时、每日和 7 天限速计数。",
+        "不会清零总额度 quota_used，也不会删除历史用量记录。",
+    ])
+    return "\n".join(lines)
+
+
+def batch_reset_confirmation_keyboard(selected_count):
+    return json.dumps({"inline_keyboard": [
+        [{"text": f"✅ 确认重置 {selected_count} 个 Key", "callback_data": "batch_confirm:0"}],
+        [
+            {"text": "◀️ 返回选择", "callback_data": "batch_back:0"},
+            {"text": "取消", "callback_data": "batch_cancel:0"},
+        ],
+    ]}, ensure_ascii=False)
+
+
+def start_batch_reset_session(admin_user_id, chat_id, message_id, now=None):
+    now = time.monotonic() if now is None else now
+    with _BATCH_RESET_LOCK:
+        _BATCH_RESET_SESSIONS[str(admin_user_id)] = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "selected": set(),
+            "updated_at": now,
+        }
+    return set()
+
+
+def change_batch_reset_selection(
+    admin_user_id,
+    chat_id,
+    message_id,
+    valid_user_ids,
+    operation,
+    target_user_id=None,
+    now=None,
+):
+    now = time.monotonic() if now is None else now
+    valid_user_ids = set(valid_user_ids)
+    with _BATCH_RESET_LOCK:
+        admin_user_id = str(admin_user_id)
+        session = _BATCH_RESET_SESSIONS.get(admin_user_id)
+        if (
+            not session
+            or now - session["updated_at"] > BATCH_RESET_SESSION_TTL
+            or session["chat_id"] != str(chat_id)
+            or session["message_id"] != message_id
+        ):
+            _BATCH_RESET_SESSIONS.pop(admin_user_id, None)
+            return None
+        session["selected"].intersection_update(valid_user_ids)
+        if operation == "toggle":
+            if target_user_id not in valid_user_ids:
+                return None
+            if target_user_id in session["selected"]:
+                session["selected"].remove(target_user_id)
+            else:
+                session["selected"].add(target_user_id)
+        elif operation == "all":
+            session["selected"] = set(valid_user_ids)
+        elif operation == "clear":
+            session["selected"].clear()
+        elif operation != "keep":
+            raise ValueError("Invalid batch reset selection operation")
+        session["updated_at"] = now
+        return set(session["selected"])
+
+
+def finish_batch_reset_session(admin_user_id, chat_id, message_id, valid_user_ids=None, now=None):
+    now = time.monotonic() if now is None else now
+    with _BATCH_RESET_LOCK:
+        admin_user_id = str(admin_user_id)
+        session = _BATCH_RESET_SESSIONS.get(admin_user_id)
+        if (
+            not session
+            or now - session["updated_at"] > BATCH_RESET_SESSION_TTL
+            or session["chat_id"] != str(chat_id)
+            or session["message_id"] != message_id
+        ):
+            _BATCH_RESET_SESSIONS.pop(admin_user_id, None)
+            return None
+        _BATCH_RESET_SESSIONS.pop(admin_user_id, None)
+        selected = set(session["selected"])
+        if valid_user_ids is not None:
+            selected.intersection_update(valid_user_ids)
+        return selected
+
+
 def admin_keyboard(bindings, selected_user_id=None):
     buttons = []
     sorted_bindings = sorted(bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0]))
@@ -197,19 +355,12 @@ def admin_keyboard(bindings, selected_user_id=None):
         button_text = key_name if len(key_name) <= 64 else key_name[:61] + "..."
         buttons.append({"text": button_text, "callback_data": f"usage:{user_id}"})
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    if selected_user_id is not None and reset_api_configured():
+    if reset_api_configured():
         rows.append([{
-            "text": "⚠️ 重置速率限制用量",
-            "callback_data": f"reset_prompt:{selected_user_id}",
+            "text": "⚠️ 批量重置速率限制",
+            "callback_data": "batch_start:0",
         }])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
-
-
-def reset_confirmation_keyboard(target_user_id):
-    return json.dumps({"inline_keyboard": [[
-        {"text": "确认重置", "callback_data": f"reset_confirm:{target_user_id}"},
-        {"text": "取消", "callback_data": f"reset_cancel:{target_user_id}"},
-    ]]}, ensure_ascii=False)
 
 
 def tg(method, params=None, timeout=10):
@@ -255,6 +406,79 @@ def reset_key_rate_limit_usage(key_id):
     if len(response_body) > 1_048_576:
         raise RuntimeError("Sub2API response is too large")
     return json.loads(response_body.decode("utf-8")) if response_body else None
+
+
+def reset_selected_keys(bindings, selected_user_ids):
+    selected_user_ids = set(selected_user_ids)
+    results = []
+    for target_user_id, binding in reset_candidates(bindings):
+        if target_user_id not in selected_user_ids:
+            continue
+        key_name = binding["key_name"]
+        reset_completed = False
+        try:
+            current_data = query_key_usage(key_name, binding["account_id"]) or {}
+            key = current_data.get("key") or {}
+            key_id = key.get("id")
+            if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
+                results.append({
+                    "key_name": key_name,
+                    "status": "failed",
+                    "detail": "未能确定唯一的 Key ID",
+                })
+                continue
+            reset_key_rate_limit_usage(key_id)
+            reset_completed = True
+            checked_data = query_key_usage(key_name, binding["account_id"]) or {}
+            checked_key = checked_data.get("key") or {}
+            if not checked_key:
+                raise RuntimeError("Post-check did not return API key data")
+            results.append({
+                "key_name": key_name,
+                "status": "success",
+                "detail": (
+                    f"5h {checked_key.get('usage_5h', '?')} / "
+                    f"日 {checked_key.get('usage_1d', '?')} / "
+                    f"周 {checked_key.get('usage_7d', '?')}"
+                ),
+            })
+        except Exception as error:
+            log_failure(
+                f"batch reset target={masked_id(target_user_id)} recheck={str(reset_completed).lower()}",
+                error,
+            )
+            results.append({
+                "key_name": key_name,
+                "status": "warning" if reset_completed else "failed",
+                "detail": "重置成功，但复查失败" if reset_completed else "重置失败",
+            })
+    return results
+
+
+def format_batch_reset_results(results, config):
+    success_count = sum(result["status"] == "success" for result in results)
+    warning_count = sum(result["status"] == "warning" for result in results)
+    failed_count = sum(result["status"] == "failed" for result in results)
+    lines = [
+        "✅ 批量重置完成",
+        "",
+        f"总计：{len(results)}",
+        f"成功：{success_count}",
+        f"需复查：{warning_count}",
+        f"失败：{failed_count}",
+        "",
+    ]
+    icons = {"success": "✅", "warning": "⚠️", "failed": "❌"}
+    displayed_results = sorted(
+        results,
+        key=lambda result: ({"failed": 0, "warning": 1, "success": 2}[result["status"]], result["key_name"].casefold()),
+    )[:30]
+    for result in displayed_results:
+        lines.append(f"{icons[result['status']]} {result['key_name']}：{result['detail']}")
+    if len(results) > len(displayed_results):
+        lines.append(f"…另有 {len(results) - len(displayed_results)} 个结果未展开，请单独查询确认。")
+    lines.extend(["", f"🔄 复查时间：{format_refresh_timestamp(config)}"])
+    return "\n".join(lines)
 
 
 def run_psql_json(sql, variables=None):
@@ -690,7 +914,10 @@ def handle_callback_query(callback):
     user_id = str(user.get("id"))
     action, separator, target_user_id = callback_data.partition(":")
     if not callback_id or not separator or action not in {
-        "usage", "reset_prompt", "reset_confirm", "reset_cancel",
+        "usage",
+        "batch_start", "batch_toggle", "batch_all", "batch_clear",
+        "batch_review", "batch_back", "batch_confirm", "batch_cancel",
+        "reset_prompt", "reset_confirm", "reset_cancel",
     }:
         return
     if not is_private_user_chat(chat, user):
@@ -700,7 +927,6 @@ def handle_callback_query(callback):
             "show_alert": "true",
         })
         return
-    reset_completed = False
     try:
         cfg = load_config()
         bindings = config_bindings(cfg)
@@ -709,6 +935,144 @@ def handle_callback_query(callback):
                 "callback_query_id": callback_id,
                 "text": "你没有管理员权限。",
                 "show_alert": "true",
+            })
+            return
+        if action in {"reset_prompt", "reset_confirm", "reset_cancel"}:
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": "重置入口已更新，请重新发送 /check。",
+                "show_alert": "true",
+            })
+            return
+        if action.startswith("batch_"):
+            chat_id = chat.get("id")
+            message_id = message.get("message_id")
+            if message_id is None:
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "该操作已失效，请重新发送 /check。",
+                    "show_alert": "true",
+                })
+                return
+            if action != "batch_cancel" and not reset_api_configured():
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "重置功能尚未配置。",
+                    "show_alert": "true",
+                })
+                return
+            candidates = reset_candidates(bindings)
+            valid_user_ids = {candidate_user_id for candidate_user_id, _binding in candidates}
+            if action == "batch_start":
+                if not candidates:
+                    tg("answerCallbackQuery", {
+                        "callback_query_id": callback_id,
+                        "text": "当前没有可重置的 Key。",
+                        "show_alert": "true",
+                    })
+                    return
+                selected_user_ids = start_batch_reset_session(user_id, chat_id, message_id)
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": batch_reset_selection_text(0, len(candidates)),
+                    "reply_markup": batch_reset_keyboard(bindings, selected_user_ids),
+                })
+                return
+            if action == "batch_cancel":
+                finish_batch_reset_session(user_id, chat_id, message_id)
+                tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": "已取消"})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": "请选择要查看的 Key：",
+                    "reply_markup": admin_keyboard(bindings),
+                })
+                return
+            if action == "batch_confirm":
+                selected_user_ids = finish_batch_reset_session(
+                    user_id, chat_id, message_id, valid_user_ids,
+                )
+                if selected_user_ids is None:
+                    tg("answerCallbackQuery", {
+                        "callback_query_id": callback_id,
+                        "text": "选择已过期，请重新开始。",
+                        "show_alert": "true",
+                    })
+                    return
+                if not selected_user_ids:
+                    tg("answerCallbackQuery", {
+                        "callback_query_id": callback_id,
+                        "text": "所选 Key 已不存在，请重新开始。",
+                        "show_alert": "true",
+                    })
+                    return
+                selected_count = len(selected_user_ids)
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": f"正在重置 {selected_count} 个 Key…",
+                })
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": f"⏳ 正在重置并复查 {selected_count} 个 Key，请稍候…",
+                })
+                results = reset_selected_keys(bindings, selected_user_ids)
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": format_batch_reset_results(results, cfg),
+                    "reply_markup": admin_keyboard(bindings),
+                })
+                return
+            operation = {
+                "batch_toggle": "toggle",
+                "batch_all": "all",
+                "batch_clear": "clear",
+                "batch_review": "keep",
+                "batch_back": "keep",
+            }[action]
+            selected_user_ids = change_batch_reset_selection(
+                user_id,
+                chat_id,
+                message_id,
+                valid_user_ids,
+                operation,
+                target_user_id if operation == "toggle" else None,
+            )
+            if selected_user_ids is None:
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "选择已过期或 Key 已变更，请重新开始。",
+                    "show_alert": "true",
+                })
+                return
+            if action == "batch_review":
+                if not selected_user_ids:
+                    tg("answerCallbackQuery", {
+                        "callback_query_id": callback_id,
+                        "text": "请至少选择一个 Key。",
+                        "show_alert": "true",
+                    })
+                    return
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": batch_reset_review_text(bindings, selected_user_ids),
+                    "reply_markup": batch_reset_confirmation_keyboard(len(selected_user_ids)),
+                })
+                return
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": f"已选择 {len(selected_user_ids)} 个 Key",
+            })
+            tg("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": batch_reset_selection_text(len(selected_user_ids), len(candidates)),
+                "reply_markup": batch_reset_keyboard(bindings, selected_user_ids),
             })
             return
         binding = bindings.get(target_user_id)
@@ -720,72 +1084,6 @@ def handle_callback_query(callback):
             })
             return
         key_name = binding["key_name"]
-        if action == "reset_prompt":
-            if not reset_api_configured():
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "重置功能尚未配置。",
-                    "show_alert": "true",
-                })
-                return
-            tg("answerCallbackQuery", {"callback_query_id": callback_id})
-            tg("editMessageText", {
-                "chat_id": chat.get("id"),
-                "message_id": message.get("message_id"),
-                "text": (
-                    "⚠️ 确认重置速率限制用量？\n\n"
-                    f"Key：{key_name}\n\n"
-                    "这会清零 5 小时、每日和 7 天限速计数；"
-                    "不会清零总额度或删除历史用量记录。"
-                ),
-                "reply_markup": reset_confirmation_keyboard(target_user_id),
-            })
-            return
-        if action == "reset_confirm":
-            if not reset_api_configured():
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "重置功能尚未配置。",
-                    "show_alert": "true",
-                })
-                return
-            tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": "正在重置…"})
-            current_data = query_key_usage(key_name, binding["account_id"]) or {}
-            key = current_data.get("key") or {}
-            key_id = key.get("id")
-            if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
-                reply = "无法重置：未能确定唯一的 Key ID。\n\n" + format_usage(key_name, current_data)
-                tg("editMessageText", {
-                    "chat_id": chat.get("id"),
-                    "message_id": message.get("message_id"),
-                    "text": reply,
-                    "reply_markup": admin_keyboard(bindings, target_user_id),
-                })
-                return
-            reset_key_rate_limit_usage(key_id)
-            reset_completed = True
-            checked_data = query_key_usage(key_name, binding["account_id"]) or {}
-            reply = "✅ 速率限制用量已重置并完成复查。\n\n" + format_usage(key_name, checked_data)
-            reply += f"\n\n🔄 复查时间：{format_refresh_timestamp(cfg)}"
-            tg("editMessageText", {
-                "chat_id": chat.get("id"),
-                "message_id": message.get("message_id"),
-                "text": reply,
-                "reply_markup": admin_keyboard(bindings, target_user_id),
-            })
-            return
-        if action == "reset_cancel":
-            tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": "已取消"})
-            data = query_key_usage(key_name, binding["account_id"])
-            reply = format_usage(key_name, data or {})
-            reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
-            tg("editMessageText", {
-                "chat_id": chat.get("id"),
-                "message_id": message.get("message_id"),
-                "text": reply,
-                "reply_markup": admin_keyboard(bindings, target_user_id),
-            })
-            return
         allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
         if not allowed:
             tg("answerCallbackQuery", {
@@ -806,10 +1104,10 @@ def handle_callback_query(callback):
         })
     except Exception as error:
         log_failure(f"admin {action} user={masked_id(user_id)}", error)
-        if action == "reset_confirm" and reset_completed:
-            error_text = "重置请求已成功，但复查失败。请重新选择该 Key 查询当前用量。"
-        elif action == "reset_confirm":
-            error_text = "重置失败，请稍后再试。"
+        if action == "batch_confirm":
+            error_text = "批量重置执行异常，请重新发送 /check 查询当前用量。"
+        elif action.startswith("batch_"):
+            error_text = "批量重置操作失败，请重新发送 /check。"
         else:
             error_text = "查询失败，请稍后再试。"
         tg("sendMessage", {"chat_id": chat.get("id"), "text": error_text})

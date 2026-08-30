@@ -111,6 +111,126 @@ class RuntimeConfigTests(unittest.TestCase):
 class MessageAuthorizationTests(unittest.TestCase):
     def setUp(self):
         bot._LAST_CHECK_BY_USER.clear()
+        bot._BATCH_RESET_SESSIONS.clear()
+
+    def test_batch_reset_keyboard_tracks_selection_and_deduplicates_key_names(self):
+        bindings = {
+            "123": {"key_name": "Key A", "account_id": 1},
+            "456": {"key_name": "Key B", "account_id": 2},
+            "789": {"key_name": "Key A", "account_id": 3},
+        }
+        keyboard = bot.json.loads(bot.batch_reset_keyboard(bindings, {"456"}))["inline_keyboard"]
+        buttons = [button for row in keyboard for button in row]
+        toggle_buttons = [button for button in buttons if button["callback_data"].startswith("batch_toggle:")]
+        self.assertEqual(
+            [(button["text"], button["callback_data"]) for button in toggle_buttons],
+            [("⬜ Key A", "batch_toggle:123"), ("✅ Key B", "batch_toggle:456")],
+        )
+        self.assertIn("🔴 重置所选（1）", {button["text"] for button in buttons})
+        self.assertIn("batch_all:0", {button["callback_data"] for button in buttons})
+        self.assertIn("batch_clear:0", {button["callback_data"] for button in buttons})
+
+    def test_batch_reset_review_lists_selected_keys_and_requires_final_confirmation(self):
+        bindings = {
+            "456": {"key_name": "Key A", "account_id": 1},
+            "789": {"key_name": "Key B", "account_id": 2},
+        }
+        text = bot.batch_reset_review_text(bindings, {"456", "789"})
+        self.assertIn("即将重置以下 2 个 Key", text)
+        self.assertIn("• Key A", text)
+        self.assertIn("• Key B", text)
+        self.assertIn("不会清零总额度 quota_used", text)
+        buttons = [
+            button
+            for row in bot.json.loads(bot.batch_reset_confirmation_keyboard(2))["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(
+            {button["callback_data"] for button in buttons},
+            {"batch_confirm:0", "batch_back:0", "batch_cancel:0"},
+        )
+
+    def test_batch_reset_session_is_scoped_to_admin_message_and_expires(self):
+        bot.start_batch_reset_session("123", 123, 10, now=100)
+        selected = bot.change_batch_reset_selection(
+            "123", 123, 10, {"456", "789"}, "toggle", "456", now=101,
+        )
+        self.assertEqual(selected, {"456"})
+        self.assertIsNone(bot.change_batch_reset_selection(
+            "123", 123, 11, {"456", "789"}, "keep", now=102,
+        ))
+
+        bot.start_batch_reset_session("123", 123, 10, now=100)
+        self.assertIsNone(bot.change_batch_reset_selection(
+            "123", 123, 10, {"456"}, "keep", now=100 + bot.BATCH_RESET_SESSION_TTL + 1,
+        ))
+
+    def test_batch_reset_session_supports_all_clear_and_atomic_finish(self):
+        bot.start_batch_reset_session("123", 123, 10, now=100)
+        self.assertEqual(
+            bot.change_batch_reset_selection("123", 123, 10, {"456", "789"}, "all", now=101),
+            {"456", "789"},
+        )
+        self.assertEqual(
+            bot.change_batch_reset_selection("123", 123, 10, {"456", "789"}, "clear", now=102),
+            set(),
+        )
+        bot.change_batch_reset_selection("123", 123, 10, {"456", "789"}, "toggle", "789", now=103)
+        self.assertEqual(
+            bot.finish_batch_reset_session("123", 123, 10, {"456", "789"}, now=104),
+            {"789"},
+        )
+        self.assertIsNone(bot.finish_batch_reset_session("123", 123, 10, {"456", "789"}, now=105))
+
+    @mock.patch.object(bot, "reset_key_rate_limit_usage", side_effect=[{"success": True}, RuntimeError("unauthorized")])
+    @mock.patch.object(bot, "query_key_usage", side_effect=[
+        {"key": {"id": 41, "usage_5h": 5, "usage_1d": 6, "usage_7d": 7}},
+        {"key": {"id": 41, "usage_5h": 0, "usage_1d": 0, "usage_7d": 0}},
+        {"key": {"id": 42, "usage_5h": 1, "usage_1d": 2, "usage_7d": 3}},
+    ])
+    def test_batch_reset_continues_after_an_individual_failure(self, query, reset):
+        bindings = {
+            "456": {"key_name": "Key A", "account_id": 1},
+            "789": {"key_name": "Key B", "account_id": 2},
+            "999": {"key_name": "Key C", "account_id": 3},
+        }
+        results = bot.reset_selected_keys(bindings, {"456", "789"})
+        self.assertEqual(results, [
+            {"key_name": "Key A", "status": "success", "detail": "5h 0 / 日 0 / 周 0"},
+            {"key_name": "Key B", "status": "failed", "detail": "重置失败"},
+        ])
+        self.assertEqual(reset.call_args_list, [mock.call(41), mock.call(42)])
+        self.assertEqual(query.call_count, 3)
+
+    @mock.patch.object(bot, "reset_key_rate_limit_usage", return_value={"success": True})
+    @mock.patch.object(bot, "query_key_usage", side_effect=[
+        {"key": {"id": 41}},
+        RuntimeError("database unavailable"),
+    ])
+    def test_batch_reset_marks_post_check_failure_as_warning(self, query, reset):
+        bindings = {"456": {"key_name": "Key A", "account_id": 1}}
+        self.assertEqual(bot.reset_selected_keys(bindings, {"456"}), [{
+            "key_name": "Key A",
+            "status": "warning",
+            "detail": "重置成功，但复查失败",
+        }])
+        reset.assert_called_once_with(41)
+
+    @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-30 12:00:00")
+    def test_batch_reset_result_summarizes_each_status(self, _refresh):
+        text = bot.format_batch_reset_results([
+            {"key_name": "Key A", "status": "success", "detail": "5h 0 / 日 0 / 周 0"},
+            {"key_name": "Key B", "status": "warning", "detail": "重置成功，但复查失败"},
+            {"key_name": "Key C", "status": "failed", "detail": "重置失败"},
+        ], {})
+        self.assertIn("总计：3", text)
+        self.assertIn("成功：1", text)
+        self.assertIn("需复查：1", text)
+        self.assertIn("失败：1", text)
+        self.assertIn("✅ Key A：5h 0 / 日 0 / 周 0", text)
+        self.assertIn("⚠️ Key B：重置成功，但复查失败", text)
+        self.assertIn("❌ Key C：重置失败", text)
+        self.assertIn("复查时间：2026-08-30 12:00:00", text)
 
     def test_only_matching_private_chat_is_authorized(self):
         self.assertTrue(bot.is_private_user_chat({"id": 123, "type": "private"}, {"id": 123}))
@@ -232,7 +352,7 @@ class MessageAuthorizationTests(unittest.TestCase):
     @mock.patch.object(bot, "reset_key_rate_limit_usage")
     @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "tg")
-    def test_non_admin_cannot_forge_reset_callback(self, tg, query, reset):
+    def test_non_admin_cannot_forge_batch_reset_callback(self, tg, query, reset):
         config = {
             "admins": [123],
             "bindings": {"123": "Administrator", "456": "User A"},
@@ -241,7 +361,7 @@ class MessageAuthorizationTests(unittest.TestCase):
             bot.handle_callback_query({
                 "id": "callback-reset-forged",
                 "from": {"id": 456},
-                "data": "reset_confirm:123",
+                "data": "batch_confirm:0",
                 "message": {"message_id": 8, "chat": {"id": 456, "type": "private"}},
             })
         query.assert_not_called()
@@ -305,96 +425,88 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertNotEqual(edits[0], edits[1])
         self.assertIn("刷新时间：2026-08-27 10:00:10", edits[1])
 
-    @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "reset_key_rate_limit_usage")
+    @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "tg")
-    def test_admin_reset_requires_confirmation(self, tg, reset, query):
-        config = {"admins": [123], "bindings": {"456": "User A"}}
+    def test_admin_can_toggle_select_all_clear_and_review_batch_reset(self, tg, query, reset):
+        config = {"admins": [123], "bindings": {"456": "Key A", "789": "Key B"}}
+        callback = {
+            "id": "callback-batch",
+            "from": {"id": 123},
+            "message": {"message_id": 11, "chat": {"id": 123, "type": "private"}},
+        }
         with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
             bot,
             SUB2API_BASE_URL="http://sub2api:8080",
             SUB2API_ADMIN_API_KEY="admin-secret",
         ):
-            bot.handle_callback_query({
-                "id": "callback-reset-prompt",
-                "from": {"id": 123},
-                "data": "reset_prompt:456",
-                "message": {"message_id": 11, "chat": {"id": 123, "type": "private"}},
-            })
+            menu_buttons = [
+                button
+                for row in bot.json.loads(bot.admin_keyboard(bot.config_bindings(config)))["inline_keyboard"]
+                for button in row
+            ]
+            self.assertIn("batch_start:0", {button["callback_data"] for button in menu_buttons})
+
+            for action in ("batch_start:0", "batch_toggle:456", "batch_all:0", "batch_clear:0",
+                           "batch_toggle:789", "batch_review:0"):
+                bot.handle_callback_query({**callback, "data": action})
+
         query.assert_not_called()
         reset.assert_not_called()
-        edit = tg.call_args_list[1].args[1]
-        self.assertIn("确认重置", edit["text"])
-        buttons = bot.json.loads(edit["reply_markup"])["inline_keyboard"][0]
-        self.assertEqual(
-            {button["callback_data"] for button in buttons},
-            {"reset_confirm:456", "reset_cancel:456"},
-        )
-
-    @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-30 12:00:00")
-    @mock.patch.object(bot, "reset_key_rate_limit_usage", return_value={"success": True})
-    @mock.patch.object(bot, "query_key_usage", side_effect=[
-        {"key": {
-            "id": 42, "name": "User A",
-            "rate_limit_5h": 10, "rate_limit_1d": 20, "rate_limit_7d": 30,
-            "usage_5h": 5, "usage_1d": 6, "usage_7d": 7,
-        }},
-        {"key": {
-            "id": 42, "name": "User A",
-            "rate_limit_5h": 10, "rate_limit_1d": 20, "rate_limit_7d": 30,
-            "usage_5h": 0, "usage_1d": 0, "usage_7d": 0,
-        }},
-    ])
-    @mock.patch.object(bot, "tg")
-    def test_admin_reset_rechecks_usage(self, tg, query, reset, _refresh):
-        config = {"admins": [123], "bindings": {"456": "User A"}}
-        with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
-            bot,
-            SUB2API_BASE_URL="http://sub2api:8080",
-            SUB2API_ADMIN_API_KEY="admin-secret",
-        ):
-            bot.handle_callback_query({
-                "id": "callback-reset-confirm",
-                "from": {"id": 123},
-                "data": "reset_confirm:456",
-                "message": {"message_id": 12, "chat": {"id": 123, "type": "private"}},
-            })
-        self.assertEqual(query.call_count, 2)
-        reset.assert_called_once_with(42)
-        edit = tg.call_args_list[-1].args[1]
-        self.assertIn("已重置并完成复查", edit["text"])
-        self.assertIn("5 小时：已用 0 / 限额 10", edit["text"])
-        self.assertIn("每日：已用 0 / 限额 20", edit["text"])
-        self.assertIn("每周：已用 0 / 限额 30", edit["text"])
-        self.assertIn("复查时间：2026-08-30 12:00:00", edit["text"])
-        buttons = [
+        edits = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"]
+        self.assertIn("已选择：0 / 2", edits[0]["text"])
+        self.assertIn("已选择：1 / 2", edits[1]["text"])
+        self.assertIn("已选择：2 / 2", edits[2]["text"])
+        self.assertIn("已选择：0 / 2", edits[3]["text"])
+        self.assertIn("即将重置以下 1 个 Key", edits[-1]["text"])
+        self.assertIn("• Key B", edits[-1]["text"])
+        confirm_buttons = [
             button
-            for row in bot.json.loads(edit["reply_markup"])["inline_keyboard"]
+            for row in bot.json.loads(edits[-1]["reply_markup"])["inline_keyboard"]
             for button in row
         ]
-        self.assertIn("reset_prompt:456", {button["callback_data"] for button in buttons})
+        self.assertIn("batch_confirm:0", {button["callback_data"] for button in confirm_buttons})
 
-    @mock.patch.object(bot, "reset_key_rate_limit_usage", return_value={"success": True})
-    @mock.patch.object(bot, "query_key_usage", side_effect=[
-        {"key": {"id": 42, "name": "User A"}},
-        RuntimeError("database unavailable"),
+    @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-30 12:00:00")
+    @mock.patch.object(bot, "reset_selected_keys", return_value=[
+        {"key_name": "Key A", "status": "success", "detail": "5h 0 / 日 0 / 周 0"},
+        {"key_name": "Key B", "status": "failed", "detail": "重置失败"},
     ])
     @mock.patch.object(bot, "tg")
-    def test_successful_reset_reports_recheck_failure_separately(self, tg, query, reset):
-        config = {"admins": [123], "bindings": {"456": "User A"}}
+    def test_admin_batch_reset_executes_once_after_final_confirmation(self, tg, reset_selected, _refresh):
+        config = {"admins": [123], "bindings": {"456": "Key A", "789": "Key B"}}
+        callback = {
+            "from": {"id": 123},
+            "message": {"message_id": 12, "chat": {"id": 123, "type": "private"}},
+        }
         with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
             bot,
             SUB2API_BASE_URL="http://sub2api:8080",
             SUB2API_ADMIN_API_KEY="admin-secret",
         ):
-            bot.handle_callback_query({
-                "id": "callback-reset-recheck-failure",
-                "from": {"id": 123},
-                "data": "reset_confirm:456",
-                "message": {"message_id": 13, "chat": {"id": 123, "type": "private"}},
-            })
-        reset.assert_called_once_with(42)
-        self.assertIn("重置请求已成功，但复查失败", tg.call_args.args[1]["text"])
+            for index, action in enumerate(("batch_start:0", "batch_all:0", "batch_review:0", "batch_confirm:0")):
+                bot.handle_callback_query({**callback, "id": f"callback-{index}", "data": action})
+            bot.handle_callback_query({**callback, "id": "callback-duplicate", "data": "batch_confirm:0"})
+
+        reset_selected.assert_called_once_with(
+            {
+                "456": {"key_name": "Key A", "account_id": None},
+                "789": {"key_name": "Key B", "account_id": None},
+            },
+            {"456", "789"},
+        )
+        edits = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"]
+        self.assertIn("正在重置并复查 2 个 Key", edits[-2]["text"])
+        self.assertIn("批量重置完成", edits[-1]["text"])
+        self.assertIn("成功：1", edits[-1]["text"])
+        self.assertIn("失败：1", edits[-1]["text"])
+        self.assertIn("batch_start:0", {
+            button["callback_data"]
+            for row in bot.json.loads(edits[-1]["reply_markup"])["inline_keyboard"]
+            for button in row
+        })
+        duplicate_answer = tg.call_args_list[-1].args[1]
+        self.assertIn("选择已过期", duplicate_answer["text"])
 
 
 class DataSafetyTests(unittest.TestCase):
