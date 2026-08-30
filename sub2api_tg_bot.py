@@ -68,6 +68,7 @@ _LAST_CHECK_BY_USER = {}
 _BATCH_RESET_LOCK = threading.Lock()
 _BATCH_RESET_SESSIONS = {}
 BATCH_RESET_SESSION_TTL = 300
+OVERVIEW_PAGE_SIZE = 8
 
 
 def log_failure(event, error):
@@ -355,11 +356,29 @@ def admin_keyboard(bindings, selected_user_id=None):
         button_text = key_name if len(key_name) <= 64 else key_name[:61] + "..."
         buttons.append({"text": button_text, "callback_data": f"usage:{user_id}"})
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([{"text": "📊 Key 总览", "callback_data": "overview:0"}])
     if reset_api_configured():
         rows.append([{
             "text": "⚠️ 批量重置速率限制",
             "callback_data": "batch_start:0",
         }])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def overview_keyboard(page, total_pages):
+    rows = []
+    if total_pages > 1:
+        previous_page = max(0, page - 1)
+        next_page = min(total_pages - 1, page + 1)
+        rows.append([
+            {"text": "◀️", "callback_data": f"overview:{previous_page}"},
+            {"text": f"{page + 1}/{total_pages}", "callback_data": f"overview:{page}"},
+            {"text": "▶️", "callback_data": f"overview:{next_page}"},
+        ])
+    rows.extend([
+        [{"text": "🔄 刷新总览", "callback_data": f"overview:{page}"}],
+        [{"text": "◀️ 返回", "callback_data": "overview_back:0"}],
+    ])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
@@ -701,6 +720,51 @@ def query_key_usage(key_name, account_id=None):
     return run_psql_json(sql, {"key_name": key_name, "account_id": str(account_id)})
 
 
+def collect_key_overview(bindings):
+    overview = []
+    for target_user_id, binding in reset_candidates(bindings):
+        key_name = binding["key_name"]
+        try:
+            data = query_key_usage(key_name, binding["account_id"]) or {}
+            key = data.get("key") or {}
+            if not key:
+                raise RuntimeError("Overview query did not return API key data")
+            overview.append({
+                "key_name": key_name,
+                "last_used_at": key.get("last_used_at"),
+                "rate_limit_7d": key.get("rate_limit_7d"),
+                "usage_7d": key.get("usage_7d"),
+            })
+        except Exception as error:
+            log_failure(f"overview target={masked_id(target_user_id)}", error)
+            overview.append({"key_name": key_name, "error": True})
+    return overview
+
+
+def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE):
+    if isinstance(page, bool) or not isinstance(page, int):
+        raise ValueError("Invalid overview page")
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
+        raise ValueError("Invalid overview page size")
+    total_pages = max(1, (len(overview) + page_size - 1) // page_size)
+    page = min(max(page, 0), total_pages - 1)
+    page_items = overview[page * page_size:(page + 1) * page_size]
+    lines = ["📊 Key 总览"]
+    if not page_items:
+        lines.extend(["", "暂无已绑定 Key。"])
+    for item in page_items:
+        lines.extend(["", f"🔑 {item['key_name']}"])
+        if item.get("error"):
+            lines.extend(["• 最后使用：数据不可用", "• 每周额度：数据不可用"])
+            continue
+        last_used_at = item.get("last_used_at")
+        lines.append(
+            f"• 最后使用：{format_timestamp(last_used_at) if last_used_at else '暂无使用记录'}"
+        )
+        append_limit(lines, "每周额度", item.get("rate_limit_7d"), item.get("usage_7d"))
+    return "\n".join(lines), page, total_pages
+
+
 def load_alert_state():
     try:
         with open(ALERT_STATE_PATH, "r", encoding="utf-8") as f:
@@ -914,7 +978,7 @@ def handle_callback_query(callback):
     user_id = str(user.get("id"))
     action, separator, target_user_id = callback_data.partition(":")
     if not callback_id or not separator or action not in {
-        "usage",
+        "usage", "overview", "overview_back",
         "batch_start", "batch_toggle", "batch_all", "batch_clear",
         "batch_review", "batch_back", "batch_confirm", "batch_cancel",
         "reset_prompt", "reset_confirm", "reset_cancel",
@@ -935,6 +999,41 @@ def handle_callback_query(callback):
                 "callback_query_id": callback_id,
                 "text": "你没有管理员权限。",
                 "show_alert": "true",
+            })
+            return
+        if action == "overview_back":
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": "请选择要查看的 Key：",
+                "reply_markup": admin_keyboard(bindings),
+            })
+            return
+        if action == "overview":
+            if not target_user_id.isdigit():
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "总览页码无效，请重新发送 /check。",
+                    "show_alert": "true",
+                })
+                return
+            allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
+            if not allowed:
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": f"查询过于频繁，请 {retry_after} 秒后再试。",
+                    "show_alert": "true",
+                })
+                return
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+            overview = collect_key_overview(bindings)
+            reply, page, total_pages = format_key_overview(overview, int(target_user_id))
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": reply,
+                "reply_markup": overview_keyboard(page, total_pages),
             })
             return
         if action in {"reset_prompt", "reset_confirm", "reset_cancel"}:
@@ -1108,6 +1207,8 @@ def handle_callback_query(callback):
             error_text = "批量重置执行异常，请重新发送 /check 查询当前用量。"
         elif action.startswith("batch_"):
             error_text = "批量重置操作失败，请重新发送 /check。"
+        elif action.startswith("overview"):
+            error_text = "总览查询失败，请稍后再试。"
         else:
             error_text = "查询失败，请稍后再试。"
         tg("sendMessage", {"chat_id": chat.get("id"), "text": error_text})

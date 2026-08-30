@@ -232,6 +232,69 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIn("❌ Key C：重置失败", text)
         self.assertIn("复查时间：2026-08-30 12:00:00", text)
 
+    @mock.patch.object(bot, "query_key_usage", side_effect=[
+        {"key": {
+            "last_used_at": "2026-08-30T07:26:18Z",
+            "rate_limit_7d": 600,
+            "usage_7d": 320,
+        }},
+        RuntimeError("database unavailable"),
+    ])
+    def test_key_overview_deduplicates_names_and_keeps_query_failures(self, query):
+        bindings = {
+            "123": {"key_name": "Key A", "account_id": 1},
+            "456": {"key_name": "Key B", "account_id": 2},
+            "789": {"key_name": "Key A", "account_id": 3},
+        }
+        self.assertEqual(bot.collect_key_overview(bindings), [
+            {
+                "key_name": "Key A",
+                "last_used_at": "2026-08-30T07:26:18Z",
+                "rate_limit_7d": 600,
+                "usage_7d": 320,
+            },
+            {"key_name": "Key B", "error": True},
+        ])
+        self.assertEqual(query.call_args_list, [mock.call("Key A", 1), mock.call("Key B", 2)])
+
+    def test_key_overview_only_formats_last_use_and_weekly_limit_with_progress(self):
+        text, page, total_pages = bot.format_key_overview([
+            {
+                "key_name": "Key A",
+                "last_used_at": "2026-08-30T07:26:18Z",
+                "rate_limit_7d": 600,
+                "usage_7d": 320,
+            },
+            {
+                "key_name": "Key B",
+                "last_used_at": None,
+                "rate_limit_7d": 0,
+                "usage_7d": 45,
+            },
+            {"key_name": "Key C", "error": True},
+        ])
+        self.assertEqual((page, total_pages), (0, 1))
+        self.assertIn("🔑 Key A", text)
+        self.assertIn("最后使用：2026-08-30 15:26:18", text)
+        self.assertIn("每周额度：已用 320 / 限额 600 / 剩余 280", text)
+        self.assertIn("[██████░░░░░░] 53.33%", text)
+        self.assertIn("最后使用：暂无使用记录", text)
+        self.assertIn("每周额度：不限（已用 45）", text)
+        self.assertIn("🔑 Key C\n• 最后使用：数据不可用\n• 每周额度：数据不可用", text)
+        for unwanted in ("请求：", "Tokens", "费用：", "5 小时", "每日：", "模型"):
+            self.assertNotIn(unwanted, text)
+
+    def test_key_overview_clamps_pages_and_limits_items_per_page(self):
+        overview = [
+            {"key_name": f"Key {index}", "last_used_at": None, "rate_limit_7d": 600, "usage_7d": index}
+            for index in range(10)
+        ]
+        text, page, total_pages = bot.format_key_overview(overview, page=99)
+        self.assertEqual((page, total_pages), (1, 2))
+        self.assertNotIn("🔑 Key 7\n", text)
+        self.assertIn("🔑 Key 8\n", text)
+        self.assertIn("🔑 Key 9\n", text)
+
     def test_only_matching_private_chat_is_authorized(self):
         self.assertTrue(bot.is_private_user_chat({"id": 123, "type": "private"}, {"id": 123}))
         self.assertFalse(bot.is_private_user_chat({"id": -10, "type": "group"}, {"id": 123}))
@@ -310,10 +373,16 @@ class MessageAuthorizationTests(unittest.TestCase):
         params = tg.call_args.args[1]
         self.assertEqual(params["text"], "请选择要查看的 Key：")
         keyboard = bot.json.loads(params["reply_markup"])["inline_keyboard"]
-        self.assertEqual([len(row) for row in keyboard], [2, 1])
+        self.assertEqual([len(row) for row in keyboard], [2, 1, 1])
         buttons = [button for row in keyboard for button in row]
-        self.assertEqual({button["text"] for button in buttons}, {"Administrator", "User A", "User B"})
-        self.assertEqual({button["callback_data"] for button in buttons}, {"usage:123", "usage:456", "usage:789"})
+        self.assertEqual(
+            {button["text"] for button in buttons},
+            {"Administrator", "User A", "User B", "📊 Key 总览"},
+        )
+        self.assertEqual(
+            {button["callback_data"] for button in buttons},
+            {"usage:123", "usage:456", "usage:789", "overview:0"},
+        )
 
     @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
     @mock.patch.object(bot, "tg")
@@ -367,6 +436,63 @@ class MessageAuthorizationTests(unittest.TestCase):
         query.assert_not_called()
         reset.assert_not_called()
         self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
+
+    @mock.patch.object(bot, "collect_key_overview")
+    @mock.patch.object(bot, "tg")
+    def test_non_admin_cannot_forge_overview_callback(self, tg, collect):
+        config = {"admins": [123], "bindings": {"456": "Key A"}}
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "callback-overview-forged",
+                "from": {"id": 456},
+                "data": "overview:0",
+                "message": {"message_id": 8, "chat": {"id": 456, "type": "private"}},
+            })
+        collect.assert_not_called()
+        self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
+
+    @mock.patch.object(bot, "allow_check", return_value=(True, 0))
+    @mock.patch.object(bot, "collect_key_overview", return_value=[
+        {"key_name": "Key A", "last_used_at": None, "rate_limit_7d": 600, "usage_7d": 300},
+    ])
+    @mock.patch.object(bot, "tg")
+    def test_admin_can_open_refresh_and_return_from_key_overview(self, tg, collect, allow):
+        config = {"admins": [123], "bindings": {"456": "Key A"}}
+        callback = {
+            "from": {"id": 123},
+            "message": {"message_id": 9, "chat": {"id": 123, "type": "private"}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({**callback, "id": "overview-open", "data": "overview:0"})
+            bot.handle_callback_query({**callback, "id": "overview-back", "data": "overview_back:0"})
+        collect.assert_called_once_with({"456": {"key_name": "Key A", "account_id": None}})
+        allow.assert_called_once_with("123", cooldown=bot.ADMIN_CHECK_COOLDOWN)
+        edits = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"]
+        self.assertIn("📊 Key 总览", edits[0]["text"])
+        self.assertIn("[██████░░░░░░] 50%", edits[0]["text"])
+        overview_buttons = [
+            button
+            for row in bot.json.loads(edits[0]["reply_markup"])["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(
+            {button["callback_data"] for button in overview_buttons},
+            {"overview:0", "overview_back:0"},
+        )
+        self.assertEqual(edits[1]["text"], "请选择要查看的 Key：")
+        collect.assert_called_once()
+
+    def test_overview_keyboard_supports_pagination_refresh_and_back(self):
+        buttons = [
+            button
+            for row in bot.json.loads(bot.overview_keyboard(1, 3))["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(
+            {button["callback_data"] for button in buttons},
+            {"overview:0", "overview:1", "overview:2", "overview_back:0"},
+        )
+        self.assertIn("2/3", {button["text"] for button in buttons})
 
     @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
     @mock.patch.object(bot, "tg")
