@@ -22,6 +22,9 @@ class RuntimeConfigTests(unittest.TestCase):
             PGPASSWORD="a-valid-restricted-password",
             PGSSLMODE="prefer",
             PG_ALLOW_INSECURE_PRIVATE_NETWORK="0",
+            SUB2API_BASE_URL="",
+            SUB2API_ADMIN_API_KEY="",
+            SUB2API_ADMIN_TIMEOUT=10,
             UPDATE_WORKERS=4,
             UPDATE_MAX_PENDING=16,
             CHECK_COOLDOWN=10,
@@ -61,6 +64,32 @@ class RuntimeConfigTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "trusted private network"):
                 bot.validate_runtime_config()
+
+    def test_reset_api_config_must_be_configured_as_a_pair(self):
+        with self.valid_runtime(), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "configured together"):
+                bot.validate_runtime_config()
+
+    def test_reset_api_rejects_plain_http_public_host(self):
+        with self.valid_runtime(), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api.example.com",
+            SUB2API_ADMIN_API_KEY="valid-admin-secret",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "private Compose network"):
+                bot.validate_runtime_config()
+
+    def test_reset_api_accepts_private_compose_service(self):
+        with self.valid_runtime(), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="valid-admin-secret",
+        ):
+            bot.validate_runtime_config()
 
     def test_secret_can_be_read_from_absolute_file(self):
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as secret_file:
@@ -200,6 +229,25 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertEqual(tg.call_args.args[0], "answerCallbackQuery")
         self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
 
+    @mock.patch.object(bot, "reset_key_rate_limit_usage")
+    @mock.patch.object(bot, "query_key_usage")
+    @mock.patch.object(bot, "tg")
+    def test_non_admin_cannot_forge_reset_callback(self, tg, query, reset):
+        config = {
+            "admins": [123],
+            "bindings": {"123": "Administrator", "456": "User A"},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "callback-reset-forged",
+                "from": {"id": 456},
+                "data": "reset_confirm:123",
+                "message": {"message_id": 8, "chat": {"id": 456, "type": "private"}},
+            })
+        query.assert_not_called()
+        reset.assert_not_called()
+        self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
+
     @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
     @mock.patch.object(bot, "tg")
     def test_admin_callback_queries_selected_binding_and_keeps_menu(self, tg, query):
@@ -257,8 +305,129 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertNotEqual(edits[0], edits[1])
         self.assertIn("刷新时间：2026-08-27 10:00:10", edits[1])
 
+    @mock.patch.object(bot, "query_key_usage")
+    @mock.patch.object(bot, "reset_key_rate_limit_usage")
+    @mock.patch.object(bot, "tg")
+    def test_admin_reset_requires_confirmation(self, tg, reset, query):
+        config = {"admins": [123], "bindings": {"456": "User A"}}
+        with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+        ):
+            bot.handle_callback_query({
+                "id": "callback-reset-prompt",
+                "from": {"id": 123},
+                "data": "reset_prompt:456",
+                "message": {"message_id": 11, "chat": {"id": 123, "type": "private"}},
+            })
+        query.assert_not_called()
+        reset.assert_not_called()
+        edit = tg.call_args_list[1].args[1]
+        self.assertIn("确认重置", edit["text"])
+        buttons = bot.json.loads(edit["reply_markup"])["inline_keyboard"][0]
+        self.assertEqual(
+            {button["callback_data"] for button in buttons},
+            {"reset_confirm:456", "reset_cancel:456"},
+        )
+
+    @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-30 12:00:00")
+    @mock.patch.object(bot, "reset_key_rate_limit_usage", return_value={"success": True})
+    @mock.patch.object(bot, "query_key_usage", side_effect=[
+        {"key": {
+            "id": 42, "name": "User A",
+            "rate_limit_5h": 10, "rate_limit_1d": 20, "rate_limit_7d": 30,
+            "usage_5h": 5, "usage_1d": 6, "usage_7d": 7,
+        }},
+        {"key": {
+            "id": 42, "name": "User A",
+            "rate_limit_5h": 10, "rate_limit_1d": 20, "rate_limit_7d": 30,
+            "usage_5h": 0, "usage_1d": 0, "usage_7d": 0,
+        }},
+    ])
+    @mock.patch.object(bot, "tg")
+    def test_admin_reset_rechecks_usage(self, tg, query, reset, _refresh):
+        config = {"admins": [123], "bindings": {"456": "User A"}}
+        with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+        ):
+            bot.handle_callback_query({
+                "id": "callback-reset-confirm",
+                "from": {"id": 123},
+                "data": "reset_confirm:456",
+                "message": {"message_id": 12, "chat": {"id": 123, "type": "private"}},
+            })
+        self.assertEqual(query.call_count, 2)
+        reset.assert_called_once_with(42)
+        edit = tg.call_args_list[-1].args[1]
+        self.assertIn("已重置并完成复查", edit["text"])
+        self.assertIn("5 小时：已用 0 / 限额 10", edit["text"])
+        self.assertIn("每日：已用 0 / 限额 20", edit["text"])
+        self.assertIn("每周：已用 0 / 限额 30", edit["text"])
+        self.assertIn("复查时间：2026-08-30 12:00:00", edit["text"])
+        buttons = [
+            button
+            for row in bot.json.loads(edit["reply_markup"])["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("reset_prompt:456", {button["callback_data"] for button in buttons})
+
+    @mock.patch.object(bot, "reset_key_rate_limit_usage", return_value={"success": True})
+    @mock.patch.object(bot, "query_key_usage", side_effect=[
+        {"key": {"id": 42, "name": "User A"}},
+        RuntimeError("database unavailable"),
+    ])
+    @mock.patch.object(bot, "tg")
+    def test_successful_reset_reports_recheck_failure_separately(self, tg, query, reset):
+        config = {"admins": [123], "bindings": {"456": "User A"}}
+        with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+        ):
+            bot.handle_callback_query({
+                "id": "callback-reset-recheck-failure",
+                "from": {"id": 123},
+                "data": "reset_confirm:456",
+                "message": {"message_id": 13, "chat": {"id": 123, "type": "private"}},
+            })
+        reset.assert_called_once_with(42)
+        self.assertIn("重置请求已成功，但复查失败", tg.call_args.args[1]["text"])
+
 
 class DataSafetyTests(unittest.TestCase):
+    def test_reset_api_uses_admin_header_and_refuses_redirects(self):
+        response = mock.MagicMock()
+        response.read.return_value = b'{"success":true}'
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        opener = mock.MagicMock()
+        opener.open.return_value = context
+        with mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+            SUB2API_ADMIN_TIMEOUT=7,
+        ), mock.patch.object(bot.urllib.request, "build_opener", return_value=opener) as build_opener:
+            result = bot.reset_key_rate_limit_usage(42)
+        self.assertEqual(result, {"success": True})
+        self.assertIsInstance(build_opener.call_args.args[0], bot.NoRedirectHandler)
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://sub2api:8080/api/v1/admin/api-keys/42")
+        self.assertEqual(request.method, "PUT")
+        self.assertEqual(request.get_header("X-api-key"), "admin-secret")
+        self.assertEqual(bot.json.loads(request.data), {"reset_rate_limit_usage": True})
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 7)
+
+    def test_reset_api_rejects_invalid_key_id_before_network(self):
+        with mock.patch.object(bot.urllib.request, "build_opener") as build_opener:
+            for value in (True, 0, -1, "42"):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    bot.reset_key_rate_limit_usage(value)
+            build_opener.assert_not_called()
+
     def test_invalid_key_name_is_rejected_before_subprocess(self):
         with mock.patch.object(bot, "run_psql_json") as run:
             with self.assertRaises(ValueError):
@@ -299,6 +468,7 @@ class DataSafetyTests(unittest.TestCase):
             PGPASSWORD="database-secret",
             PGSSLMODE="prefer",
             TOKEN="telegram-secret",
+            SUB2API_ADMIN_API_KEY="sub2api-admin-secret",
         ), mock.patch.object(bot.subprocess, "check_output", return_value='{"ok": true}\n') as check:
             result = bot.run_psql_json("SELECT :'key_name';", {"key_name": "example-key"})
         self.assertEqual(result, {"ok": True})
@@ -314,6 +484,7 @@ class DataSafetyTests(unittest.TestCase):
         self.assertEqual(environment["PGUSER"], "sub2api_tg_bot")
         self.assertIn("default_transaction_read_only=on", environment["PGOPTIONS"])
         self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
+        self.assertNotIn("SUB2API_ADMIN_API_KEY", environment)
 
     def test_database_setup_exposes_only_fixed_function(self):
         with open("deploy/create_readonly_role.sql", "r", encoding="utf-8") as file:
@@ -526,6 +697,9 @@ class ContainerPackagingTests(unittest.TestCase):
         self.assertIn("cap_drop:", compose)
         self.assertIn("internal: true", compose)
         self.assertIn("PG_ALLOW_INSECURE_PRIVATE_NETWORK: \"1\"", compose)
+        self.assertIn("SUB2API_ADMIN_API_KEY_FILE: /run/secrets/sub2api_admin_api_key", compose)
+        self.assertIn("SUB2API_BASE_URL:", compose)
+        self.assertIn("file: ./secrets/sub2api_admin_api_key", compose)
         self.assertNotIn("docker.sock", compose)
         self.assertNotIn("ports:", compose)
         self.assertNotIn("env_file:", compose)

@@ -38,6 +38,9 @@ def read_secret(name):
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("SUB2API_TG_BOT_CONFIG", os.path.join(BASE_DIR, "config.json"))
 TOKEN = read_secret("TELEGRAM_BOT_TOKEN").strip()
+SUB2API_BASE_URL = os.environ.get("SUB2API_BASE_URL", "").strip().rstrip("/")
+SUB2API_ADMIN_API_KEY = read_secret("SUB2API_ADMIN_API_KEY").strip()
+SUB2API_ADMIN_TIMEOUT = int(os.environ.get("SUB2API_ADMIN_TIMEOUT", "10"))
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
 ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
@@ -86,6 +89,38 @@ def validate_runtime_config():
         raise RuntimeError("ADMIN_CHECK_COOLDOWN must be between 1 and 3600 seconds")
     if not 1 <= POLL_TIMEOUT <= 50:
         raise RuntimeError("POLL_TIMEOUT must be between 1 and 50 seconds")
+    if not 1 <= SUB2API_ADMIN_TIMEOUT <= 60:
+        raise RuntimeError("SUB2API_ADMIN_TIMEOUT must be between 1 and 60 seconds")
+    if bool(SUB2API_BASE_URL) != bool(SUB2API_ADMIN_API_KEY):
+        raise RuntimeError("SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY must be configured together")
+    if SUB2API_BASE_URL:
+        parsed = urllib.parse.urlsplit(SUB2API_BASE_URL)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError("SUB2API_BASE_URL is invalid")
+        try:
+            parsed.port
+        except ValueError as error:
+            raise RuntimeError("SUB2API_BASE_URL is invalid") from error
+        local_hosts = {"127.0.0.1", "::1", "localhost"}
+        if (
+            parsed.scheme == "http"
+            and parsed.hostname not in local_hosts
+            and not COMPOSE_SERVICE_NAME_RE.fullmatch(parsed.hostname)
+        ):
+            raise RuntimeError("SUB2API_BASE_URL must use HTTPS outside a private Compose network")
+        if (
+            not SUB2API_ADMIN_API_KEY
+            or "replace_me" in SUB2API_ADMIN_API_KEY.lower()
+            or any(char in SUB2API_ADMIN_API_KEY for char in "\r\n\0")
+        ):
+            raise RuntimeError("SUB2API_ADMIN_API_KEY is invalid")
     if not os.path.isabs(PSQL_BIN) or not os.path.isfile(PSQL_BIN) or not os.access(PSQL_BIN, os.X_OK):
         raise RuntimeError("PSQL_BIN must point to an executable psql client")
     if not PGHOST or any(char in PGHOST for char in "\r\n\0"):
@@ -154,7 +189,7 @@ def config_admins(config):
     return normalized
 
 
-def admin_keyboard(bindings):
+def admin_keyboard(bindings, selected_user_id=None):
     buttons = []
     sorted_bindings = sorted(bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0]))
     for user_id, binding in sorted_bindings:
@@ -162,7 +197,19 @@ def admin_keyboard(bindings):
         button_text = key_name if len(key_name) <= 64 else key_name[:61] + "..."
         buttons.append({"text": button_text, "callback_data": f"usage:{user_id}"})
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    if selected_user_id is not None and reset_api_configured():
+        rows.append([{
+            "text": "⚠️ 重置速率限制用量",
+            "callback_data": f"reset_prompt:{selected_user_id}",
+        }])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def reset_confirmation_keyboard(target_user_id):
+    return json.dumps({"inline_keyboard": [[
+        {"text": "确认重置", "callback_data": f"reset_confirm:{target_user_id}"},
+        {"text": "取消", "callback_data": f"reset_cancel:{target_user_id}"},
+    ]]}, ensure_ascii=False)
 
 
 def tg(method, params=None, timeout=10):
@@ -175,6 +222,39 @@ def tg(method, params=None, timeout=10):
     if not payload.get("ok"):
         raise RuntimeError(f"Telegram API error: {payload}")
     return payload.get("result")
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def reset_api_configured():
+    return bool(SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY)
+
+
+def reset_key_rate_limit_usage(key_id):
+    if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
+        raise ValueError("Invalid API key ID")
+    if not reset_api_configured():
+        raise RuntimeError("Sub2API reset API is not configured")
+    body = json.dumps({"reset_rate_limit_usage": True}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{SUB2API_BASE_URL}/api/v1/admin/api-keys/{key_id}",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-api-key": SUB2API_ADMIN_API_KEY,
+        },
+        method="PUT",
+    )
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    with opener.open(request, timeout=SUB2API_ADMIN_TIMEOUT) as response:
+        response_body = response.read(1_048_577)
+    if len(response_body) > 1_048_576:
+        raise RuntimeError("Sub2API response is too large")
+    return json.loads(response_body.decode("utf-8")) if response_body else None
 
 
 def run_psql_json(sql, variables=None):
@@ -608,7 +688,10 @@ def handle_callback_query(callback):
     chat = message.get("chat") or {}
     user = callback.get("from") or {}
     user_id = str(user.get("id"))
-    if not callback_id or not callback_data.startswith("usage:"):
+    action, separator, target_user_id = callback_data.partition(":")
+    if not callback_id or not separator or action not in {
+        "usage", "reset_prompt", "reset_confirm", "reset_cancel",
+    }:
         return
     if not is_private_user_chat(chat, user):
         tg("answerCallbackQuery", {
@@ -617,6 +700,7 @@ def handle_callback_query(callback):
             "show_alert": "true",
         })
         return
+    reset_completed = False
     try:
         cfg = load_config()
         bindings = config_bindings(cfg)
@@ -627,7 +711,6 @@ def handle_callback_query(callback):
                 "show_alert": "true",
             })
             return
-        target_user_id = callback_data.removeprefix("usage:")
         binding = bindings.get(target_user_id)
         if not binding:
             tg("answerCallbackQuery", {
@@ -637,6 +720,72 @@ def handle_callback_query(callback):
             })
             return
         key_name = binding["key_name"]
+        if action == "reset_prompt":
+            if not reset_api_configured():
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "重置功能尚未配置。",
+                    "show_alert": "true",
+                })
+                return
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": (
+                    "⚠️ 确认重置速率限制用量？\n\n"
+                    f"Key：{key_name}\n\n"
+                    "这会清零 5 小时、每日和 7 天限速计数；"
+                    "不会清零总额度或删除历史用量记录。"
+                ),
+                "reply_markup": reset_confirmation_keyboard(target_user_id),
+            })
+            return
+        if action == "reset_confirm":
+            if not reset_api_configured():
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "重置功能尚未配置。",
+                    "show_alert": "true",
+                })
+                return
+            tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": "正在重置…"})
+            current_data = query_key_usage(key_name, binding["account_id"]) or {}
+            key = current_data.get("key") or {}
+            key_id = key.get("id")
+            if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
+                reply = "无法重置：未能确定唯一的 Key ID。\n\n" + format_usage(key_name, current_data)
+                tg("editMessageText", {
+                    "chat_id": chat.get("id"),
+                    "message_id": message.get("message_id"),
+                    "text": reply,
+                    "reply_markup": admin_keyboard(bindings, target_user_id),
+                })
+                return
+            reset_key_rate_limit_usage(key_id)
+            reset_completed = True
+            checked_data = query_key_usage(key_name, binding["account_id"]) or {}
+            reply = "✅ 速率限制用量已重置并完成复查。\n\n" + format_usage(key_name, checked_data)
+            reply += f"\n\n🔄 复查时间：{format_refresh_timestamp(cfg)}"
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": reply,
+                "reply_markup": admin_keyboard(bindings, target_user_id),
+            })
+            return
+        if action == "reset_cancel":
+            tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": "已取消"})
+            data = query_key_usage(key_name, binding["account_id"])
+            reply = format_usage(key_name, data or {})
+            reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": reply,
+                "reply_markup": admin_keyboard(bindings, target_user_id),
+            })
+            return
         allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
         if not allowed:
             tg("answerCallbackQuery", {
@@ -653,11 +802,17 @@ def handle_callback_query(callback):
             "chat_id": chat.get("id"),
             "message_id": message.get("message_id"),
             "text": reply,
-            "reply_markup": admin_keyboard(bindings),
+            "reply_markup": admin_keyboard(bindings, target_user_id),
         })
     except Exception as error:
-        log_failure(f"admin check user={masked_id(user_id)}", error)
-        tg("sendMessage", {"chat_id": chat.get("id"), "text": "查询失败，请稍后再试。"})
+        log_failure(f"admin {action} user={masked_id(user_id)}", error)
+        if action == "reset_confirm" and reset_completed:
+            error_text = "重置请求已成功，但复查失败。请重新选择该 Key 查询当前用量。"
+        elif action == "reset_confirm":
+            error_text = "重置失败，请稍后再试。"
+        else:
+            error_text = "查询失败，请稍后再试。"
+        tg("sendMessage", {"chat_id": chat.get("id"), "text": error_text})
 
 
 def handle_update(update):

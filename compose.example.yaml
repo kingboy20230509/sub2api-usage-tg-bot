@@ -9,6 +9,9 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
       PGPASSWORD_FILE: /run/secrets/postgres_password
+      SUB2API_ADMIN_API_KEY_FILE: /run/secrets/sub2api_admin_api_key
+      SUB2API_BASE_URL: ${SUB2API_TG_BOT_SUB2API_BASE_URL:-http://sub2api:8080}
+      SUB2API_ADMIN_TIMEOUT: ${SUB2API_TG_BOT_SUB2API_ADMIN_TIMEOUT:-10}
       SUB2API_TG_BOT_CONFIG: /etc/sub2api-tg-bot/config.json
       ALERT_STATE_PATH: /var/lib/sub2api-tg-bot/alert_state.json
       LISTEN_HOST: 127.0.0.1
@@ -29,6 +32,7 @@ services:
     secrets:
       - telegram_bot_token
       - postgres_password
+      - sub2api_admin_api_key
     volumes:
       - type: bind
         source: ./config.json
@@ -58,6 +62,8 @@ secrets:
     file: ./secrets/telegram_bot_token
   postgres_password:
     file: ./secrets/postgres_password
+  sub2api_admin_api_key:
+    file: ./secrets/sub2api_admin_api_key
 
 volumes:
   sub2api-tg-bot-state:
