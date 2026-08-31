@@ -166,14 +166,86 @@ SELECT (
 FROM base;
 $function$;
 
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_estimate(
+  p_account_id bigint
+)
+RETURNS json
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+WITH account_snapshot AS (
+  SELECT
+    id,
+    name,
+    platform,
+    type,
+    extra->>'codex_usage_updated_at' AS snapshot_updated_at,
+    extra->>'codex_7d_used_percent' AS used_7d_percent,
+    CASE
+      WHEN extra->>'codex_7d_reset_at' ~
+        '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+      THEN (extra->>'codex_7d_reset_at')::timestamptz
+    END AS reset_7d_at,
+    CASE
+      WHEN extra->>'codex_7d_window_minutes' ~ '^[0-9]+$'
+        AND (extra->>'codex_7d_window_minutes')::bigint > 0
+      THEN (extra->>'codex_7d_window_minutes')::bigint
+      ELSE 10080
+    END AS window_7d_minutes
+  FROM public.accounts
+  WHERE id = p_account_id
+    AND deleted_at IS NULL
+), account_cost AS (
+  SELECT coalesce(sum(
+    coalesce(
+      nullif(to_jsonb(usage_row)->>'account_stats_cost', '')::numeric,
+      usage_row.total_cost
+    ) * coalesce(
+      nullif(to_jsonb(usage_row)->>'account_rate_multiplier', '')::numeric,
+      1
+    )
+  ), 0)::numeric(20, 10) AS consumed_amount
+  FROM public.usage_logs AS usage_row
+  JOIN account_snapshot AS account ON account.id = usage_row.account_id
+  WHERE account.reset_7d_at IS NOT NULL
+    AND usage_row.created_at >= account.reset_7d_at - account.window_7d_minutes * interval '1 minute'
+    AND usage_row.created_at < account.reset_7d_at
+)
+SELECT CASE
+  WHEN NOT EXISTS (SELECT 1 FROM account_snapshot)
+    THEN json_build_object('error', 'not_found', 'id', p_account_id)
+  ELSE json_build_object(
+    'id', (SELECT id FROM account_snapshot),
+    'name', (SELECT name FROM account_snapshot),
+    'platform', (SELECT platform FROM account_snapshot),
+    'type', (SELECT type FROM account_snapshot),
+    'snapshot_updated_at', (SELECT snapshot_updated_at FROM account_snapshot),
+    'used_7d_percent', (SELECT used_7d_percent FROM account_snapshot),
+    'window_start', (
+      SELECT reset_7d_at - window_7d_minutes * interval '1 minute'
+      FROM account_snapshot
+    ),
+    'window_end', (SELECT reset_7d_at FROM account_snapshot),
+    'consumed_amount', CASE
+      WHEN (SELECT reset_7d_at FROM account_snapshot) IS NULL THEN NULL
+      ELSE (SELECT consumed_amount FROM account_cost)
+    END
+  )
+END;
+$function$;
+
 REVOKE ALL PRIVILEGES ON DATABASE sub2api FROM sub2api_tg_bot;
 REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts FROM sub2api_tg_bot;
 REVOKE CREATE ON SCHEMA public FROM sub2api_tg_bot;
 REVOKE ALL ON SCHEMA sub2api_tg_bot_api FROM sub2api_tg_bot;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) FROM PUBLIC;
 
 GRANT CONNECT ON DATABASE sub2api TO sub2api_tg_bot;
 GRANT USAGE ON SCHEMA sub2api_tg_bot_api TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) TO sub2api_tg_bot;
