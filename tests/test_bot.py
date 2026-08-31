@@ -451,12 +451,13 @@ class MessageAuthorizationTests(unittest.TestCase):
         collect.assert_not_called()
         self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
 
+    @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-31 11:56:00")
     @mock.patch.object(bot, "allow_check", return_value=(True, 0))
     @mock.patch.object(bot, "collect_key_overview", return_value=[
         {"key_name": "Key A", "last_used_at": None, "rate_limit_7d": 600, "usage_7d": 300},
     ])
     @mock.patch.object(bot, "tg")
-    def test_admin_can_open_refresh_and_return_from_key_overview(self, tg, collect, allow):
+    def test_admin_can_open_refresh_and_return_from_key_overview(self, tg, collect, allow, _refresh):
         config = {"admins": [123], "bindings": {"456": "Key A"}}
         callback = {
             "from": {"id": 123},
@@ -470,6 +471,7 @@ class MessageAuthorizationTests(unittest.TestCase):
         edits = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"]
         self.assertIn("📊 Key 总览", edits[0]["text"])
         self.assertIn("[██████░░░░░░] 50%", edits[0]["text"])
+        self.assertIn("🔄 刷新时间：2026-08-31 11:56:00", edits[0]["text"])
         overview_buttons = [
             button
             for row in bot.json.loads(edits[0]["reply_markup"])["inline_keyboard"]
