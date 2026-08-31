@@ -882,6 +882,7 @@ class DataSafetyTests(unittest.TestCase):
                 "window_7d_start": "2026-08-24T00:00:00+00:00",
                 "window_7d_end": "2026-08-31T00:00:00+00:00",
                 "last_used_at": "2026-08-21T15:31:41.722896+08:00",
+                "expires_at": "2026-08-31T08:30:00Z",
             },
             "today": {
                 "requests": 1,
@@ -943,6 +944,7 @@ class DataSafetyTests(unittest.TestCase):
         self.assertEqual(output.count("["), 2)
         self.assertNotIn("💰 额度", output)
         self.assertNotIn("总额", output)
+        self.assertIn("📅 到期时间：2026-08-31 16:30:00｜剩余：7d 1h", output)
         self.assertIn("状态：正常", output)
         self.assertIn("2026-08-21 15:31:41", output)
         self.assertIn("今日模型 Top 5", output)
@@ -955,6 +957,22 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("Tokens：输入 0.02k / 输出 0.004k", output)
         self.assertIn("缓存占比：读取 23.53%｜写入 17.65%", output)
         self.assertLess(len(output), 4096)
+
+    def test_key_expiry_supports_permanent_expired_and_invalid_values(self):
+        now = bot.datetime.fromisoformat("2026-08-31T04:00:00+00:00")
+        permanent = bot.format_usage("permanent", {
+            "key": {"name": "permanent", "status": "active", "expires_at": None},
+        }, now=now)
+        expired = bot.format_usage("expired", {
+            "key": {"name": "expired", "status": "expired", "expires_at": "2026-08-30T04:00:00Z"},
+        }, now=now)
+        invalid = bot.format_usage("invalid", {
+            "key": {"name": "invalid", "status": "active", "expires_at": "not-a-timestamp"},
+        }, now=now)
+        self.assertIn("📅 到期时间：永不过期", permanent)
+        self.assertIn("📅 到期时间：2026-08-30 12:00:00｜已过期", expired)
+        self.assertIn("状态：已过期", expired)
+        self.assertIn("📅 到期时间：数据不可用", invalid)
 
     def test_missing_configured_account_is_visible_without_guessing_a_reset(self):
         data = {
