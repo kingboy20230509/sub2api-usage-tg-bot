@@ -21,7 +21,7 @@ Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API
 
 ## 功能与安全边界
 
-- `/start` 显示使用提示，`/check` 查询用量；管理员可以查看所有已绑定 Key 的最后使用时间和每周额度进度条，也可以通过复选按钮选择一个或多个 Key，在最终确认后批量重置 5 小时/日/周限速用量。
+- `/start` 显示使用提示，`/check` 查询用量；管理员可以查看所有已绑定 Key 的最后使用时间、每周额度进度条，以及绑定账号的周使用百分比、消耗金额和满额金额预估，也可以通过复选按钮选择一个或多个 Key，在最终确认后批量重置 5 小时/日/周限速用量。
 - 显示总额度、5 小时/日/周限额、今日及 7 天用量和模型统计；5 小时与每周重置时间读取绑定账号的 Codex 上游快照，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
 - 周额度剩余不超过 20% 时主动提醒，每个周窗口只提醒一次。
 - 仅允许绑定用户在与 Bot 的私聊中查询；群聊不返回用量。
@@ -114,7 +114,7 @@ docker compose exec -T postgres psql -U sub2api -d sub2api -P pager=off \
   -c "SELECT id, name, platform, type, status, extra->>'codex_usage_updated_at' AS snapshot_updated_at, extra->>'codex_7d_reset_at' AS reset_7d_at FROM accounts WHERE deleted_at IS NULL ORDER BY id;"
 ```
 
-`account_id` 必须按账号逐个绑定，不能用 Key 名称推断。Bot 使用 `accounts.extra` 中由 Sub2API 保存的 `codex_5h_reset_at` 和 `codex_7d_reset_at`，并实时计算剩余时间；只有对应 Key 配置了该项限额时才会显示。该快照可能在账号尚未使用或后台尚未刷新时为空或过期；Bot 不会伪造重置周期，也不会使用管理员 Token 强制刷新。旧版字符串绑定仍可继续使用，但不会显示上游账号重置时间。
+`account_id` 必须按账号逐个绑定，不能用 Key 名称推断。Bot 使用 `accounts.extra` 中由 Sub2API 保存的 `codex_5h_reset_at`、`codex_7d_reset_at` 和 `codex_7d_used_percent`。重置时间会实时计算剩余时长；管理员的 Key 总览还会按账号当前周窗口汇总 Sub2API 账号成本，并用“消耗金额 ÷ 使用百分比”线性预估满额金额。该快照可能在账号尚未使用或后台尚未刷新时为空或过期；百分比为 0 或数据不完整时不会进行预估。Bot 不会伪造重置周期，也不会使用管理员 Token 强制刷新。旧版字符串绑定仍可继续使用，但不会显示上游账号重置时间或账号金额预估。
 
 Key 名称必须唯一。如果数据库中存在多个未删除且同名的 Key，Bot 会拒绝返回数据并提示先改成唯一名称，避免误显示其他 Key 的用量。生产 Linux 主机使用：
 
@@ -185,7 +185,9 @@ sub2api tg bot long polling started
 /check
 ```
 
-普通用户直接查询自己的 Key；管理员会先看到 Key 查询按钮、“Key 总览”和“批量重置速率限制”按钮。“Key 总览”按 Key 名称去重，每页显示 8 个 Key，只展示最后使用时间、每周已用/限额/剩余、12 格进度条和本次刷新时间；支持刷新、翻页和返回，不显示请求、Tokens、费用、模型、5 小时或每日信息。
+普通用户直接查询自己的 Key；管理员会先看到 Key 查询按钮、“Key 总览”和“批量重置速率限制”按钮。“Key 总览”按 Key 名称去重，每页显示 8 个 Key，展示最后使用时间、每周已用/限额/剩余和 12 格进度条；下方按 `account_id` 去重展示所有绑定账号的周使用百分比、账号消耗金额、满额金额预估及汇总，最后显示本次刷新时间。账号名称若为邮箱格式会自动脱敏。总览支持刷新、翻页和返回，不显示请求、Tokens、模型、5 小时或每日信息。
+
+账号金额预估只对配置中的管理员开放。普通用户看不到 Key 总览按钮；即使伪造 `overview` 回调，Bot 也会在执行任何 Key 或账号数据库查询前重新校验 Telegram 管理员 ID。账号消耗金额采用 Sub2API 的账号用量统计口径，不代表 OpenAI 实际账单；满额金额是线性预估值。
 
 进入批量重置后，可以逐项勾选或取消 Key，也可以全选或清空；点击“重置所选”后还需最终确认，Bot 才会逐个清零所选 Key 的 5 小时、每日和 7 天限速计数并立即复查。单个 Key 失败不会中断其余 Key，完成消息会分别汇总成功、需复查和失败数量。
 
@@ -193,7 +195,7 @@ sub2api tg bot long polling started
 
 批量选择会话只保存在 Bot 内存中，按管理员及当前 Telegram 消息隔离，并在 5 分钟后过期。Bot 重启、配置中的 Key 被移除或重复点击已执行的确认按钮，都不会再次执行旧批次。批量重置只使用现有 `bindings`，不需要修改 `config.json` 结构、数据库函数或 PostgreSQL 权限。
 
-Key 总览同样只使用现有 `bindings` 和只读数据库函数，不依赖 Sub2API Admin API Key。本功能升级不需要修改 Compose、secret、`config.json`、数据库函数或 PostgreSQL 权限。
+Key 总览只使用现有 `bindings` 和只读数据库函数，不依赖 Sub2API Admin API Key。本功能升级不需要修改 Compose、secret 或 `config.json`，但必须以数据库所有者重新执行 `deploy/create_readonly_role.sql`，以安装固定的只读账号预估函数及其最小执行权限。
 
 普通用户的数据库查询冷却默认是 10 秒，管理员切换或刷新 Key 的冷却默认是 2 秒。可分别通过 `.env` 中的 `SUB2API_TG_BOT_CHECK_COOLDOWN` 和 `SUB2API_TG_BOT_ADMIN_CHECK_COOLDOWN` 调整。
 
