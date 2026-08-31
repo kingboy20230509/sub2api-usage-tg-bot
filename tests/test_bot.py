@@ -257,6 +257,35 @@ class MessageAuthorizationTests(unittest.TestCase):
         ])
         self.assertEqual(query.call_args_list, [mock.call("Key A", 1), mock.call("Key B", 2)])
 
+    @mock.patch.object(bot, "query_account_estimate", side_effect=[
+        {
+            "name": "account-a@example.com",
+            "used_7d_percent": "40",
+            "consumed_amount": "8.2",
+            "snapshot_updated_at": "2026-08-31T03:56:00Z",
+        },
+        RuntimeError("database unavailable"),
+    ])
+    def test_account_overview_deduplicates_accounts_and_collects_bound_keys(self, query):
+        bindings = {
+            "123": {"key_name": "Key A", "account_id": 12},
+            "456": {"key_name": "Key B", "account_id": 13},
+            "789": {"key_name": "Key C", "account_id": 12},
+            "999": {"key_name": "Legacy", "account_id": None},
+        }
+        self.assertEqual(bot.collect_account_overview(bindings), [
+            {
+                "account_id": 12,
+                "account_name": "account-a@example.com",
+                "key_names": ["Key A", "Key C"],
+                "used_7d_percent": "40",
+                "consumed_amount": "8.2",
+                "snapshot_updated_at": "2026-08-31T03:56:00Z",
+            },
+            {"account_id": 13, "key_names": ["Key B"], "error": True},
+        ])
+        self.assertEqual(query.call_args_list, [mock.call(12), mock.call(13)])
+
     def test_key_overview_only_formats_last_use_and_weekly_limit_with_progress(self):
         text, page, total_pages = bot.format_key_overview([
             {
@@ -283,6 +312,53 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIn("🔑 Key C\n• 最后使用：数据不可用\n• 每周额度：数据不可用", text)
         for unwanted in ("请求：", "Tokens", "费用：", "5 小时", "每日：", "模型"):
             self.assertNotIn(unwanted, text)
+
+    def test_key_overview_formats_bound_account_estimates_and_totals(self):
+        text, _page, _total_pages = bot.format_key_overview(
+            [{"key_name": "Key A", "last_used_at": None, "rate_limit_7d": 600, "usage_7d": 300}],
+            accounts=[
+                {
+                    "account_id": 12,
+                    "account_name": "account-a@example.com",
+                    "key_names": ["Key A", "Key C"],
+                    "used_7d_percent": "40",
+                    "consumed_amount": "8.2",
+                },
+                {
+                    "account_id": 13,
+                    "account_name": "Second account",
+                    "key_names": ["Key B"],
+                    "used_7d_percent": "75",
+                    "consumed_amount": "15.6",
+                },
+            ],
+        )
+        self.assertIn("💰 绑定账号金额预估", text)
+        self.assertIn("👤 acc***@example.com", text)
+        self.assertIn("绑定 Key：Key A、Key C", text)
+        self.assertIn("账号使用：40%\n  [█████░░░░░░░] 40%", text)
+        self.assertIn("已消耗金额：$8.2", text)
+        self.assertIn("预估总金额：约 $20.5", text)
+        self.assertIn("👤 Second account", text)
+        self.assertIn("📦 全部账号汇总", text)
+        self.assertIn("已消耗金额：$23.8", text)
+        self.assertIn("预估总金额：约 $41.3", text)
+
+    def test_account_estimate_handles_zero_percent_and_incomplete_data(self):
+        self.assertIsNone(bot.account_estimated_total("8.2", "0"))
+        self.assertIsNone(bot.account_estimated_total(None, "40"))
+        text, _page, _total_pages = bot.format_key_overview([], accounts=[
+            {
+                "account_id": 12,
+                "account_name": "account-a@example.com",
+                "key_names": ["Key A"],
+                "used_7d_percent": "0",
+                "consumed_amount": "0",
+            },
+        ])
+        self.assertIn("账号使用：0%\n  [░░░░░░░░░░░░] 0%", text)
+        self.assertIn("预估总金额：暂无数据", text)
+        self.assertIn("📦 全部账号汇总\n• 已消耗金额：$0\n• 预估总金额：数据不完整", text)
 
     def test_key_overview_clamps_pages_and_limits_items_per_page(self):
         overview = [
@@ -437,9 +513,10 @@ class MessageAuthorizationTests(unittest.TestCase):
         reset.assert_not_called()
         self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
 
+    @mock.patch.object(bot, "collect_account_overview")
     @mock.patch.object(bot, "collect_key_overview")
     @mock.patch.object(bot, "tg")
-    def test_non_admin_cannot_forge_overview_callback(self, tg, collect):
+    def test_non_admin_cannot_forge_overview_callback(self, tg, collect_keys, collect_accounts):
         config = {"admins": [123], "bindings": {"456": "Key A"}}
         with mock.patch.object(bot, "load_config", return_value=config):
             bot.handle_callback_query({
@@ -448,16 +525,28 @@ class MessageAuthorizationTests(unittest.TestCase):
                 "data": "overview:0",
                 "message": {"message_id": 8, "chat": {"id": 456, "type": "private"}},
             })
-        collect.assert_not_called()
+        collect_keys.assert_not_called()
+        collect_accounts.assert_not_called()
         self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
 
     @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-31 11:56:00")
     @mock.patch.object(bot, "allow_check", return_value=(True, 0))
+    @mock.patch.object(bot, "collect_account_overview", return_value=[
+        {
+            "account_id": 12,
+            "account_name": "account@example.com",
+            "key_names": ["Key A"],
+            "used_7d_percent": "50",
+            "consumed_amount": "10",
+        },
+    ])
     @mock.patch.object(bot, "collect_key_overview", return_value=[
         {"key_name": "Key A", "last_used_at": None, "rate_limit_7d": 600, "usage_7d": 300},
     ])
     @mock.patch.object(bot, "tg")
-    def test_admin_can_open_refresh_and_return_from_key_overview(self, tg, collect, allow, _refresh):
+    def test_admin_can_open_refresh_and_return_from_key_overview(
+        self, tg, collect_keys, collect_accounts, allow, _refresh
+    ):
         config = {"admins": [123], "bindings": {"456": "Key A"}}
         callback = {
             "from": {"id": 123},
@@ -466,11 +555,14 @@ class MessageAuthorizationTests(unittest.TestCase):
         with mock.patch.object(bot, "load_config", return_value=config):
             bot.handle_callback_query({**callback, "id": "overview-open", "data": "overview:0"})
             bot.handle_callback_query({**callback, "id": "overview-back", "data": "overview_back:0"})
-        collect.assert_called_once_with({"456": {"key_name": "Key A", "account_id": None}})
+        collect_keys.assert_called_once_with({"456": {"key_name": "Key A", "account_id": None}})
+        collect_accounts.assert_called_once_with({"456": {"key_name": "Key A", "account_id": None}})
         allow.assert_called_once_with("123", cooldown=bot.ADMIN_CHECK_COOLDOWN)
         edits = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"]
         self.assertIn("📊 Key 总览", edits[0]["text"])
         self.assertIn("[██████░░░░░░] 50%", edits[0]["text"])
+        self.assertIn("💰 绑定账号金额预估", edits[0]["text"])
+        self.assertIn("预估总金额：约 $20", edits[0]["text"])
         self.assertIn("🔄 刷新时间：2026-08-31 11:56:00", edits[0]["text"])
         overview_buttons = [
             button
@@ -482,7 +574,8 @@ class MessageAuthorizationTests(unittest.TestCase):
             {"overview:0", "overview_back:0"},
         )
         self.assertEqual(edits[1]["text"], "请选择要查看的 Key：")
-        collect.assert_called_once()
+        collect_keys.assert_called_once()
+        collect_accounts.assert_called_once()
 
     def test_overview_keyboard_supports_pagination_refresh_and_back(self):
         buttons = [
@@ -690,11 +783,26 @@ class DataSafetyTests(unittest.TestCase):
             {"key_name": "example-key", "account_id": "12"},
         )
 
+    def test_account_estimate_uses_fixed_read_only_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_account_estimate(12)
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.account_estimate(:'account_id'::bigint)::text;",
+            {"account_id": "12"},
+        )
+
     def test_invalid_account_id_is_rejected_before_subprocess(self):
         for value in (True, 0, -1, "12"):
             with self.subTest(value=value), mock.patch.object(bot, "run_psql_json") as run:
                 with self.assertRaises(ValueError):
                     bot.query_key_usage("example-key", value)
+                run.assert_not_called()
+
+    def test_invalid_account_estimate_id_is_rejected_before_subprocess(self):
+        for value in (True, 0, -1, "12"):
+            with self.subTest(value=value), mock.patch.object(bot, "run_psql_json") as run:
+                with self.assertRaises(ValueError):
+                    bot.query_account_estimate(value)
                 run.assert_not_called()
 
     def test_psql_subprocess_gets_only_database_environment(self):
@@ -734,10 +842,15 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint)", sql)
         self.assertIn("FROM public.accounts", sql)
         self.assertIn("extra->>'codex_usage_updated_at'", sql)
         self.assertIn("extra->>'codex_5h_reset_at'", sql)
         self.assertIn("extra->>'codex_7d_reset_at'", sql)
+        self.assertIn("extra->>'codex_7d_used_percent'", sql)
+        self.assertIn("usage_row.account_id", sql)
+        self.assertIn("to_jsonb(usage_row)->>'account_stats_cost'", sql)
+        self.assertIn("'consumed_amount'", sql)
         self.assertIn("'models_today'", sql)
         self.assertIn("'models_7d'", sql)
         self.assertIn("interval '6 days'", sql)
