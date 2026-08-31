@@ -1029,6 +1029,7 @@ def handle_callback_query(callback):
             tg("answerCallbackQuery", {"callback_query_id": callback_id})
             overview = collect_key_overview(bindings)
             reply, page, total_pages = format_key_overview(overview, int(target_user_id))
+            reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
             tg("editMessageText", {
                 "chat_id": chat.get("id"),
                 "message_id": message.get("message_id"),
