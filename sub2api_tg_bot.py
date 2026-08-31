@@ -720,6 +720,13 @@ def query_key_usage(key_name, account_id=None):
     return run_psql_json(sql, {"key_name": key_name, "account_id": str(account_id)})
 
 
+def query_account_estimate(account_id):
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        raise ValueError("Invalid account ID in binding config")
+    sql = "SELECT sub2api_tg_bot_api.account_estimate(:'account_id'::bigint)::text;"
+    return run_psql_json(sql, {"account_id": str(account_id)})
+
+
 def collect_key_overview(bindings):
     overview = []
     for target_user_id, binding in reset_candidates(bindings):
@@ -741,7 +748,115 @@ def collect_key_overview(bindings):
     return overview
 
 
-def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE):
+def collect_account_overview(bindings):
+    account_bindings = {}
+    for _target_user_id, binding in sorted(
+        bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0])
+    ):
+        account_id = binding["account_id"]
+        if account_id is None:
+            continue
+        key_names = account_bindings.setdefault(account_id, [])
+        if binding["key_name"] not in key_names:
+            key_names.append(binding["key_name"])
+
+    overview = []
+    for account_id, key_names in account_bindings.items():
+        try:
+            data = query_account_estimate(account_id) or {}
+            if data.get("error"):
+                raise RuntimeError("Account estimate query did not return account data")
+            overview.append({
+                "account_id": account_id,
+                "account_name": data.get("name"),
+                "key_names": key_names,
+                "used_7d_percent": data.get("used_7d_percent"),
+                "consumed_amount": data.get("consumed_amount"),
+                "snapshot_updated_at": data.get("snapshot_updated_at"),
+            })
+        except Exception as error:
+            log_failure(f"account overview account={masked_id(account_id)}", error)
+            overview.append({"account_id": account_id, "key_names": key_names, "error": True})
+    return overview
+
+
+def mask_account_name(value):
+    name = str(value or "").strip()
+    if "@" not in name:
+        return name or "未命名账号"
+    local, domain = name.rsplit("@", 1)
+    if not local or not domain:
+        return name
+    return f"{local[:3]}***@{domain}"
+
+
+def account_estimated_total(consumed_amount, used_percent):
+    if consumed_amount is None or used_percent is None:
+        return None
+    percent = dec(used_percent)
+    if percent <= 0:
+        return None
+    return max(dec(consumed_amount), Decimal("0")) * Decimal("100") / percent
+
+
+def append_account_overview(lines, accounts):
+    lines.extend(["", "💰 绑定账号金额预估"])
+    if not accounts:
+        lines.append("• 暂无配置了 account_id 的绑定账号。")
+        return
+
+    total_consumed = Decimal("0")
+    total_estimated = Decimal("0")
+    consumed_count = 0
+    estimated_count = 0
+    for account in accounts:
+        lines.extend(["", f"👤 {mask_account_name(account.get('account_name'))}"])
+        lines.append(f"• 绑定 Key：{'、'.join(account.get('key_names') or []) or '-'}")
+        if account.get("error"):
+            lines.extend([
+                "• 账号使用：数据不可用",
+                "• 已消耗金额：数据不可用",
+                "• 预估总金额：数据不可用",
+            ])
+            continue
+
+        used_percent = account.get("used_7d_percent")
+        consumed_amount = account.get("consumed_amount")
+        if used_percent is None:
+            lines.append("• 账号使用：暂无数据")
+        else:
+            percent = max(dec(used_percent), Decimal("0"))
+            lines.extend([
+                f"• 账号使用：{money(percent)}%",
+                f"  {progress_bar(percent, 100)}",
+            ])
+        if consumed_amount is None:
+            lines.append("• 已消耗金额：暂无数据")
+        else:
+            consumed = max(dec(consumed_amount), Decimal("0"))
+            total_consumed += consumed
+            consumed_count += 1
+            lines.append(f"• 已消耗金额：${money(consumed)}")
+        estimated = account_estimated_total(consumed_amount, used_percent)
+        if estimated is None:
+            lines.append("• 预估总金额：暂无数据")
+        else:
+            total_estimated += estimated
+            estimated_count += 1
+            lines.append(f"• 预估总金额：约 ${money(estimated)}")
+
+    lines.extend(["", "📦 全部账号汇总"])
+    lines.append(
+        f"• 已消耗金额：${money(total_consumed)}"
+        if consumed_count == len(accounts) else "• 已消耗金额：数据不完整"
+    )
+    lines.append(
+        f"• 预估总金额：约 ${money(total_estimated)}"
+        if estimated_count == len(accounts) else "• 预估总金额：数据不完整"
+    )
+
+
+def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE, accounts=None):
     if isinstance(page, bool) or not isinstance(page, int):
         raise ValueError("Invalid overview page")
     if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
@@ -762,6 +877,7 @@ def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE):
             f"• 最后使用：{format_timestamp(last_used_at) if last_used_at else '暂无使用记录'}"
         )
         append_limit(lines, "每周额度", item.get("rate_limit_7d"), item.get("usage_7d"))
+    append_account_overview(lines, accounts or [])
     return "\n".join(lines), page, total_pages
 
 
@@ -1028,7 +1144,10 @@ def handle_callback_query(callback):
                 return
             tg("answerCallbackQuery", {"callback_query_id": callback_id})
             overview = collect_key_overview(bindings)
-            reply, page, total_pages = format_key_overview(overview, int(target_user_id))
+            accounts = collect_account_overview(bindings)
+            reply, page, total_pages = format_key_overview(
+                overview, int(target_user_id), accounts=accounts
+            )
             reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
             tg("editMessageText", {
                 "chat_id": chat.get("id"),
