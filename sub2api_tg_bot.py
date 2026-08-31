@@ -686,6 +686,31 @@ def reset_remaining_text(value, now=None):
     return f"{max(1, minutes)}m"
 
 
+def format_key_expiry(value, now=None):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "永不过期"
+    expires_at = parse_upstream_timestamp(value)
+    if expires_at is None:
+        return "数据不可用"
+    current = datetime.now(timezone.utc) if now is None else now
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    timestamp = expires_at.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+    seconds = int((expires_at - current).total_seconds())
+    if seconds <= 0:
+        return f"{timestamp}｜已过期"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        remaining = f"{days}d" + (f" {hours}h" if hours else "")
+    elif hours:
+        remaining = f"{hours}h" + (f" {minutes}m" if minutes else "")
+    else:
+        remaining = f"{max(1, minutes)}m"
+    return f"{timestamp}｜剩余：{remaining}"
+
+
 def append_account_reset(lines, reset_at, now=None):
     remaining = reset_remaining_text(reset_at, now)
     if remaining:
@@ -968,6 +993,7 @@ def format_usage(key_name, data, now=None):
     upstream_account = data.get("upstream_account") or {}
     lines = [
         f"🔑 Key：{k.get('name')}",
+        f"📅 到期时间：{format_key_expiry(k.get('expires_at'), now)}",
         f"状态：{format_status(k.get('status'))}",
         "",
         "⏱ 限额",
