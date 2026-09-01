@@ -798,6 +798,7 @@ def collect_account_overview(bindings):
                 "used_7d_percent": data.get("used_7d_percent"),
                 "consumed_amount": data.get("consumed_amount"),
                 "snapshot_updated_at": data.get("snapshot_updated_at"),
+                "reset_7d_at": data.get("window_end"),
             })
         except Exception as error:
             log_failure(f"account overview account={masked_id(account_id)}", error)
@@ -824,7 +825,7 @@ def account_estimated_total(consumed_amount, used_percent):
     return max(dec(consumed_amount), Decimal("0")) * Decimal("100") / percent
 
 
-def append_account_overview(lines, accounts):
+def append_account_overview(lines, accounts, now=None):
     lines.extend(["", "💰 绑定账号金额预估"])
     if not accounts:
         lines.append("• 暂无配置了 account_id 的绑定账号。")
@@ -855,6 +856,7 @@ def append_account_overview(lines, accounts):
                 f"• 账号使用：{money(percent)}%",
                 f"  {progress_bar(percent, 100)}",
             ])
+        append_account_reset(lines, account.get("reset_7d_at"), now)
         if consumed_amount is None:
             lines.append("• 已消耗金额：暂无数据")
         else:
@@ -881,7 +883,7 @@ def append_account_overview(lines, accounts):
     )
 
 
-def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE, accounts=None):
+def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE, accounts=None, now=None):
     if isinstance(page, bool) or not isinstance(page, int):
         raise ValueError("Invalid overview page")
     if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
@@ -902,7 +904,7 @@ def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE, accounts
             f"• 最后使用：{format_timestamp(last_used_at) if last_used_at else '暂无使用记录'}"
         )
         append_limit(lines, "每周额度", item.get("rate_limit_7d"), item.get("usage_7d"))
-    append_account_overview(lines, accounts or [])
+    append_account_overview(lines, accounts or [], now)
     return "\n".join(lines), page, total_pages
 
 

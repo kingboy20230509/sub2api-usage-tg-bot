@@ -263,6 +263,7 @@ class MessageAuthorizationTests(unittest.TestCase):
             "used_7d_percent": "40",
             "consumed_amount": "8.2",
             "snapshot_updated_at": "2026-08-31T03:56:00Z",
+            "window_end": "2026-09-07T09:03:10Z",
         },
         RuntimeError("database unavailable"),
     ])
@@ -281,6 +282,7 @@ class MessageAuthorizationTests(unittest.TestCase):
                 "used_7d_percent": "40",
                 "consumed_amount": "8.2",
                 "snapshot_updated_at": "2026-08-31T03:56:00Z",
+                "reset_7d_at": "2026-09-07T09:03:10Z",
             },
             {"account_id": 13, "key_names": ["Key B"], "error": True},
         ])
@@ -323,6 +325,7 @@ class MessageAuthorizationTests(unittest.TestCase):
                     "key_names": ["Key A", "Key C"],
                     "used_7d_percent": "40",
                     "consumed_amount": "8.2",
+                    "reset_7d_at": "2026-09-07T09:03:10Z",
                 },
                 {
                     "account_id": 13,
@@ -332,11 +335,13 @@ class MessageAuthorizationTests(unittest.TestCase):
                     "consumed_amount": "15.6",
                 },
             ],
+            now=bot.datetime.fromisoformat("2026-09-01T15:03:10+00:00"),
         )
         self.assertIn("💰 绑定账号金额预估", text)
         self.assertIn("👤 acc***@example.com", text)
         self.assertIn("绑定 Key：Key A、Key C", text)
         self.assertIn("账号使用：40%\n  [█████░░░░░░░] 40%", text)
+        self.assertIn("重置时间：2026-09-07 17:03:10｜剩余：5d 18h", text)
         self.assertIn("已消耗金额：$8.2", text)
         self.assertIn("预估总金额：约 $20.5", text)
         self.assertIn("👤 Second account", text)
