@@ -45,6 +45,10 @@ LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
 ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
 ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
+AUTO_RESET_STATE_PATH = os.environ.get(
+    "AUTO_RESET_STATE_PATH", os.path.join(BASE_DIR, "auto_reset_state.json")
+)
+AUTO_RESET_CHECK_INTERVAL = int(os.environ.get("AUTO_RESET_CHECK_INTERVAL", "60"))
 PSQL_BIN = os.environ.get("PSQL_BIN", "/usr/bin/psql").strip()
 PGHOST = os.environ.get("PGHOST", "127.0.0.1").strip()
 PGPORT = os.environ.get("PGPORT", "5432").strip()
@@ -95,6 +99,8 @@ def validate_runtime_config():
         raise RuntimeError("POLL_TIMEOUT must be between 1 and 50 seconds")
     if not 1 <= SUB2API_ADMIN_TIMEOUT <= 60:
         raise RuntimeError("SUB2API_ADMIN_TIMEOUT must be between 1 and 60 seconds")
+    if not 60 <= AUTO_RESET_CHECK_INTERVAL <= 3600:
+        raise RuntimeError("AUTO_RESET_CHECK_INTERVAL must be between 60 and 3600 seconds")
     if bool(SUB2API_BASE_URL) != bool(SUB2API_ADMIN_API_KEY):
         raise RuntimeError("SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY must be configured together")
     if SUB2API_BASE_URL:
@@ -752,6 +758,13 @@ def query_account_estimate(account_id):
     return run_psql_json(sql, {"account_id": str(account_id)})
 
 
+def query_account_weekly_reset(account_id):
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        raise ValueError("Invalid account ID in binding config")
+    sql = "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;"
+    return run_psql_json(sql, {"account_id": str(account_id)})
+
+
 def collect_key_overview(bindings):
     overview = []
     for target_user_id, binding in reset_candidates(bindings):
@@ -933,6 +946,193 @@ def save_alert_state(state):
     os.chmod(ALERT_STATE_PATH, 0o600)
 
 
+def load_auto_reset_state():
+    try:
+        with open(AUTO_RESET_STATE_PATH, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log_failure("auto reset state load", e)
+        return {}
+
+
+def save_auto_reset_state(state):
+    tmp = AUTO_RESET_STATE_PATH + ".tmp"
+    os.makedirs(os.path.dirname(AUTO_RESET_STATE_PATH) or ".", exist_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, AUTO_RESET_STATE_PATH)
+    os.chmod(AUTO_RESET_STATE_PATH, 0o600)
+
+
+def canonical_reset_timestamp(value):
+    parsed = parse_upstream_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def configured_account_keys(bindings):
+    result = {}
+    for _user_id, binding in reset_candidates(bindings):
+        account_id = binding["account_id"]
+        if account_id is not None:
+            result.setdefault(account_id, []).append(binding["key_name"])
+    return result
+
+
+def notify_admins(admins, text):
+    for admin_user_id in sorted(admins):
+        try:
+            tg("sendMessage", {"chat_id": admin_user_id, "text": text})
+        except Exception as error:
+            log_failure(f"auto reset notify admin={masked_id(admin_user_id)}", error)
+
+
+def check_account_weekly_resets():
+    if not reset_api_configured():
+        return
+    try:
+        cfg = load_config()
+        bindings = config_bindings(cfg)
+        admins = config_admins(cfg)
+        account_keys = configured_account_keys(bindings)
+        state = load_auto_reset_state()
+        account_states = state.get("accounts")
+        if not isinstance(account_states, dict):
+            account_states = {}
+            state["accounts"] = account_states
+
+        configured_account_ids = {str(account_id) for account_id in account_keys}
+        changed = False
+        for stale_account_id in set(account_states) - configured_account_ids:
+            del account_states[stale_account_id]
+            changed = True
+
+        for account_id, key_names in account_keys.items():
+            account_state_key = str(account_id)
+            try:
+                snapshot = query_account_weekly_reset(account_id) or {}
+                if snapshot.get("error"):
+                    raise RuntimeError("Account weekly reset query did not return account data")
+                current_reset_at = canonical_reset_timestamp(snapshot.get("reset_7d_at"))
+                if current_reset_at is None:
+                    continue
+
+                account_state = account_states.get(account_state_key)
+                if not isinstance(account_state, dict):
+                    account_states[account_state_key] = {
+                        "observed_reset_at": current_reset_at,
+                        "pending_keys": [],
+                    }
+                    changed = True
+                    continue
+
+                observed_reset_at = canonical_reset_timestamp(account_state.get("observed_reset_at"))
+                pending_keys = account_state.get("pending_keys")
+                if not isinstance(pending_keys, list):
+                    pending_keys = []
+                    account_state["pending_keys"] = pending_keys
+                    changed = True
+
+                if observed_reset_at is None:
+                    account_state["observed_reset_at"] = current_reset_at
+                    account_state["pending_keys"] = []
+                    changed = True
+                    continue
+
+                current_dt = parse_upstream_timestamp(current_reset_at)
+                observed_dt = parse_upstream_timestamp(observed_reset_at)
+                if current_dt > observed_dt:
+                    account_state["observed_reset_at"] = current_reset_at
+                    account_state["pending_keys"] = list(key_names)
+                    pending_keys = account_state["pending_keys"]
+                    changed = True
+                    save_auto_reset_state(state)
+                    changed = False
+                elif current_dt < observed_dt:
+                    continue
+                else:
+                    filtered = [key_name for key_name in pending_keys if key_name in key_names]
+                    if filtered != pending_keys:
+                        account_state["pending_keys"] = filtered
+                        pending_keys = filtered
+                        changed = True
+
+                for key_name in list(pending_keys):
+                    try:
+                        data = query_key_usage(key_name, account_id) or {}
+                        key_id = (data.get("key") or {}).get("id")
+                        if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
+                            raise RuntimeError("Unable to determine unique API key ID")
+                    except Exception as error:
+                        log_failure(
+                            f"auto reset lookup account={masked_id(account_id)} key={key_name}",
+                            error,
+                        )
+                        notify_admins(
+                            admins,
+                            "\n".join([
+                                "❌ 上游账号周窗口更新，但 Key 自动重置失败",
+                                f"账号 ID：{account_id}",
+                                f"Key：{key_name}",
+                                f"新的 7 日重置时间：{format_timestamp(current_reset_at)}",
+                                "Bot 将在下次检查时重试，也可以使用手动重置功能。",
+                            ]),
+                        )
+                        continue
+
+                    try:
+                        account_state["pending_keys"].remove(key_name)
+                        save_auto_reset_state(state)
+                        reset_key_rate_limit_usage(key_id)
+                        notify_admins(
+                            admins,
+                            "\n".join([
+                                "✅ 上游账号周窗口更新，Key 已自动重置",
+                                f"账号 ID：{account_id}",
+                                f"Key：{key_name}",
+                                f"新的 7 日重置时间：{format_timestamp(current_reset_at)}",
+                            ]),
+                        )
+                    except Exception as error:
+                        if key_name in key_names and key_name not in account_state["pending_keys"]:
+                            account_state["pending_keys"].append(key_name)
+                            try:
+                                save_auto_reset_state(state)
+                            except Exception as state_error:
+                                log_failure(
+                                    f"auto reset state restore account={masked_id(account_id)} key={key_name}",
+                                    state_error,
+                                )
+                        log_failure(
+                            f"auto reset account={masked_id(account_id)} key={key_name}",
+                            error,
+                        )
+                        notify_admins(
+                            admins,
+                            "\n".join([
+                                "❌ 上游账号周窗口更新，但 Key 自动重置失败",
+                                f"账号 ID：{account_id}",
+                                f"Key：{key_name}",
+                                f"新的 7 日重置时间：{format_timestamp(current_reset_at)}",
+                                "Bot 将在下次检查时重试，也可以使用手动重置功能。",
+                            ]),
+                        )
+            except Exception as error:
+                log_failure(f"auto reset check account={masked_id(account_id)}", error)
+        if changed:
+            save_auto_reset_state(state)
+    except Exception as error:
+        log_failure("auto reset scan", error)
+
+
 def check_weekly_alerts():
     try:
         cfg = load_config()
@@ -977,6 +1177,13 @@ def alert_loop():
     while True:
         check_weekly_alerts()
         time.sleep(max(ALERT_CHECK_INTERVAL, 60))
+
+
+def auto_reset_loop():
+    time.sleep(10)
+    while True:
+        check_account_weekly_resets()
+        time.sleep(max(AUTO_RESET_CHECK_INTERVAL, 60))
 
 
 def format_usage(key_name, data, now=None):
@@ -1495,6 +1702,8 @@ def main():
     ], ensure_ascii=False)})
     print("sub2api tg bot long polling started", flush=True)
     threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
+    if reset_api_configured():
+        threading.Thread(target=auto_reset_loop, name="account-weekly-resets", daemon=True).start()
     dispatcher = UpdateDispatcher(UPDATE_WORKERS, UPDATE_MAX_PENDING)
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     httpd.daemon_threads = True
