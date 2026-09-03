@@ -236,6 +236,30 @@ SELECT CASE
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_weekly_reset(
+  p_account_id bigint
+)
+RETURNS json
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+SELECT CASE
+  WHEN account.id IS NULL
+    THEN json_build_object('error', 'not_found', 'id', p_account_id)
+  ELSE json_build_object(
+    'id', account.id,
+    'snapshot_updated_at', account.extra->>'codex_usage_updated_at',
+    'reset_7d_at', account.extra->>'codex_7d_reset_at'
+  )
+END
+FROM (SELECT 1) AS seed
+LEFT JOIN public.accounts AS account
+  ON account.id = p_account_id
+ AND account.deleted_at IS NULL;
+$function$;
+
 REVOKE ALL PRIVILEGES ON DATABASE sub2api FROM sub2api_tg_bot;
 REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts FROM sub2api_tg_bot;
 REVOKE CREATE ON SCHEMA public FROM sub2api_tg_bot;
@@ -243,9 +267,11 @@ REVOKE ALL ON SCHEMA sub2api_tg_bot_api FROM sub2api_tg_bot;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) FROM PUBLIC;
 
 GRANT CONNECT ON DATABASE sub2api TO sub2api_tg_bot;
 GRANT USAGE ON SCHEMA sub2api_tg_bot_api TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) TO sub2api_tg_bot;
