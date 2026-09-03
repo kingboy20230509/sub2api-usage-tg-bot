@@ -25,6 +25,7 @@ class RuntimeConfigTests(unittest.TestCase):
             SUB2API_BASE_URL="",
             SUB2API_ADMIN_API_KEY="",
             SUB2API_ADMIN_TIMEOUT=10,
+            AUTO_RESET_CHECK_INTERVAL=60,
             UPDATE_WORKERS=4,
             UPDATE_MAX_PENDING=16,
             CHECK_COOLDOWN=10,
@@ -39,6 +40,11 @@ class RuntimeConfigTests(unittest.TestCase):
     def test_poll_timeout_is_bounded(self):
         with self.valid_runtime(), mock.patch.object(bot, "POLL_TIMEOUT", 0):
             with self.assertRaisesRegex(RuntimeError, "POLL_TIMEOUT"):
+                bot.validate_runtime_config()
+
+    def test_auto_reset_interval_is_bounded(self):
+        with self.valid_runtime(), mock.patch.object(bot, "AUTO_RESET_CHECK_INTERVAL", 59):
+            with self.assertRaisesRegex(RuntimeError, "AUTO_RESET_CHECK_INTERVAL"):
                 bot.validate_runtime_config()
 
     def test_remote_database_requires_tls(self):
@@ -780,6 +786,14 @@ class DataSafetyTests(unittest.TestCase):
             {"key_name": "example-key"},
         )
 
+    def test_account_weekly_reset_uses_fixed_read_only_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_account_weekly_reset(12)
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;",
+            {"account_id": "12"},
+        )
+
     def test_account_binding_uses_fixed_account_snapshot_function(self):
         with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
             bot.query_key_usage("example-key", 12)
@@ -848,6 +862,7 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint)", sql)
         self.assertIn("FROM public.accounts", sql)
         self.assertIn("extra->>'codex_usage_updated_at'", sql)
         self.assertIn("extra->>'codex_5h_reset_at'", sql)
@@ -1051,6 +1066,145 @@ class DataSafetyTests(unittest.TestCase):
             self.assertEqual(mode, 0o600)
 
 
+class AccountWeeklyAutoResetTests(unittest.TestCase):
+    def config(self):
+        return {
+            "admins": ["123", "999"],
+            "bindings": {
+                "100": {"key_name": "Key A", "account_id": 12},
+                "101": {"key_name": "Key B", "account_id": 12},
+                "102": {"key_name": "Key A", "account_id": 12},
+                "103": {"key_name": "Key C", "account_id": 13},
+            },
+        }
+
+    def auto_reset_runtime(self, state_path):
+        return mock.patch.multiple(
+            bot,
+            AUTO_RESET_STATE_PATH=state_path,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+        )
+
+    def test_first_snapshot_only_establishes_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.auto_reset_runtime(state_path), \
+                    mock.patch.object(bot, "load_config", return_value=self.config()), \
+                    mock.patch.object(bot, "query_account_weekly_reset", side_effect=lambda account_id: {
+                        "id": account_id,
+                        "reset_7d_at": "2026-09-07T09:03:10Z",
+                    }), \
+                    mock.patch.object(bot, "reset_key_rate_limit_usage") as reset, \
+                    mock.patch.object(bot, "tg") as tg:
+                bot.check_account_weekly_resets()
+
+            reset.assert_not_called()
+            tg.assert_not_called()
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = bot.json.load(state_file)
+            self.assertEqual(set(state["accounts"]), {"12", "13"})
+            self.assertEqual(
+                state["accounts"]["12"],
+                {"observed_reset_at": "2026-09-07T09:03:10Z", "pending_keys": []},
+            )
+            self.assertEqual(stat.S_IMODE(os.stat(state_path).st_mode), 0o600)
+
+    def test_later_account_reset_resets_only_its_configured_unique_keys_and_notifies_admins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.auto_reset_runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    "12": {"observed_reset_at": "2026-09-07T09:03:10Z", "pending_keys": []},
+                    "13": {"observed_reset_at": "2026-09-08T09:03:10Z", "pending_keys": []},
+                }})
+                with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                        mock.patch.object(bot, "query_account_weekly_reset", side_effect=lambda account_id: {
+                            "id": account_id,
+                            "reset_7d_at": (
+                                "2026-09-14T09:03:10Z" if account_id == 12
+                                else "2026-09-08T09:03:10Z"
+                            ),
+                        }), \
+                        mock.patch.object(bot, "query_key_usage", side_effect=lambda key_name, account_id: {
+                            "key": {"id": {"Key A": 41, "Key B": 42}[key_name]}
+                        }) as query_key, \
+                        mock.patch.object(bot, "reset_key_rate_limit_usage") as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets()
+
+            self.assertEqual(
+                query_key.call_args_list,
+                [mock.call("Key A", 12), mock.call("Key B", 12)],
+            )
+            self.assertEqual(reset.call_args_list, [mock.call(41), mock.call(42)])
+            self.assertEqual(len(tg.call_args_list), 4)
+            self.assertEqual(
+                {call.args[1]["chat_id"] for call in tg.call_args_list},
+                {"123", "999"},
+            )
+            self.assertTrue(all("自动重置" in call.args[1]["text"] for call in tg.call_args_list))
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = bot.json.load(state_file)
+            self.assertEqual(
+                state["accounts"]["12"],
+                {"observed_reset_at": "2026-09-14T09:03:10Z", "pending_keys": []},
+            )
+
+    def test_equal_or_earlier_reset_time_does_not_trigger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.auto_reset_runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    "12": {"observed_reset_at": "2026-09-14T09:03:10Z", "pending_keys": []},
+                }})
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": "2026-09-07T09:03:10Z",
+                        }), \
+                        mock.patch.object(bot, "reset_key_rate_limit_usage") as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets()
+
+            reset.assert_not_called()
+            tg.assert_not_called()
+
+    def test_failed_reset_is_notified_and_retried_until_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["admins"] = ["123"]
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.auto_reset_runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    "12": {"observed_reset_at": "2026-09-07T09:03:10Z", "pending_keys": []},
+                }})
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": "2026-09-14T09:03:10Z",
+                        }), \
+                        mock.patch.object(bot, "query_key_usage", return_value={"key": {"id": 41}}), \
+                        mock.patch.object(
+                            bot,
+                            "reset_key_rate_limit_usage",
+                            side_effect=[RuntimeError("unavailable"), {"success": True}],
+                        ) as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets()
+                    bot.check_account_weekly_resets()
+
+            self.assertEqual(reset.call_count, 2)
+            self.assertIn("❌", tg.call_args_list[0].args[1]["text"])
+            self.assertIn("✅", tg.call_args_list[1].args[1]["text"])
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = bot.json.load(state_file)
+            self.assertEqual(state["accounts"]["12"]["pending_keys"], [])
+
+
 class ContainerPackagingTests(unittest.TestCase):
     def test_example_config_binds_key_names_to_account_ids(self):
         with open("config.example.json", "r", encoding="utf-8") as file:
@@ -1075,6 +1229,8 @@ class ContainerPackagingTests(unittest.TestCase):
         self.assertIn("PG_ALLOW_INSECURE_PRIVATE_NETWORK: \"1\"", compose)
         self.assertIn("SUB2API_ADMIN_API_KEY_FILE: /run/secrets/sub2api_admin_api_key", compose)
         self.assertIn("SUB2API_BASE_URL:", compose)
+        self.assertIn("AUTO_RESET_STATE_PATH: /var/lib/sub2api-tg-bot/auto_reset_state.json", compose)
+        self.assertIn("AUTO_RESET_CHECK_INTERVAL:", compose)
         self.assertIn("file: ./secrets/sub2api_admin_api_key", compose)
         self.assertNotIn("docker.sock", compose)
         self.assertNotIn("ports:", compose)
