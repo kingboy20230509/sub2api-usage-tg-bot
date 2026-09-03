@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import secrets
 import signal
 import threading
 import subprocess
@@ -71,7 +72,11 @@ _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_CHECK_BY_USER = {}
 _BATCH_RESET_LOCK = threading.Lock()
 _BATCH_RESET_SESSIONS = {}
+_AUTO_RESET_LOCK = threading.Lock()
+_RESET_OPERATION_LOCK = threading.Lock()
 BATCH_RESET_SESSION_TTL = 300
+AUTO_RESET_MIN_ADVANCE_SECONDS = 3600
+AUTO_RESET_APPROVAL_SECONDS = 180
 OVERVIEW_PAGE_SIZE = 8
 
 
@@ -368,6 +373,10 @@ def admin_keyboard(bindings, selected_user_id=None):
             "text": "⚠️ 批量重置速率限制",
             "callback_data": "batch_start:0",
         }])
+        rows.append([{
+            "text": "↩️ 回滚 Key 使用量",
+            "callback_data": "rollback_start:0",
+        }])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
@@ -388,6 +397,93 @@ def overview_keyboard(page, total_pages):
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
+def rollback_key_keyboard(bindings):
+    buttons = []
+    for target_user_id, binding in reset_candidates(bindings):
+        key_name = binding["key_name"]
+        buttons.append({
+            "text": key_name if len(key_name) <= 64 else key_name[:61] + "...",
+            "callback_data": f"rollback_key:{target_user_id}",
+        })
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([{"text": "◀️ 返回", "callback_data": "rollback_back:0"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def rollback_backup_keyboard(target_user_id, backups):
+    rows = []
+    for backup in backups:
+        backup_id = backup.get("backup_id")
+        if isinstance(backup_id, bool) or not isinstance(backup_id, int) or backup_id <= 0:
+            continue
+        source = "自动" if backup.get("reset_source") == "auto" else "手动"
+        created_at = format_timestamp(backup.get("created_at"))
+        rows.append([{
+            "text": f"#{backup_id}｜{created_at}｜{source}",
+            "callback_data": f"rollback_prompt:{target_user_id}:{backup_id}",
+        }])
+    rows.append([{"text": "◀️ 返回选择 Key", "callback_data": "rollback_start:0"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def rollback_confirmation_keyboard(target_user_id, backup_id):
+    return json.dumps({"inline_keyboard": [
+        [{
+            "text": f"✅ 确认回滚到备份 #{backup_id}",
+            "callback_data": f"rollback_confirm:{target_user_id}:{backup_id}",
+        }],
+        [{
+            "text": "◀️ 返回备份列表",
+            "callback_data": f"rollback_key:{target_user_id}",
+        }],
+    ]}, ensure_ascii=False)
+
+
+def format_rollback_backup(key_name, backup):
+    snapshot = backup.get("snapshot") or {}
+    source = "自动重置" if backup.get("reset_source") == "auto" else "手动重置"
+    return "\n".join([
+        "⚠️ 确认完整回滚？",
+        "",
+        f"Key：{key_name}",
+        f"备份：#{backup.get('backup_id')}｜{source}",
+        f"备份时间：{format_timestamp(backup.get('created_at'))}",
+        f"5 小时用量：{money(snapshot.get('usage_5h'))}",
+        f"每日用量：{money(snapshot.get('usage_1d'))}",
+        f"每周用量：{money(snapshot.get('usage_7d'))}",
+        f"5 小时窗口：{format_timestamp(snapshot.get('window_5h_start'))}",
+        f"每日窗口：{format_timestamp(snapshot.get('window_1d_start'))}",
+        f"每周窗口：{format_timestamp(snapshot.get('window_7d_start'))}",
+        "",
+        "确认后将覆盖当前六个速率限制字段，并定向刷新该 Key 的缓存。",
+    ])
+
+
+def format_reset_backup_snapshot(key_name, backup):
+    snapshot = backup.get("snapshot") or {}
+    lines = [f"🔑 {key_name}"]
+    last_used_at = snapshot.get("last_used_at")
+    lines.append(
+        f"• 最后使用：{format_timestamp(last_used_at) if last_used_at else '暂无使用记录'}"
+    )
+    append_limit(
+        lines,
+        "每周额度",
+        snapshot.get("rate_limit_7d"),
+        snapshot.get("usage_7d"),
+    )
+    return "\n".join(lines)
+
+
+def format_reset_backup_snapshots(results):
+    snapshots = [
+        format_reset_backup_snapshot(result["key_name"], result["backup"])
+        for result in results
+        if isinstance(result.get("backup"), dict)
+    ]
+    return "\n\n".join(snapshots)
+
+
 def tg(method, params=None, timeout=10):
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
@@ -403,6 +499,12 @@ def tg(method, params=None, timeout=10):
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class ResetAfterBackupError(RuntimeError):
+    def __init__(self, backup):
+        super().__init__("Reset failed after backup")
+        self.backup = backup
 
 
 def reset_api_configured():
@@ -433,6 +535,25 @@ def reset_key_rate_limit_usage(key_id):
     return json.loads(response_body.decode("utf-8")) if response_body else None
 
 
+def backup_and_reset_key(key_name, account_id, reset_source):
+    with _RESET_OPERATION_LOCK:
+        backup = create_rate_limit_backup(key_name, account_id, reset_source) or {}
+        if backup.get("error"):
+            raise RuntimeError(f"Rate-limit backup failed: {backup.get('error')}")
+        key_id = backup.get("key_id")
+        backup_id = backup.get("backup_id")
+        if (
+            isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0
+            or isinstance(backup_id, bool) or not isinstance(backup_id, int) or backup_id <= 0
+        ):
+            raise RuntimeError("Rate-limit backup did not return valid IDs")
+        try:
+            reset_key_rate_limit_usage(key_id)
+        except Exception as error:
+            raise ResetAfterBackupError(backup) from error
+        return backup
+
+
 def reset_selected_keys(bindings, selected_user_ids):
     selected_user_ids = set(selected_user_ids)
     results = []
@@ -441,18 +562,10 @@ def reset_selected_keys(bindings, selected_user_ids):
             continue
         key_name = binding["key_name"]
         reset_completed = False
+        backup_completed = False
         try:
-            current_data = query_key_usage(key_name, binding["account_id"]) or {}
-            key = current_data.get("key") or {}
-            key_id = key.get("id")
-            if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
-                results.append({
-                    "key_name": key_name,
-                    "status": "failed",
-                    "detail": "未能确定唯一的 Key ID",
-                })
-                continue
-            reset_key_rate_limit_usage(key_id)
+            backup = backup_and_reset_key(key_name, binding["account_id"], "manual")
+            backup_completed = True
             reset_completed = True
             checked_data = query_key_usage(key_name, binding["account_id"]) or {}
             checked_key = checked_data.get("key") or {}
@@ -461,22 +574,34 @@ def reset_selected_keys(bindings, selected_user_ids):
             results.append({
                 "key_name": key_name,
                 "status": "success",
+                "backup": backup,
                 "detail": (
                     f"5h {checked_key.get('usage_5h', '?')} / "
                     f"日 {checked_key.get('usage_1d', '?')} / "
-                    f"周 {checked_key.get('usage_7d', '?')}"
+                    f"周 {checked_key.get('usage_7d', '?')} / "
+                    f"备份 #{backup['backup_id']}"
                 ),
             })
         except Exception as error:
+            if isinstance(error, ResetAfterBackupError):
+                backup_completed = True
             log_failure(
                 f"batch reset target={masked_id(target_user_id)} recheck={str(reset_completed).lower()}",
                 error,
             )
-            results.append({
+            result = {
                 "key_name": key_name,
                 "status": "warning" if reset_completed else "failed",
-                "detail": "重置成功，但复查失败" if reset_completed else "重置失败",
-            })
+                "detail": (
+                    "重置成功且已有备份，但复查失败"
+                    if reset_completed else
+                    "已备份，但重置失败" if backup_completed else
+                    "备份失败，未执行重置"
+                ),
+            }
+            if reset_completed:
+                result["backup"] = backup
+            results.append(result)
     return results
 
 
@@ -506,8 +631,10 @@ def format_batch_reset_results(results, config):
     return "\n".join(lines)
 
 
-def run_psql_json(sql, variables=None):
+def _run_psql_json(sql, variables=None, allow_write=False):
     cmd = [PSQL_BIN, "-X", "--set=ON_ERROR_STOP=1", "-tAX"]
+    if allow_write:
+        cmd.append("--quiet")
     for name, value in sorted((variables or {}).items()):
         if not PSQL_VARIABLE_RE.fullmatch(name):
             raise ValueError("Invalid psql variable name")
@@ -525,7 +652,11 @@ def run_psql_json(sql, variables=None):
         "PGCONNECT_TIMEOUT": "5",
         "PGDATABASE": PGDATABASE,
         "PGHOST": PGHOST,
-        "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000",
+        "PGOPTIONS": (
+            "-c statement_timeout=10000 -c lock_timeout=2000"
+            if allow_write
+            else "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000"
+        ),
         "PGPASSFILE": "/dev/null",
         "PGPASSWORD": PGPASSWORD,
         "PGPORT": PGPORT,
@@ -534,7 +665,7 @@ def run_psql_json(sql, variables=None):
     }
     out = subprocess.check_output(
         cmd,
-        input=sql,
+        input=("SET default_transaction_read_only=off;\n" + sql) if allow_write else sql,
         env=env,
         encoding="utf-8",
         stderr=subprocess.STDOUT,
@@ -543,6 +674,14 @@ def run_psql_json(sql, variables=None):
     if not out:
         return None
     return json.loads(out)
+
+
+def run_psql_json(sql, variables=None):
+    return _run_psql_json(sql, variables, allow_write=False)
+
+
+def run_psql_write_json(sql, variables=None):
+    return _run_psql_json(sql, variables, allow_write=True)
 
 
 def dec(v):
@@ -763,6 +902,74 @@ def query_account_weekly_reset(account_id):
         raise ValueError("Invalid account ID in binding config")
     sql = "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;"
     return run_psql_json(sql, {"account_id": str(account_id)})
+
+
+def create_rate_limit_backup(key_name, account_id, reset_source):
+    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
+        raise ValueError("Invalid key name")
+    if account_id is not None and (
+        isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0
+    ):
+        raise ValueError("Invalid account ID")
+    if reset_source not in {"manual", "auto"}:
+        raise ValueError("Invalid reset source")
+    sql = (
+        "SELECT sub2api_tg_bot_api.backup_rate_limits("
+        ":'key_name', NULLIF(:'account_id', '')::bigint, :'reset_source')::text;"
+    )
+    return run_psql_write_json(sql, {
+        "key_name": key_name,
+        "account_id": "" if account_id is None else str(account_id),
+        "reset_source": reset_source,
+    })
+
+
+def query_rate_limit_backups(key_name):
+    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
+        raise ValueError("Invalid key name")
+    sql = "SELECT sub2api_tg_bot_api.rate_limit_backups(:'key_name')::text;"
+    return run_psql_json(sql, {"key_name": key_name})
+
+
+def restore_rate_limit_backup(backup_id, key_name):
+    if isinstance(backup_id, bool) or not isinstance(backup_id, int) or backup_id <= 0:
+        raise ValueError("Invalid backup ID")
+    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
+        raise ValueError("Invalid key name")
+    sql = (
+        "SELECT sub2api_tg_bot_api.restore_rate_limit_backup("
+        ":'backup_id'::bigint, :'key_name')::text;"
+    )
+    return run_psql_write_json(sql, {"backup_id": str(backup_id), "key_name": key_name})
+
+
+def find_rate_limit_backup(key_name, backup_id):
+    data = query_rate_limit_backups(key_name) or {}
+    if data.get("error"):
+        raise RuntimeError(f"Backup lookup failed: {data.get('error')}")
+    for backup in data.get("backups") or []:
+        if backup.get("backup_id") == backup_id:
+            return data.get("key_id"), backup
+    raise RuntimeError("Backup does not belong to this configured key")
+
+
+def rollback_key_rate_limits(key_name, account_id, backup_id):
+    with _RESET_OPERATION_LOCK:
+        key_id, backup = find_rate_limit_backup(key_name, backup_id)
+        if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
+            raise RuntimeError("Backup lookup did not return a valid key ID")
+        # The official reset invalidates Sub2API's targeted Redis rate-limit
+        # cache. Restoring the database snapshot afterwards makes the next
+        # request reload all six restored values without broad Redis access.
+        reset_key_rate_limit_usage(key_id)
+        restored = restore_rate_limit_backup(backup_id, key_name) or {}
+        if restored.get("error"):
+            raise RuntimeError(f"Backup restore failed: {restored.get('error')}")
+        checked = query_key_usage(key_name, account_id) or {}
+        checked_key = checked.get("key") or {}
+        if not checked_key:
+            raise RuntimeError("Rollback completed but post-check failed")
+        return {"backup": backup, "restored": restored, "key": checked_key}
 
 
 def collect_key_overview(bindings):
@@ -988,147 +1195,274 @@ def configured_account_keys(bindings):
 
 
 def notify_admins(admins, text):
+    delivered = 0
     for admin_user_id in sorted(admins):
         try:
             tg("sendMessage", {"chat_id": admin_user_id, "text": text})
+            delivered += 1
         except Exception as error:
-            log_failure(f"auto reset notify admin={masked_id(admin_user_id)}", error)
+            log_failure(f"notify admin={masked_id(admin_user_id)}", error)
+    return delivered
 
 
-def check_account_weekly_resets():
-    if not reset_api_configured():
-        return
-    try:
+def auto_reset_approval_keyboard(account_id, token):
+    return json.dumps({"inline_keyboard": [[
+        {"text": "✅ 同意重置", "callback_data": f"auto_approve:{account_id}:{token}"},
+        {"text": "❌ 不重置", "callback_data": f"auto_reject:{account_id}:{token}"},
+    ]]}, ensure_ascii=False)
+
+
+def notify_auto_reset_approval(admins, account_id, reset_at, key_names, token):
+    lines = [
+        "⚠️ 检测到上游账号 7 日窗口更新",
+        f"账号 ID：{account_id}",
+        f"新的 7 日重置时间：{format_timestamp(reset_at)}",
+        "涉及 Key：" + "、".join(key_names),
+        "",
+        "请在 3 分钟内选择；无人操作将自动备份并重置。",
+    ]
+    delivered = 0
+    reply_markup = auto_reset_approval_keyboard(account_id, token)
+    for admin_user_id in sorted(admins):
+        try:
+            tg("sendMessage", {
+                "chat_id": admin_user_id,
+                "text": "\n".join(lines),
+                "reply_markup": reply_markup,
+            })
+            delivered += 1
+        except Exception as error:
+            log_failure(f"auto reset approval admin={masked_id(admin_user_id)}", error)
+    return delivered
+
+
+def execute_auto_reset_approval(state, account_id, account_state, admins, configured_key_names):
+    approval = account_state.get("approval")
+    if not isinstance(approval, dict) or approval.get("status") != "approved":
+        return []
+    pending_keys = approval.get("keys")
+    if not isinstance(pending_keys, list):
+        pending_keys = []
+    approval["keys"] = [key_name for key_name in pending_keys if key_name in configured_key_names]
+    results = []
+    for key_name in list(approval["keys"]):
+        try:
+            approval["keys"].remove(key_name)
+            save_auto_reset_state(state)
+            backup = backup_and_reset_key(key_name, account_id, "auto")
+            results.append({
+                "key_name": key_name,
+                "status": "success",
+                "backup_id": backup["backup_id"],
+                "backup": backup,
+            })
+            notify_admins(
+                admins,
+                "\n".join([
+                    "✅ 上游账号周窗口更新，Key 已自动重置",
+                    f"账号 ID：{account_id}",
+                    f"Key：{key_name}",
+                    f"新的 7 日重置时间：{format_timestamp(approval.get('reset_at'))}",
+                    f"回滚备份：#{backup['backup_id']}",
+                    "",
+                    format_reset_backup_snapshot(key_name, backup),
+                ]),
+            )
+        except Exception as error:
+            if key_name in configured_key_names and key_name not in approval["keys"]:
+                approval["keys"].append(key_name)
+                try:
+                    save_auto_reset_state(state)
+                except Exception as state_error:
+                    log_failure(
+                        f"auto reset state restore account={masked_id(account_id)} key={key_name}",
+                        state_error,
+                    )
+            log_failure(f"auto reset account={masked_id(account_id)} key={key_name}", error)
+            results.append({"key_name": key_name, "status": "failed"})
+            notify_admins(
+                admins,
+                "\n".join([
+                    "❌ 上游账号周窗口更新，但 Key 自动重置失败",
+                    f"账号 ID：{account_id}",
+                    f"Key：{key_name}",
+                    f"新的 7 日重置时间：{format_timestamp(approval.get('reset_at'))}",
+                    "Bot 将在下次检查时重试，也可以使用手动重置功能。",
+                ]),
+            )
+    if not approval["keys"]:
+        account_state.pop("approval", None)
+    save_auto_reset_state(state)
+    return results
+
+
+def decide_auto_reset_approval(account_id, token, approve):
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        raise ValueError("Invalid account ID")
+    if not re.fullmatch(r"[0-9a-f]{8}", token or ""):
+        raise ValueError("Invalid approval token")
+    with _AUTO_RESET_LOCK:
         cfg = load_config()
         bindings = config_bindings(cfg)
         admins = config_admins(cfg)
         account_keys = configured_account_keys(bindings)
         state = load_auto_reset_state()
-        account_states = state.get("accounts")
-        if not isinstance(account_states, dict):
-            account_states = {}
-            state["accounts"] = account_states
+        account_state = (state.get("accounts") or {}).get(str(account_id))
+        approval = account_state.get("approval") if isinstance(account_state, dict) else None
+        if (
+            not isinstance(approval, dict)
+            or approval.get("token") != token
+            or approval.get("status") != "pending"
+        ):
+            return {"status": "expired"}
+        if not approve:
+            account_state.pop("approval", None)
+            save_auto_reset_state(state)
+            notify_admins(admins, f"⛔ 管理员已拒绝账号 {account_id} 的本次 Key 自动重置。")
+            return {"status": "rejected"}
+        approval["status"] = "approved"
+        save_auto_reset_state(state)
+        notify_admins(admins, f"✅ 管理员已批准账号 {account_id} 的本次 Key 自动重置，正在执行。")
+        results = execute_auto_reset_approval(
+            state,
+            account_id,
+            account_state,
+            admins,
+            account_keys.get(account_id, []),
+        )
+        return {"status": "approved", "results": results}
 
-        configured_account_ids = {str(account_id) for account_id in account_keys}
-        changed = False
-        for stale_account_id in set(account_states) - configured_account_ids:
-            del account_states[stale_account_id]
-            changed = True
 
-        for account_id, key_names in account_keys.items():
-            account_state_key = str(account_id)
-            try:
-                snapshot = query_account_weekly_reset(account_id) or {}
-                if snapshot.get("error"):
-                    raise RuntimeError("Account weekly reset query did not return account data")
-                current_reset_at = canonical_reset_timestamp(snapshot.get("reset_7d_at"))
-                if current_reset_at is None:
-                    continue
+def check_account_weekly_resets(now=None):
+    if not reset_api_configured():
+        return
+    now = time.time() if now is None else now
+    try:
+        with _AUTO_RESET_LOCK:
+            cfg = load_config()
+            bindings = config_bindings(cfg)
+            admins = config_admins(cfg)
+            account_keys = configured_account_keys(bindings)
+            state = load_auto_reset_state()
+            account_states = state.get("accounts")
+            if not isinstance(account_states, dict):
+                account_states = {}
+                state["accounts"] = account_states
 
-                account_state = account_states.get(account_state_key)
-                if not isinstance(account_state, dict):
-                    account_states[account_state_key] = {
-                        "observed_reset_at": current_reset_at,
-                        "pending_keys": [],
-                    }
-                    changed = True
-                    continue
+            configured_account_ids = {str(account_id) for account_id in account_keys}
+            changed = False
+            for stale_account_id in set(account_states) - configured_account_ids:
+                del account_states[stale_account_id]
+                changed = True
 
-                observed_reset_at = canonical_reset_timestamp(account_state.get("observed_reset_at"))
-                pending_keys = account_state.get("pending_keys")
-                if not isinstance(pending_keys, list):
-                    pending_keys = []
-                    account_state["pending_keys"] = pending_keys
-                    changed = True
+            for account_id, key_names in account_keys.items():
+                account_state_key = str(account_id)
+                try:
+                    account_state = account_states.get(account_state_key)
+                    if isinstance(account_state, dict):
+                        had_legacy_pending_keys = "pending_keys" in account_state
+                        legacy_pending_keys = account_state.pop("pending_keys", [])
+                        if legacy_pending_keys and not isinstance(account_state.get("approval"), dict):
+                            account_state["approval"] = {
+                                "token": secrets.token_hex(4),
+                                "reset_at": account_state.get("observed_reset_at"),
+                                "deadline_at": None,
+                                "status": "pending",
+                                "keys": [key for key in legacy_pending_keys if key in key_names],
+                            }
+                        if had_legacy_pending_keys:
+                            changed = True
 
-                if observed_reset_at is None:
-                    account_state["observed_reset_at"] = current_reset_at
-                    account_state["pending_keys"] = []
-                    changed = True
-                    continue
+                        approval = account_state.get("approval")
+                        if isinstance(approval, dict):
+                            approval["keys"] = [
+                                key for key in approval.get("keys", []) if key in key_names
+                            ]
+                            if not approval["keys"]:
+                                account_state.pop("approval", None)
+                                changed = True
+                            elif approval.get("deadline_at") is None:
+                                save_auto_reset_state(state)
+                                delivered = notify_auto_reset_approval(
+                                    admins,
+                                    account_id,
+                                    approval.get("reset_at"),
+                                    approval["keys"],
+                                    approval.get("token"),
+                                )
+                                if delivered:
+                                    approval["deadline_at"] = now + AUTO_RESET_APPROVAL_SECONDS
+                                    changed = True
+                            elif (
+                                approval.get("status") == "pending"
+                                and now >= approval.get("deadline_at")
+                            ):
+                                approval["status"] = "approved"
+                                save_auto_reset_state(state)
+                                notify_admins(
+                                    admins,
+                                    f"⏱️ 3 分钟内无人操作，账号 {account_id} 的 Key 将自动重置。",
+                                )
+                                execute_auto_reset_approval(
+                                    state, account_id, account_state, admins, key_names,
+                                )
+                            elif approval.get("status") == "approved":
+                                execute_auto_reset_approval(
+                                    state, account_id, account_state, admins, key_names,
+                                )
 
-                current_dt = parse_upstream_timestamp(current_reset_at)
-                observed_dt = parse_upstream_timestamp(observed_reset_at)
-                if current_dt > observed_dt:
-                    account_state["observed_reset_at"] = current_reset_at
-                    account_state["pending_keys"] = list(key_names)
-                    pending_keys = account_state["pending_keys"]
-                    changed = True
-                    save_auto_reset_state(state)
-                    changed = False
-                elif current_dt < observed_dt:
-                    continue
-                else:
-                    filtered = [key_name for key_name in pending_keys if key_name in key_names]
-                    if filtered != pending_keys:
-                        account_state["pending_keys"] = filtered
-                        pending_keys = filtered
-                        changed = True
-
-                for key_name in list(pending_keys):
-                    try:
-                        data = query_key_usage(key_name, account_id) or {}
-                        key_id = (data.get("key") or {}).get("id")
-                        if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
-                            raise RuntimeError("Unable to determine unique API key ID")
-                    except Exception as error:
-                        log_failure(
-                            f"auto reset lookup account={masked_id(account_id)} key={key_name}",
-                            error,
-                        )
-                        notify_admins(
-                            admins,
-                            "\n".join([
-                                "❌ 上游账号周窗口更新，但 Key 自动重置失败",
-                                f"账号 ID：{account_id}",
-                                f"Key：{key_name}",
-                                f"新的 7 日重置时间：{format_timestamp(current_reset_at)}",
-                                "Bot 将在下次检查时重试，也可以使用手动重置功能。",
-                            ]),
-                        )
+                    snapshot = query_account_weekly_reset(account_id) or {}
+                    if snapshot.get("error"):
+                        raise RuntimeError("Account weekly reset query did not return account data")
+                    current_reset_at = canonical_reset_timestamp(snapshot.get("reset_7d_at"))
+                    if current_reset_at is None:
                         continue
 
-                    try:
-                        account_state["pending_keys"].remove(key_name)
+                    account_state = account_states.get(account_state_key)
+                    if not isinstance(account_state, dict):
+                        account_states[account_state_key] = {"observed_reset_at": current_reset_at}
+                        changed = True
+                        continue
+
+                    observed_reset_at = canonical_reset_timestamp(account_state.get("observed_reset_at"))
+
+                    if observed_reset_at is None:
+                        account_state["observed_reset_at"] = current_reset_at
+                        account_state.pop("approval", None)
+                        changed = True
+                        continue
+
+                    current_dt = parse_upstream_timestamp(current_reset_at)
+                    observed_dt = parse_upstream_timestamp(observed_reset_at)
+                    reset_advance_seconds = (current_dt - observed_dt).total_seconds()
+                    if reset_advance_seconds >= AUTO_RESET_MIN_ADVANCE_SECONDS:
+                        account_state["observed_reset_at"] = current_reset_at
+                        account_state["approval"] = {
+                            "token": secrets.token_hex(4),
+                            "reset_at": current_reset_at,
+                            "deadline_at": None,
+                            "status": "pending",
+                            "keys": list(key_names),
+                        }
+                        changed = True
                         save_auto_reset_state(state)
-                        reset_key_rate_limit_usage(key_id)
-                        notify_admins(
-                            admins,
-                            "\n".join([
-                                "✅ 上游账号周窗口更新，Key 已自动重置",
-                                f"账号 ID：{account_id}",
-                                f"Key：{key_name}",
-                                f"新的 7 日重置时间：{format_timestamp(current_reset_at)}",
-                            ]),
+                        delivered = notify_auto_reset_approval(
+                            admins, account_id, current_reset_at, key_names,
+                            account_state["approval"]["token"],
                         )
-                    except Exception as error:
-                        if key_name in key_names and key_name not in account_state["pending_keys"]:
-                            account_state["pending_keys"].append(key_name)
-                            try:
-                                save_auto_reset_state(state)
-                            except Exception as state_error:
-                                log_failure(
-                                    f"auto reset state restore account={masked_id(account_id)} key={key_name}",
-                                    state_error,
-                                )
-                        log_failure(
-                            f"auto reset account={masked_id(account_id)} key={key_name}",
-                            error,
-                        )
-                        notify_admins(
-                            admins,
-                            "\n".join([
-                                "❌ 上游账号周窗口更新，但 Key 自动重置失败",
-                                f"账号 ID：{account_id}",
-                                f"Key：{key_name}",
-                                f"新的 7 日重置时间：{format_timestamp(current_reset_at)}",
-                                "Bot 将在下次检查时重试，也可以使用手动重置功能。",
-                            ]),
-                        )
-            except Exception as error:
-                log_failure(f"auto reset check account={masked_id(account_id)}", error)
-        if changed:
-            save_auto_reset_state(state)
+                        if delivered:
+                            account_state["approval"]["deadline_at"] = (
+                                now + AUTO_RESET_APPROVAL_SECONDS
+                            )
+                        continue
+                    if reset_advance_seconds > 0:
+                        account_state["observed_reset_at"] = current_reset_at
+                        changed = True
+                        continue
+                except Exception as error:
+                    log_failure(f"auto reset check account={masked_id(account_id)}", error)
+            if changed:
+                save_auto_reset_state(state)
     except Exception as error:
         log_failure("auto reset scan", error)
 
@@ -1333,6 +1667,9 @@ def handle_callback_query(callback):
         "batch_start", "batch_toggle", "batch_all", "batch_clear",
         "batch_review", "batch_back", "batch_confirm", "batch_cancel",
         "reset_prompt", "reset_confirm", "reset_cancel",
+        "auto_approve", "auto_reject",
+        "rollback_start", "rollback_key", "rollback_prompt",
+        "rollback_confirm", "rollback_back",
     }:
         return
     if not is_private_user_chat(chat, user):
@@ -1350,6 +1687,155 @@ def handle_callback_query(callback):
                 "callback_query_id": callback_id,
                 "text": "你没有管理员权限。",
                 "show_alert": "true",
+            })
+            return
+        if action in {"auto_approve", "auto_reject"}:
+            account_id_text, token_separator, token = target_user_id.partition(":")
+            if not token_separator or not account_id_text.isdigit():
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "审批信息无效或已过期。",
+                    "show_alert": "true",
+                })
+                return
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": "正在处理本次决定…",
+            })
+            decision = decide_auto_reset_approval(
+                int(account_id_text), token, action == "auto_approve",
+            )
+            status = decision.get("status")
+            if status == "expired":
+                decision_text = "⚠️ 本次自动重置审批已被其他管理员处理或已经失效。"
+            elif status == "rejected":
+                decision_text = f"⛔ 已拒绝账号 {account_id_text} 的本次 Key 自动重置。"
+            else:
+                results = decision.get("results") or []
+                success_count = sum(result.get("status") == "success" for result in results)
+                failed_count = sum(result.get("status") == "failed" for result in results)
+                decision_text = (
+                    f"✅ 已批准账号 {account_id_text} 的本次 Key 自动重置。\n"
+                    f"成功：{success_count}；失败待重试：{failed_count}"
+                )
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": decision_text,
+            })
+            return
+        if action.startswith("rollback_"):
+            chat_id = chat.get("id")
+            message_id = message.get("message_id")
+            if message_id is None:
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "该操作已失效，请重新发送 /check。",
+                    "show_alert": "true",
+                })
+                return
+            if action != "rollback_back" and not reset_api_configured():
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "回滚功能尚未配置。",
+                    "show_alert": "true",
+                })
+                return
+            if action == "rollback_back":
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": "请选择要查看的 Key：",
+                    "reply_markup": admin_keyboard(bindings),
+                })
+                return
+            if action == "rollback_start":
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": "↩️ 请选择需要回滚的 Key：",
+                    "reply_markup": rollback_key_keyboard(bindings),
+                })
+                return
+            rollback_user_id, backup_separator, backup_id_text = target_user_id.partition(":")
+            if action == "rollback_key":
+                rollback_user_id = target_user_id
+            if (
+                not rollback_user_id.isdigit()
+                or (action != "rollback_key" and (
+                    not backup_separator or not backup_id_text.isdigit()
+                ))
+            ):
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "回滚信息无效，请重新开始。",
+                    "show_alert": "true",
+                })
+                return
+            binding = bindings.get(rollback_user_id)
+            if not binding:
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "该 Key 绑定已不存在。",
+                    "show_alert": "true",
+                })
+                return
+            key_name = binding["key_name"]
+            if action == "rollback_key":
+                data = query_rate_limit_backups(key_name) or {}
+                backups = data.get("backups") or []
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                text = (
+                    f"↩️ {key_name} 最近的回滚备份："
+                    if backups else
+                    f"↩️ {key_name} 暂无可回滚备份。"
+                )
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                    "reply_markup": rollback_backup_keyboard(rollback_user_id, backups),
+                })
+                return
+            backup_id = int(backup_id_text)
+            if action == "rollback_prompt":
+                _key_id, backup = find_rate_limit_backup(key_name, backup_id)
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": format_rollback_backup(key_name, backup),
+                    "reply_markup": rollback_confirmation_keyboard(rollback_user_id, backup_id),
+                })
+                return
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": f"正在回滚 {key_name}…",
+            })
+            tg("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": f"⏳ 正在回滚 {key_name} 到备份 #{backup_id}，请稍候…",
+            })
+            result = rollback_key_rate_limits(
+                key_name, binding["account_id"], backup_id,
+            )
+            checked_key = result["key"]
+            tg("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": "\n".join([
+                    "✅ Key 使用量已完整回滚",
+                    f"Key：{key_name}",
+                    f"备份：#{backup_id}",
+                    f"5 小时：{money(checked_key.get('usage_5h'))}",
+                    f"每日：{money(checked_key.get('usage_1d'))}",
+                    f"每周：{money(checked_key.get('usage_7d'))}",
+                    "Sub2API 缓存已定向失效。",
+                ]),
+                "reply_markup": admin_keyboard(bindings),
             })
             return
         if action == "overview_back":
@@ -1473,6 +1959,9 @@ def handle_callback_query(callback):
                     "text": f"⏳ 正在重置并复查 {selected_count} 个 Key，请稍候…",
                 })
                 results = reset_selected_keys(bindings, selected_user_ids)
+                reset_backup_text = format_reset_backup_snapshots(results)
+                if reset_backup_text:
+                    notify_admins(config_admins(cfg), reset_backup_text)
                 tg("editMessageText", {
                     "chat_id": chat_id,
                     "message_id": message_id,
@@ -1562,6 +2051,8 @@ def handle_callback_query(callback):
             error_text = "批量重置执行异常，请重新发送 /check 查询当前用量。"
         elif action.startswith("batch_"):
             error_text = "批量重置操作失败，请重新发送 /check。"
+        elif action.startswith("rollback_"):
+            error_text = "回滚操作失败；备份仍保留，请重新发送 /check 后重试。"
         elif action.startswith("overview"):
             error_text = "总览查询失败，请稍后再试。"
         else:

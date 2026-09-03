@@ -24,6 +24,20 @@ ALTER ROLE sub2api_tg_bot SET temp_file_limit = '16MB';
 CREATE SCHEMA IF NOT EXISTS sub2api_tg_bot_api;
 REVOKE ALL ON SCHEMA sub2api_tg_bot_api FROM PUBLIC;
 
+CREATE TABLE IF NOT EXISTS sub2api_tg_bot_api.rate_limit_backups (
+  backup_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  api_key_id bigint NOT NULL,
+  key_name text NOT NULL,
+  account_id bigint,
+  reset_source text NOT NULL CHECK (reset_source IN ('manual', 'auto')),
+  snapshot jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+REVOKE ALL ON TABLE sub2api_tg_bot_api.rate_limit_backups FROM PUBLIC;
+REVOKE ALL ON TABLE sub2api_tg_bot_api.rate_limit_backups FROM sub2api_tg_bot;
+REVOKE ALL ON SEQUENCE sub2api_tg_bot_api.rate_limit_backups_backup_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE sub2api_tg_bot_api.rate_limit_backups_backup_id_seq FROM sub2api_tg_bot;
+
 CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.usage(p_key_name text)
 RETURNS json
 LANGUAGE sql
@@ -260,6 +274,159 @@ LEFT JOIN public.accounts AS account
  AND account.deleted_at IS NULL;
 $function$;
 
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.backup_rate_limits(
+  p_key_name text,
+  p_account_id bigint,
+  p_reset_source text
+)
+RETURNS json
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  v_key public.api_keys%ROWTYPE;
+  v_match_count integer;
+  v_backup_id bigint;
+  v_snapshot jsonb;
+BEGIN
+  IF p_reset_source NOT IN ('manual', 'auto') THEN
+    RETURN json_build_object('error', 'invalid_source');
+  END IF;
+  SELECT count(*)::integer INTO v_match_count
+  FROM public.api_keys
+  WHERE name = p_key_name AND deleted_at IS NULL;
+  IF v_match_count = 0 THEN
+    RETURN json_build_object('error', 'not_found');
+  ELSIF v_match_count > 1 THEN
+    RETURN json_build_object('error', 'duplicate_key_name');
+  END IF;
+  SELECT * INTO v_key
+  FROM public.api_keys
+  WHERE name = p_key_name AND deleted_at IS NULL
+  FOR UPDATE;
+  v_snapshot := jsonb_build_object(
+    'usage_5h', v_key.usage_5h,
+    'usage_1d', v_key.usage_1d,
+    'usage_7d', v_key.usage_7d,
+    'last_used_at', v_key.last_used_at,
+    'rate_limit_7d', v_key.rate_limit_7d,
+    'window_5h_start', v_key.window_5h_start,
+    'window_1d_start', v_key.window_1d_start,
+    'window_7d_start', v_key.window_7d_start
+  );
+  INSERT INTO sub2api_tg_bot_api.rate_limit_backups (
+    api_key_id, key_name, account_id, reset_source, snapshot
+  ) VALUES (
+    v_key.id, v_key.name, p_account_id, p_reset_source, v_snapshot
+  ) RETURNING backup_id INTO v_backup_id;
+  DELETE FROM sub2api_tg_bot_api.rate_limit_backups
+  WHERE api_key_id = v_key.id
+    AND backup_id NOT IN (
+      SELECT backup_id
+      FROM sub2api_tg_bot_api.rate_limit_backups
+      WHERE api_key_id = v_key.id
+      ORDER BY created_at DESC, backup_id DESC
+      LIMIT 3
+    );
+  RETURN json_build_object(
+    'backup_id', v_backup_id,
+    'key_id', v_key.id,
+    'key_name', v_key.name,
+    'reset_source', p_reset_source,
+    'snapshot', v_snapshot
+  );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.rate_limit_backups(p_key_name text)
+RETURNS json
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+WITH matching_keys AS (
+  SELECT id
+  FROM public.api_keys
+  WHERE name = p_key_name AND deleted_at IS NULL
+), match_count AS (
+  SELECT count(*)::integer AS total FROM matching_keys
+), backups AS (
+  SELECT backup_id, reset_source, snapshot, created_at
+  FROM sub2api_tg_bot_api.rate_limit_backups
+  WHERE api_key_id = (SELECT id FROM matching_keys)
+  ORDER BY created_at DESC, backup_id DESC
+  LIMIT 3
+)
+SELECT CASE
+  WHEN (SELECT total FROM match_count) = 0
+    THEN json_build_object('error', 'not_found')
+  WHEN (SELECT total FROM match_count) > 1
+    THEN json_build_object('error', 'duplicate_key_name')
+  ELSE json_build_object(
+    'key_id', (SELECT id FROM matching_keys),
+    'backups', coalesce(
+      (SELECT json_agg(json_build_object(
+        'backup_id', backup_id,
+        'reset_source', reset_source,
+        'created_at', created_at,
+        'snapshot', snapshot
+      )) FROM backups),
+      '[]'::json
+    )
+  )
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(
+  p_backup_id bigint,
+  p_key_name text
+)
+RETURNS json
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  v_match_count integer;
+  v_key_id bigint;
+  v_backup sub2api_tg_bot_api.rate_limit_backups%ROWTYPE;
+BEGIN
+  SELECT count(*)::integer, min(id) INTO v_match_count, v_key_id
+  FROM public.api_keys
+  WHERE name = p_key_name AND deleted_at IS NULL;
+  IF v_match_count = 0 THEN
+    RETURN json_build_object('error', 'not_found');
+  ELSIF v_match_count > 1 THEN
+    RETURN json_build_object('error', 'duplicate_key_name');
+  END IF;
+  SELECT * INTO v_backup
+  FROM sub2api_tg_bot_api.rate_limit_backups
+  WHERE backup_id = p_backup_id AND api_key_id = v_key_id;
+  IF NOT FOUND THEN
+    RETURN json_build_object('error', 'backup_not_found');
+  END IF;
+  UPDATE public.api_keys
+  SET usage_5h = (v_backup.snapshot->>'usage_5h')::numeric,
+      usage_1d = (v_backup.snapshot->>'usage_1d')::numeric,
+      usage_7d = (v_backup.snapshot->>'usage_7d')::numeric,
+      window_5h_start = (v_backup.snapshot->>'window_5h_start')::timestamptz,
+      window_1d_start = (v_backup.snapshot->>'window_1d_start')::timestamptz,
+      window_7d_start = (v_backup.snapshot->>'window_7d_start')::timestamptz
+  WHERE id = v_key_id;
+  RETURN json_build_object(
+    'backup_id', v_backup.backup_id,
+    'key_id', v_key_id,
+    'key_name', p_key_name,
+    'restored_at', clock_timestamp(),
+    'snapshot', v_backup.snapshot
+  );
+END;
+$function$;
+
 REVOKE ALL PRIVILEGES ON DATABASE sub2api FROM sub2api_tg_bot;
 REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts FROM sub2api_tg_bot;
 REVOKE CREATE ON SCHEMA public FROM sub2api_tg_bot;
@@ -268,6 +435,9 @@ REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text) FROM PUBLIC;
 
 GRANT CONNECT ON DATABASE sub2api TO sub2api_tg_bot;
 GRANT USAGE ON SCHEMA sub2api_tg_bot_api TO sub2api_tg_bot;
@@ -275,3 +445,6 @@ GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text) TO sub2api_tg_bot;
