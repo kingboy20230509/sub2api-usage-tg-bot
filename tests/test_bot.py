@@ -189,12 +189,14 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIsNone(bot.finish_batch_reset_session("123", 123, 10, {"456", "789"}, now=105))
 
     @mock.patch.object(bot, "reset_key_rate_limit_usage", side_effect=[{"success": True}, RuntimeError("unauthorized")])
-    @mock.patch.object(bot, "query_key_usage", side_effect=[
-        {"key": {"id": 41, "usage_5h": 5, "usage_1d": 6, "usage_7d": 7}},
-        {"key": {"id": 41, "usage_5h": 0, "usage_1d": 0, "usage_7d": 0}},
-        {"key": {"id": 42, "usage_5h": 1, "usage_1d": 2, "usage_7d": 3}},
+    @mock.patch.object(bot, "create_rate_limit_backup", side_effect=[
+        {"key_id": 41, "backup_id": 1},
+        {"key_id": 42, "backup_id": 2},
     ])
-    def test_batch_reset_continues_after_an_individual_failure(self, query, reset):
+    @mock.patch.object(bot, "query_key_usage", side_effect=[
+        {"key": {"id": 41, "usage_5h": 0, "usage_1d": 0, "usage_7d": 0}},
+    ])
+    def test_batch_reset_continues_after_an_individual_failure(self, query, backup, reset):
         bindings = {
             "456": {"key_name": "Key A", "account_id": 1},
             "789": {"key_name": "Key B", "account_id": 2},
@@ -202,25 +204,43 @@ class MessageAuthorizationTests(unittest.TestCase):
         }
         results = bot.reset_selected_keys(bindings, {"456", "789"})
         self.assertEqual(results, [
-            {"key_name": "Key A", "status": "success", "detail": "5h 0 / 日 0 / 周 0"},
-            {"key_name": "Key B", "status": "failed", "detail": "重置失败"},
+            {
+                "key_name": "Key A",
+                "status": "success",
+                "backup": {"key_id": 41, "backup_id": 1},
+                "detail": "5h 0 / 日 0 / 周 0 / 备份 #1",
+            },
+            {"key_name": "Key B", "status": "failed", "detail": "已备份，但重置失败"},
         ])
         self.assertEqual(reset.call_args_list, [mock.call(41), mock.call(42)])
-        self.assertEqual(query.call_count, 3)
+        self.assertEqual(backup.call_count, 2)
+        self.assertEqual(query.call_count, 1)
 
     @mock.patch.object(bot, "reset_key_rate_limit_usage", return_value={"success": True})
-    @mock.patch.object(bot, "query_key_usage", side_effect=[
-        {"key": {"id": 41}},
-        RuntimeError("database unavailable"),
-    ])
-    def test_batch_reset_marks_post_check_failure_as_warning(self, query, reset):
+    @mock.patch.object(bot, "create_rate_limit_backup", return_value={"key_id": 41, "backup_id": 1})
+    @mock.patch.object(bot, "query_key_usage", side_effect=RuntimeError("database unavailable"))
+    def test_batch_reset_marks_post_check_failure_as_warning(self, query, backup, reset):
         bindings = {"456": {"key_name": "Key A", "account_id": 1}}
         self.assertEqual(bot.reset_selected_keys(bindings, {"456"}), [{
             "key_name": "Key A",
             "status": "warning",
-            "detail": "重置成功，但复查失败",
+            "backup": {"key_id": 41, "backup_id": 1},
+            "detail": "重置成功且已有备份，但复查失败",
         }])
         reset.assert_called_once_with(41)
+        backup.assert_called_once_with("Key A", 1, "manual")
+
+    @mock.patch.object(bot, "reset_key_rate_limit_usage")
+    @mock.patch.object(bot, "create_rate_limit_backup", return_value={"error": "not_found"})
+    def test_batch_reset_does_not_reset_when_backup_fails(self, backup, reset):
+        bindings = {"456": {"key_name": "Key A", "account_id": 1}}
+        self.assertEqual(bot.reset_selected_keys(bindings, {"456"}), [{
+            "key_name": "Key A",
+            "status": "failed",
+            "detail": "备份失败，未执行重置",
+        }])
+        backup.assert_called_once_with("Key A", 1, "manual")
+        reset.assert_not_called()
 
     @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-30 12:00:00")
     def test_batch_reset_result_summarizes_each_status(self, _refresh):
@@ -237,6 +257,77 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIn("⚠️ Key B：重置成功，但复查失败", text)
         self.assertIn("❌ Key C：重置失败", text)
         self.assertIn("复查时间：2026-08-30 12:00:00", text)
+
+    @mock.patch.object(bot, "query_key_usage", return_value={
+        "key": {"usage_5h": 5, "usage_1d": 6, "usage_7d": 7},
+    })
+    @mock.patch.object(bot, "restore_rate_limit_backup", return_value={"backup_id": 9})
+    @mock.patch.object(bot, "reset_key_rate_limit_usage")
+    @mock.patch.object(bot, "find_rate_limit_backup", return_value=(41, {"backup_id": 9}))
+    def test_rollback_invalidates_cache_then_restores_and_rechecks(
+        self, find_backup, reset, restore, query,
+    ):
+        result = bot.rollback_key_rate_limits("Key A", 1, 9)
+        find_backup.assert_called_once_with("Key A", 9)
+        reset.assert_called_once_with(41)
+        restore.assert_called_once_with(9, "Key A")
+        query.assert_called_once_with("Key A", 1)
+        self.assertEqual(result["key"]["usage_7d"], 7)
+
+    def test_rollback_format_contains_all_six_fields(self):
+        text = bot.format_rollback_backup("Key A", {
+            "backup_id": 9,
+            "reset_source": "auto",
+            "created_at": "2026-09-03T10:00:00Z",
+            "snapshot": {
+                "usage_5h": "1.1",
+                "usage_1d": "2.2",
+                "usage_7d": "3.3",
+                "window_5h_start": "2026-09-03T05:00:00Z",
+                "window_1d_start": "2026-09-03T00:00:00Z",
+                "window_7d_start": "2026-08-28T00:00:00Z",
+            },
+        })
+        self.assertIn("5 小时用量：1.1", text)
+        self.assertIn("每日用量：2.2", text)
+        self.assertIn("每周用量：3.3", text)
+        self.assertIn("5 小时窗口：", text)
+        self.assertIn("每日窗口：", text)
+        self.assertIn("每周窗口：", text)
+
+    def test_reset_backup_notice_matches_key_overview_format(self):
+        text = bot.format_reset_backup_snapshots([
+            {
+                "key_name": "Administrator",
+                "backup": {"snapshot": {
+                    "last_used_at": "2026-09-03T10:56:43Z",
+                    "rate_limit_7d": "600",
+                    "usage_7d": "90.02",
+                }},
+            },
+            {
+                "key_name": "funstark1",
+                "backup": {"snapshot": {
+                    "last_used_at": "2026-09-01T08:56:23Z",
+                    "rate_limit_7d": "600",
+                    "usage_7d": "0",
+                }},
+            },
+        ])
+        self.assertIn(
+            "🔑 Administrator\n"
+            "• 最后使用：2026-09-03 18:56:43\n"
+            "• 每周额度：已用 90.02 / 限额 600 / 剩余 509.98\n"
+            "  [██░░░░░░░░░░] 15%",
+            text,
+        )
+        self.assertIn(
+            "🔑 funstark1\n"
+            "• 最后使用：2026-09-01 16:56:23\n"
+            "• 每周额度：已用 0 / 限额 600 / 剩余 600\n"
+            "  [░░░░░░░░░░░░] 0%",
+            text,
+        )
 
     @mock.patch.object(bot, "query_key_usage", side_effect=[
         {"key": {
@@ -701,7 +792,16 @@ class MessageAuthorizationTests(unittest.TestCase):
 
     @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-30 12:00:00")
     @mock.patch.object(bot, "reset_selected_keys", return_value=[
-        {"key_name": "Key A", "status": "success", "detail": "5h 0 / 日 0 / 周 0"},
+        {
+            "key_name": "Key A",
+            "status": "success",
+            "detail": "5h 0 / 日 0 / 周 0",
+            "backup": {"snapshot": {
+                "last_used_at": "2026-09-03T10:56:43Z",
+                "rate_limit_7d": 600,
+                "usage_7d": 90,
+            }},
+        },
         {"key_name": "Key B", "status": "failed", "detail": "重置失败"},
     ])
     @mock.patch.object(bot, "tg")
@@ -732,6 +832,13 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIn("批量重置完成", edits[-1]["text"])
         self.assertIn("成功：1", edits[-1]["text"])
         self.assertIn("失败：1", edits[-1]["text"])
+        backup_notices = [
+            call.args[1]["text"] for call in tg.call_args_list
+            if call.args[0] == "sendMessage" and "🔑 Key A" in call.args[1]["text"]
+        ]
+        self.assertEqual(len(backup_notices), 1)
+        self.assertIn("最后使用：2026-09-03 18:56:43", backup_notices[0])
+        self.assertIn("每周额度：已用 90 / 限额 600 / 剩余 510", backup_notices[0])
         self.assertIn("batch_start:0", {
             button["callback_data"]
             for row in bot.json.loads(edits[-1]["reply_markup"])["inline_keyboard"]
@@ -739,6 +846,74 @@ class MessageAuthorizationTests(unittest.TestCase):
         })
         duplicate_answer = tg.call_args_list[-1].args[1]
         self.assertIn("选择已过期", duplicate_answer["text"])
+
+    @mock.patch.object(bot, "rollback_key_rate_limits", return_value={
+        "key": {"usage_5h": "1.1", "usage_1d": "2.2", "usage_7d": "3.3"},
+    })
+    @mock.patch.object(bot, "find_rate_limit_backup", return_value=(41, {
+        "backup_id": 9,
+        "reset_source": "manual",
+        "created_at": "2026-09-03T10:00:00Z",
+        "snapshot": {"usage_5h": 1, "usage_1d": 2, "usage_7d": 3},
+    }))
+    @mock.patch.object(bot, "query_rate_limit_backups", return_value={
+        "key_id": 41,
+        "backups": [{
+            "backup_id": 9,
+            "reset_source": "manual",
+            "created_at": "2026-09-03T10:00:00Z",
+            "snapshot": {"usage_5h": 1, "usage_1d": 2, "usage_7d": 3},
+        }],
+    })
+    @mock.patch.object(bot, "tg")
+    def test_admin_can_select_confirm_and_execute_rollback(
+        self, tg, query_backups, find_backup, rollback,
+    ):
+        config = {
+            "admins": [123],
+            "bindings": {"456": {"key_name": "Key A", "account_id": 12}},
+        }
+        callback = {
+            "from": {"id": 123},
+            "message": {"message_id": 12, "chat": {"id": 123, "type": "private"}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+        ):
+            for index, action in enumerate((
+                "rollback_start:0",
+                "rollback_key:456",
+                "rollback_prompt:456:9",
+                "rollback_confirm:456:9",
+            )):
+                bot.handle_callback_query({**callback, "id": f"rollback-{index}", "data": action})
+
+        query_backups.assert_called_once_with("Key A")
+        find_backup.assert_called_once_with("Key A", 9)
+        rollback.assert_called_once_with("Key A", 12, 9)
+        edits = [call.args[1]["text"] for call in tg.call_args_list if call.args[0] == "editMessageText"]
+        self.assertTrue(any("最近的回滚备份" in text for text in edits))
+        self.assertTrue(any("确认完整回滚" in text for text in edits))
+        self.assertIn("Key 使用量已完整回滚", edits[-1])
+
+    @mock.patch.object(bot, "query_rate_limit_backups")
+    @mock.patch.object(bot, "tg")
+    def test_non_admin_cannot_forge_rollback_callback(self, tg, query_backups):
+        config = {
+            "admins": [123],
+            "bindings": {"456": {"key_name": "Key A", "account_id": 12}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "forged-rollback",
+                "from": {"id": 456},
+                "data": "rollback_key:456",
+                "message": {"message_id": 12, "chat": {"id": 456, "type": "private"}},
+            })
+        query_backups.assert_not_called()
+        self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
 
 
 class DataSafetyTests(unittest.TestCase):
@@ -792,6 +967,32 @@ class DataSafetyTests(unittest.TestCase):
         run.assert_called_once_with(
             "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;",
             {"account_id": "12"},
+        )
+
+    def test_backup_uses_fixed_write_function(self):
+        with mock.patch.object(bot, "run_psql_write_json", return_value={}) as run:
+            bot.create_rate_limit_backup("example-key", 12, "manual")
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.backup_rate_limits("
+            ":'key_name', NULLIF(:'account_id', '')::bigint, :'reset_source')::text;",
+            {"key_name": "example-key", "account_id": "12", "reset_source": "manual"},
+        )
+
+    def test_restore_uses_fixed_write_function(self):
+        with mock.patch.object(bot, "run_psql_write_json", return_value={}) as run:
+            bot.restore_rate_limit_backup(9, "example-key")
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.restore_rate_limit_backup("
+            ":'backup_id'::bigint, :'key_name')::text;",
+            {"backup_id": "9", "key_name": "example-key"},
+        )
+
+    def test_backup_list_uses_fixed_read_only_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_rate_limit_backups("example-key")
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.rate_limit_backups(:'key_name')::text;",
+            {"key_name": "example-key"},
         )
 
     def test_account_binding_uses_fixed_account_snapshot_function(self):
@@ -853,6 +1054,26 @@ class DataSafetyTests(unittest.TestCase):
         self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
         self.assertNotIn("SUB2API_ADMIN_API_KEY", environment)
 
+    def test_write_function_connection_explicitly_enables_writes_without_table_credentials(self):
+        with mock.patch.multiple(
+            bot,
+            PSQL_BIN="/usr/bin/psql",
+            PGHOST="127.0.0.1",
+            PGPORT="5432",
+            PGDATABASE="sub2api",
+            PGUSER="sub2api_tg_bot",
+            PGPASSWORD="database-secret",
+            PGSSLMODE="prefer",
+        ), mock.patch.object(bot.subprocess, "check_output", return_value='{"ok": true}\n') as check:
+            result = bot.run_psql_write_json("SELECT fixed_function();")
+        self.assertEqual(result, {"ok": True})
+        self.assertIn("--quiet", check.call_args.args[0])
+        self.assertEqual(
+            check.call_args.kwargs["input"],
+            "SET default_transaction_read_only=off;\nSELECT fixed_function();",
+        )
+        self.assertNotIn("default_transaction_read_only=on", check.call_args.kwargs["env"]["PGOPTIONS"])
+
     def test_database_setup_exposes_only_fixed_function(self):
         with open("deploy/create_readonly_role.sql", "r", encoding="utf-8") as file:
             sql = file.read()
@@ -863,6 +1084,15 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint)", sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS sub2api_tg_bot_api.rate_limit_backups", sql)
+        self.assertIn("LIMIT 3", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text)", sql)
+        self.assertIn("SET usage_5h = (v_backup.snapshot->>'usage_5h')::numeric", sql)
+        self.assertIn("window_7d_start = (v_backup.snapshot->>'window_7d_start')::timestamptz", sql)
+        self.assertIn("'last_used_at', v_key.last_used_at", sql)
+        self.assertIn("'rate_limit_7d', v_key.rate_limit_7d", sql)
         self.assertIn("FROM public.accounts", sql)
         self.assertIn("extra->>'codex_usage_updated_at'", sql)
         self.assertIn("extra->>'codex_5h_reset_at'", sql)
@@ -1086,6 +1316,29 @@ class AccountWeeklyAutoResetTests(unittest.TestCase):
             SUB2API_ADMIN_API_KEY="admin-secret",
         )
 
+    def test_approval_keyboard_identifies_account_and_event(self):
+        buttons = bot.json.loads(
+            bot.auto_reset_approval_keyboard(12, "a1b2c3d4")
+        )["inline_keyboard"][0]
+        self.assertEqual(
+            [button["callback_data"] for button in buttons],
+            ["auto_approve:12:a1b2c3d4", "auto_reject:12:a1b2c3d4"],
+        )
+
+    @mock.patch.object(bot, "tg")
+    def test_approval_notice_is_sent_to_each_admin_with_three_minute_warning(self, tg):
+        delivered = bot.notify_auto_reset_approval(
+            {"123", "999"},
+            12,
+            "2026-09-14T09:03:10Z",
+            ["Key A", "Key B"],
+            "a1b2c3d4",
+        )
+        self.assertEqual(delivered, 2)
+        self.assertEqual({call.args[1]["chat_id"] for call in tg.call_args_list}, {"123", "999"})
+        self.assertTrue(all("3 分钟" in call.args[1]["text"] for call in tg.call_args_list))
+        self.assertTrue(all("reply_markup" in call.args[1] for call in tg.call_args_list))
+
     def test_first_snapshot_only_establishes_baseline(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = os.path.join(directory, "auto_reset_state.json")
@@ -1106,11 +1359,11 @@ class AccountWeeklyAutoResetTests(unittest.TestCase):
             self.assertEqual(set(state["accounts"]), {"12", "13"})
             self.assertEqual(
                 state["accounts"]["12"],
-                {"observed_reset_at": "2026-09-07T09:03:10Z", "pending_keys": []},
+                {"observed_reset_at": "2026-09-07T09:03:10Z"},
             )
             self.assertEqual(stat.S_IMODE(os.stat(state_path).st_mode), 0o600)
 
-    def test_later_account_reset_resets_only_its_configured_unique_keys_and_notifies_admins(self):
+    def test_later_account_reset_requests_approval_without_resetting(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = os.path.join(directory, "auto_reset_state.json")
             with self.auto_reset_runtime(state_path):
@@ -1126,29 +1379,34 @@ class AccountWeeklyAutoResetTests(unittest.TestCase):
                                 else "2026-09-08T09:03:10Z"
                             ),
                         }), \
-                        mock.patch.object(bot, "query_key_usage", side_effect=lambda key_name, account_id: {
-                            "key": {"id": {"Key A": 41, "Key B": 42}[key_name]}
-                        }) as query_key, \
+                        mock.patch.object(bot.secrets, "token_hex", return_value="a1b2c3d4"), \
+                        mock.patch.object(bot, "query_key_usage") as query_key, \
                         mock.patch.object(bot, "reset_key_rate_limit_usage") as reset, \
                         mock.patch.object(bot, "tg") as tg:
-                    bot.check_account_weekly_resets()
+                    bot.check_account_weekly_resets(now=1000)
 
-            self.assertEqual(
-                query_key.call_args_list,
-                [mock.call("Key A", 12), mock.call("Key B", 12)],
-            )
-            self.assertEqual(reset.call_args_list, [mock.call(41), mock.call(42)])
-            self.assertEqual(len(tg.call_args_list), 4)
+            query_key.assert_not_called()
+            reset.assert_not_called()
+            self.assertEqual(len(tg.call_args_list), 2)
             self.assertEqual(
                 {call.args[1]["chat_id"] for call in tg.call_args_list},
                 {"123", "999"},
             )
-            self.assertTrue(all("自动重置" in call.args[1]["text"] for call in tg.call_args_list))
+            self.assertTrue(all("3 分钟" in call.args[1]["text"] for call in tg.call_args_list))
             with open(state_path, "r", encoding="utf-8") as state_file:
                 state = bot.json.load(state_file)
             self.assertEqual(
                 state["accounts"]["12"],
-                {"observed_reset_at": "2026-09-14T09:03:10Z", "pending_keys": []},
+                {
+                    "observed_reset_at": "2026-09-14T09:03:10Z",
+                    "approval": {
+                        "token": "a1b2c3d4",
+                        "reset_at": "2026-09-14T09:03:10Z",
+                        "deadline_at": 1180,
+                        "status": "pending",
+                        "keys": ["Key A", "Key B"],
+                    },
+                },
             )
 
     def test_equal_or_earlier_reset_time_does_not_trigger(self):
@@ -1172,7 +1430,34 @@ class AccountWeeklyAutoResetTests(unittest.TestCase):
             reset.assert_not_called()
             tg.assert_not_called()
 
-    def test_failed_reset_is_notified_and_retried_until_success(self):
+    def test_small_forward_reset_time_drift_updates_baseline_without_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.auto_reset_runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    "12": {"observed_reset_at": "2026-09-07T09:03:10Z", "pending_keys": []},
+                }})
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": "2026-09-07T09:03:24Z",
+                        }), \
+                        mock.patch.object(bot, "reset_key_rate_limit_usage") as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets()
+
+            reset.assert_not_called()
+            tg.assert_not_called()
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = bot.json.load(state_file)
+            self.assertEqual(
+                state["accounts"]["12"]["observed_reset_at"],
+                "2026-09-07T09:03:24Z",
+            )
+
+    def test_timeout_resets_and_failed_key_is_retried_until_success(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = os.path.join(directory, "auto_reset_state.json")
             config = self.config()
@@ -1187,22 +1472,95 @@ class AccountWeeklyAutoResetTests(unittest.TestCase):
                             "id": 12,
                             "reset_7d_at": "2026-09-14T09:03:10Z",
                         }), \
-                        mock.patch.object(bot, "query_key_usage", return_value={"key": {"id": 41}}), \
+                        mock.patch.object(
+                            bot,
+                            "create_rate_limit_backup",
+                            side_effect=[
+                                {"key_id": 41, "backup_id": 1},
+                                {"key_id": 41, "backup_id": 2},
+                            ],
+                        ), \
                         mock.patch.object(
                             bot,
                             "reset_key_rate_limit_usage",
                             side_effect=[RuntimeError("unavailable"), {"success": True}],
                         ) as reset, \
                         mock.patch.object(bot, "tg") as tg:
-                    bot.check_account_weekly_resets()
-                    bot.check_account_weekly_resets()
+                    bot.check_account_weekly_resets(now=1000)
+                    bot.check_account_weekly_resets(now=1180)
+                    bot.check_account_weekly_resets(now=1240)
 
             self.assertEqual(reset.call_count, 2)
-            self.assertIn("❌", tg.call_args_list[0].args[1]["text"])
-            self.assertIn("✅", tg.call_args_list[1].args[1]["text"])
+            messages = [call.args[1]["text"] for call in tg.call_args_list]
+            self.assertTrue(any("3 分钟内无人操作" in text for text in messages))
+            self.assertTrue(any("❌" in text for text in messages))
+            self.assertTrue(any("✅" in text and "自动重置" in text for text in messages))
+            self.assertTrue(any("🔑 Key A" in text and "每周额度：" in text for text in messages))
             with open(state_path, "r", encoding="utf-8") as state_file:
                 state = bot.json.load(state_file)
-            self.assertEqual(state["accounts"]["12"]["pending_keys"], [])
+            self.assertNotIn("approval", state["accounts"]["12"])
+
+    def test_first_admin_decision_approves_and_later_click_is_expired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.auto_reset_runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    "12": {
+                        "observed_reset_at": "2026-09-14T09:03:10Z",
+                        "approval": {
+                            "token": "a1b2c3d4",
+                            "reset_at": "2026-09-14T09:03:10Z",
+                            "deadline_at": 1180,
+                            "status": "pending",
+                            "keys": ["Key A"],
+                        },
+                    },
+                }})
+                with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                        mock.patch.object(
+                            bot,
+                            "create_rate_limit_backup",
+                            return_value={"key_id": 41, "backup_id": 1},
+                        ), \
+                        mock.patch.object(bot, "reset_key_rate_limit_usage") as reset, \
+                        mock.patch.object(bot, "tg"):
+                    first = bot.decide_auto_reset_approval(12, "a1b2c3d4", True)
+                    second = bot.decide_auto_reset_approval(12, "a1b2c3d4", False)
+
+            self.assertEqual(first["status"], "approved")
+            self.assertEqual(second["status"], "expired")
+            reset.assert_called_once_with(41)
+
+    def test_rejection_prevents_timeout_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.auto_reset_runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    "12": {
+                        "observed_reset_at": "2026-09-14T09:03:10Z",
+                        "approval": {
+                            "token": "a1b2c3d4",
+                            "reset_at": "2026-09-14T09:03:10Z",
+                            "deadline_at": 1180,
+                            "status": "pending",
+                            "keys": ["Key A"],
+                        },
+                    },
+                }})
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": "2026-09-14T09:03:10Z",
+                        }), \
+                        mock.patch.object(bot, "reset_key_rate_limit_usage") as reset, \
+                        mock.patch.object(bot, "tg"):
+                    decision = bot.decide_auto_reset_approval(12, "a1b2c3d4", False)
+                    bot.check_account_weekly_resets(now=1300)
+
+            self.assertEqual(decision["status"], "rejected")
+            reset.assert_not_called()
 
 
 class ContainerPackagingTests(unittest.TestCase):
