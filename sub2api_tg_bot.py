@@ -382,7 +382,7 @@ def admin_keyboard(bindings, selected_user_id=None):
 
 
 def overview_keyboard(bindings, page, total_pages):
-    rows = []
+    rows = [[{"text": "🔄 刷新总览", "callback_data": f"overview:{page}"}]]
     page_candidates = reset_candidates(bindings)[
         page * OVERVIEW_PAGE_SIZE:(page + 1) * OVERVIEW_PAGE_SIZE
     ]
@@ -403,10 +403,7 @@ def overview_keyboard(bindings, page, total_pages):
             {"text": f"{page + 1}/{total_pages}", "callback_data": f"overview:{page}"},
             {"text": "▶️", "callback_data": f"overview:{next_page}"},
         ])
-    rows.extend([
-        [{"text": "🔄 刷新总览", "callback_data": f"overview:{page}"}],
-        [{"text": "◀️ 返回", "callback_data": "overview_back:0"}],
-    ])
+    rows.append([{"text": "◀️ 返回", "callback_data": "overview_back:0"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
