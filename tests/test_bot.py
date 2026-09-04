@@ -697,9 +697,13 @@ class MessageAuthorizationTests(unittest.TestCase):
             str(index): {"key_name": f"Key {index}", "account_id": index}
             for index in range(24)
         }
+        keyboard = bot.json.loads(bot.overview_keyboard(bindings, 1, 3))["inline_keyboard"]
+        self.assertEqual(keyboard[0], [
+            {"text": "🔄 刷新总览", "callback_data": "overview:1"},
+        ])
         buttons = [
             button
-            for row in bot.json.loads(bot.overview_keyboard(bindings, 1, 3))["inline_keyboard"]
+            for row in keyboard
             for button in row
         ]
         callback_data = {button["callback_data"] for button in buttons}
