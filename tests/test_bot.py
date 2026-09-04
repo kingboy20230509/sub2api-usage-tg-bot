@@ -214,6 +214,8 @@ class MessageAuthorizationTests(unittest.TestCase):
         ])
         self.assertEqual(reset.call_args_list, [mock.call(41), mock.call(42)])
         self.assertEqual(backup.call_count, 2)
+        batch_ids = {call.args[3] for call in backup.call_args_list}
+        self.assertEqual(len(batch_ids), 1)
         self.assertEqual(query.call_count, 1)
 
     @mock.patch.object(bot, "reset_key_rate_limit_usage", return_value={"success": True})
@@ -228,7 +230,8 @@ class MessageAuthorizationTests(unittest.TestCase):
             "detail": "重置成功且已有备份，但复查失败",
         }])
         reset.assert_called_once_with(41)
-        backup.assert_called_once_with("Key A", 1, "manual")
+        self.assertEqual(backup.call_args.args[:3], ("Key A", 1, "manual"))
+        self.assertRegex(backup.call_args.args[3], r"^[0-9a-f]{16}$")
 
     @mock.patch.object(bot, "reset_key_rate_limit_usage")
     @mock.patch.object(bot, "create_rate_limit_backup", return_value={"error": "not_found"})
@@ -239,7 +242,8 @@ class MessageAuthorizationTests(unittest.TestCase):
             "status": "failed",
             "detail": "备份失败，未执行重置",
         }])
-        backup.assert_called_once_with("Key A", 1, "manual")
+        self.assertEqual(backup.call_args.args[:3], ("Key A", 1, "manual"))
+        self.assertRegex(backup.call_args.args[3], r"^[0-9a-f]{16}$")
         reset.assert_not_called()
 
     @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-08-30 12:00:00")
@@ -329,12 +333,12 @@ class MessageAuthorizationTests(unittest.TestCase):
             text,
         )
 
-    @mock.patch.object(bot, "query_key_usage", side_effect=[
+    @mock.patch.object(bot, "query_key_overview", side_effect=[
         {"key": {
             "last_used_at": "2026-08-30T07:26:18Z",
             "rate_limit_7d": 600,
             "usage_7d": 320,
-        }},
+        }, "ip_counts": {"today": 3, "yesterday": 2}},
         RuntimeError("database unavailable"),
     ])
     def test_key_overview_deduplicates_names_and_keeps_query_failures(self, query):
@@ -349,10 +353,12 @@ class MessageAuthorizationTests(unittest.TestCase):
                 "last_used_at": "2026-08-30T07:26:18Z",
                 "rate_limit_7d": 600,
                 "usage_7d": 320,
+                "today_ip_count": 3,
+                "yesterday_ip_count": 2,
             },
             {"key_name": "Key B", "error": True},
         ])
-        self.assertEqual(query.call_args_list, [mock.call("Key A", 1), mock.call("Key B", 2)])
+        self.assertEqual(query.call_args_list, [mock.call("Key A"), mock.call("Key B")])
 
     @mock.patch.object(bot, "query_account_estimate", side_effect=[
         {
@@ -392,6 +398,8 @@ class MessageAuthorizationTests(unittest.TestCase):
                 "last_used_at": "2026-08-30T07:26:18Z",
                 "rate_limit_7d": 600,
                 "usage_7d": 320,
+                "today_ip_count": 3,
+                "yesterday_ip_count": 2,
             },
             {
                 "key_name": "Key B",
@@ -406,9 +414,14 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIn("最后使用：2026-08-30 15:26:18", text)
         self.assertIn("每周额度：已用 320 / 限额 600 / 剩余 280", text)
         self.assertIn("[██████░░░░░░] 53.33%", text)
+        self.assertIn("去重 IP：今日 3｜昨日 2", text)
         self.assertIn("最后使用：暂无使用记录", text)
         self.assertIn("每周额度：不限（已用 45）", text)
-        self.assertIn("🔑 Key C\n• 最后使用：数据不可用\n• 每周额度：数据不可用", text)
+        self.assertIn(
+            "🔑 Key C\n• 最后使用：数据不可用\n"
+            "• 每周额度：数据不可用\n• 去重 IP：数据不可用",
+            text,
+        )
         for unwanted in ("请求：", "Tokens", "费用：", "5 小时", "每日：", "模型"):
             self.assertNotIn(unwanted, text)
 
@@ -673,23 +686,91 @@ class MessageAuthorizationTests(unittest.TestCase):
         ]
         self.assertEqual(
             {button["callback_data"] for button in overview_buttons},
-            {"overview:0", "overview_back:0"},
+            {"ip_detail:456:0:0", "overview:0", "overview_back:0"},
         )
         self.assertEqual(edits[1]["text"], "请选择要查看的 Key：")
         collect_keys.assert_called_once()
         collect_accounts.assert_called_once()
 
     def test_overview_keyboard_supports_pagination_refresh_and_back(self):
+        bindings = {
+            str(index): {"key_name": f"Key {index}", "account_id": index}
+            for index in range(24)
+        }
         buttons = [
             button
-            for row in bot.json.loads(bot.overview_keyboard(1, 3))["inline_keyboard"]
+            for row in bot.json.loads(bot.overview_keyboard(bindings, 1, 3))["inline_keyboard"]
             for button in row
         ]
-        self.assertEqual(
-            {button["callback_data"] for button in buttons},
-            {"overview:0", "overview:1", "overview:2", "overview_back:0"},
-        )
+        callback_data = {button["callback_data"] for button in buttons}
+        self.assertTrue({"overview:0", "overview:1", "overview:2", "overview_back:0"} <= callback_data)
+        self.assertEqual(len([value for value in callback_data if value.startswith("ip_detail:")]), 8)
         self.assertIn("2/3", {button["text"] for button in buttons})
+
+    def test_ip_history_formats_unique_addresses_and_pagination(self):
+        text, page, total_pages = bot.format_key_ip_history("Key A", {
+            "window_start": "2026-09-02T00:00:00+08:00",
+            "window_end": "2026-09-04T12:00:00+08:00",
+            "total": 11,
+            "ips": [{
+                "ip_address": "203.0.113.25",
+                "first_seen": "2026-09-02T01:13:27Z",
+                "last_seen": "2026-09-04T06:32:18Z",
+                "requests": 126,
+            }],
+        })
+        self.assertEqual((page, total_pages), (0, 2))
+        self.assertIn("🌐 Key A｜近 3 日去重 IP", text)
+        self.assertIn("203.0.113.25", text)
+        self.assertIn("请求：126 次", text)
+
+    @mock.patch.object(bot, "query_key_ip_history")
+    @mock.patch.object(bot, "tg")
+    def test_non_admin_cannot_forge_ip_history_callback(self, tg, query):
+        config = {"admins": [123], "bindings": {"456": "Key A"}}
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "callback-ip-forged",
+                "from": {"id": 456},
+                "data": "ip_detail:456:0:0",
+                "message": {"message_id": 8, "chat": {"id": 456, "type": "private"}},
+            })
+        query.assert_not_called()
+        self.assertIn("没有管理员权限", tg.call_args.args[1]["text"])
+
+    @mock.patch.object(bot, "format_refresh_timestamp", return_value="2026-09-04 14:40:00")
+    @mock.patch.object(bot, "allow_check", return_value=(True, 0))
+    @mock.patch.object(bot, "query_key_ip_history", return_value={
+        "window_start": "2026-09-02T00:00:00+08:00",
+        "window_end": "2026-09-04T14:40:00+08:00",
+        "total": 1,
+        "ips": [{
+            "ip_address": "203.0.113.25",
+            "first_seen": "2026-09-02T01:00:00Z",
+            "last_seen": "2026-09-04T06:00:00Z",
+            "requests": 5,
+        }],
+    })
+    @mock.patch.object(bot, "tg")
+    def test_admin_can_open_ip_history(self, tg, query, allow, _refresh):
+        config = {"admins": [123], "bindings": {"456": "Key A"}}
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "callback-ip",
+                "from": {"id": 123},
+                "data": "ip_detail:456:0:0",
+                "message": {"message_id": 8, "chat": {"id": 123, "type": "private"}},
+            })
+        query.assert_called_once_with("Key A", 0)
+        allow.assert_called_once_with("123", cooldown=bot.ADMIN_CHECK_COOLDOWN)
+        edit = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"][0]
+        self.assertIn("203.0.113.25", edit["text"])
+        callbacks = {
+            button["callback_data"]
+            for row in bot.json.loads(edit["reply_markup"])["inline_keyboard"]
+            for button in row
+        }
+        self.assertEqual(callbacks, {"ip_detail:456:0:0", "overview:0"})
 
     @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
     @mock.patch.object(bot, "tg")
@@ -898,6 +979,107 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertTrue(any("确认完整回滚" in text for text in edits))
         self.assertIn("Key 使用量已完整回滚", edits[-1])
 
+    @mock.patch.object(bot, "rollback_all_key_rate_limits")
+    @mock.patch.object(bot, "find_complete_backup_batch")
+    @mock.patch.object(bot, "query_rate_limit_backup_batches")
+    @mock.patch.object(bot, "tg")
+    def test_admin_can_choose_and_execute_all_key_rollback(
+        self, tg, query_batches, find_batch, rollback_all,
+    ):
+        batch = {
+            "batch_id": "0123456789abcdef",
+            "created_at": "2026-09-04T02:31:26Z",
+            "reset_source": "manual",
+            "key_count": 2,
+            "backups": [
+                {"backup_id": 9, "key_name": "Key A", "snapshot": {}},
+                {"backup_id": 10, "key_name": "Key B", "snapshot": {}},
+            ],
+        }
+        query_batches.return_value = {"batches": [batch]}
+        find_batch.return_value = batch
+        rollback_all.return_value = (batch, [
+            {"key_name": "Key A", "status": "success"},
+            {"key_name": "Key B", "status": "success"},
+        ])
+        config = {"admins": [123], "bindings": {"456": "Key A", "789": "Key B"}}
+        callback = {
+            "from": {"id": 123},
+            "message": {"message_id": 12, "chat": {"id": 123, "type": "private"}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config), mock.patch.multiple(
+            bot,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+        ):
+            for index, action in enumerate((
+                "rollback_start:0",
+                "rollback_all:0",
+                "rollback_all_prompt:0123456789abcdef",
+                "rollback_all_confirm:0123456789abcdef",
+            )):
+                bot.handle_callback_query({**callback, "id": f"rollback-all-{index}", "data": action})
+        rollback_all.assert_called_once()
+        edits = [call.args[1]["text"] for call in tg.call_args_list if call.args[0] == "editMessageText"]
+        self.assertIn("请选择回滚方式", edits[0])
+        self.assertIn("选择全员回滚版本", edits[1])
+        self.assertIn("确认回滚所有绑定 Key", edits[2])
+        self.assertIn("全员回滚完成", edits[-1])
+
+    @mock.patch.object(bot, "_rollback_key_rate_limits_unlocked")
+    @mock.patch.object(bot, "find_rate_limit_backup", side_effect=[
+        (41, {"backup_id": 9, "key_name": "Key A"}),
+        (42, {"backup_id": 10, "key_name": "Key B"}),
+    ])
+    @mock.patch.object(bot, "find_complete_backup_batch")
+    def test_all_key_rollback_preflights_complete_batch_and_processes_each_key(
+        self, find_batch, find_backup, rollback_one,
+    ):
+        batch = {
+            "batch_id": "0123456789abcdef",
+            "created_at": "2026-09-04T02:31:26Z",
+            "backups": [
+                {"backup_id": 9, "key_name": "Key A"},
+                {"backup_id": 10, "key_name": "Key B"},
+            ],
+        }
+        find_batch.return_value = batch
+        bindings = {
+            "456": {"key_name": "Key A", "account_id": 1},
+            "789": {"key_name": "Key B", "account_id": 2},
+        }
+        returned_batch, results = bot.rollback_all_key_rate_limits(
+            bindings, "0123456789abcdef"
+        )
+        self.assertIs(returned_batch, batch)
+        self.assertEqual(results, [
+            {"key_name": "Key A", "status": "success"},
+            {"key_name": "Key B", "status": "success"},
+        ])
+        self.assertEqual(rollback_one.call_count, 2)
+
+    @mock.patch.object(bot, "_rollback_key_rate_limits_unlocked")
+    @mock.patch.object(bot, "find_rate_limit_backup", side_effect=[
+        (41, {"backup_id": 9, "key_name": "Key A"}),
+        RuntimeError("backup missing"),
+    ])
+    @mock.patch.object(bot, "find_complete_backup_batch", return_value={
+        "backups": [
+            {"backup_id": 9, "key_name": "Key A"},
+            {"backup_id": 10, "key_name": "Key B"},
+        ],
+    })
+    def test_all_key_rollback_changes_nothing_when_preflight_fails(
+        self, _find_batch, _find_backup, rollback_one,
+    ):
+        bindings = {
+            "456": {"key_name": "Key A", "account_id": 1},
+            "789": {"key_name": "Key B", "account_id": 2},
+        }
+        with self.assertRaises(RuntimeError):
+            bot.rollback_all_key_rate_limits(bindings, "0123456789abcdef")
+        rollback_one.assert_not_called()
+
     @mock.patch.object(bot, "query_rate_limit_backups")
     @mock.patch.object(bot, "tg")
     def test_non_admin_cannot_forge_rollback_callback(self, tg, query_backups):
@@ -961,6 +1143,23 @@ class DataSafetyTests(unittest.TestCase):
             {"key_name": "example-key"},
         )
 
+    def test_ip_history_uses_fixed_read_only_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_key_ip_history("example-key", page=2)
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.key_ip_history("
+            ":'key_name', :'offset'::integer, :'limit'::integer)::text;",
+            {"key_name": "example-key", "offset": "20", "limit": "10"},
+        )
+
+    def test_key_overview_uses_admin_only_fixed_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_key_overview("example-key")
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.key_overview(:'key_name')::text;",
+            {"key_name": "example-key"},
+        )
+
     def test_account_weekly_reset_uses_fixed_read_only_function(self):
         with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
             bot.query_account_weekly_reset(12)
@@ -971,11 +1170,30 @@ class DataSafetyTests(unittest.TestCase):
 
     def test_backup_uses_fixed_write_function(self):
         with mock.patch.object(bot, "run_psql_write_json", return_value={}) as run:
-            bot.create_rate_limit_backup("example-key", 12, "manual")
+            bot.create_rate_limit_backup("example-key", 12, "manual", "0123456789abcdef")
         run.assert_called_once_with(
             "SELECT sub2api_tg_bot_api.backup_rate_limits("
-            ":'key_name', NULLIF(:'account_id', '')::bigint, :'reset_source')::text;",
-            {"key_name": "example-key", "account_id": "12", "reset_source": "manual"},
+            ":'key_name', NULLIF(:'account_id', '')::bigint, "
+            ":'reset_source', :'batch_id')::text;",
+            {
+                "key_name": "example-key",
+                "account_id": "12",
+                "reset_source": "manual",
+                "batch_id": "0123456789abcdef",
+            },
+        )
+
+    def test_backup_batch_list_uses_fixed_read_only_function(self):
+        bindings = {
+            "123": {"key_name": "Key A", "account_id": 1},
+            "456": {"key_name": "Key B", "account_id": 2},
+        }
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_rate_limit_backup_batches(bindings)
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.rate_limit_backup_batches("
+            ":'key_names'::jsonb)::text;",
+            {"key_names": '["Key A", "Key B"]'},
         )
 
     def test_restore_uses_fixed_write_function(self):
@@ -1081,12 +1299,16 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("SET search_path = pg_catalog", sql)
         self.assertIn("REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_overview(text)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_ip_history(text, integer, integer)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint)", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS sub2api_tg_bot_api.rate_limit_backups", sql)
         self.assertIn("LIMIT 3", sql)
-        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text)", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backup_batches(jsonb)", sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS batch_id text", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text)", sql)
         self.assertIn("SET usage_5h = (v_backup.snapshot->>'usage_5h')::numeric", sql)
@@ -1102,6 +1324,8 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("to_jsonb(usage_row)->>'account_stats_cost'", sql)
         self.assertIn("'consumed_amount'", sql)
         self.assertIn("'models_today'", sql)
+        self.assertIn("'ip_counts'", sql)
+        self.assertIn("count(DISTINCT ip_address)", sql)
         self.assertIn("'models_7d'", sql)
         self.assertIn("interval '6 days'", sql)
         self.assertIn("AS window_start", sql)
@@ -1170,6 +1394,7 @@ class DataSafetyTests(unittest.TestCase):
                 "cache_read_tokens": 8,
                 "actual_cost": "0.02",
             }],
+            "ip_counts": {"today": 3, "yesterday": 2},
             "upstream_account": {
                 "id": 12,
                 "platform": "openai",
@@ -1206,6 +1431,7 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("━━━━━━━━━━━━━━━━", output)
         self.assertIn("Tokens：输入 0.02k / 输出 0.004k", output)
         self.assertIn("缓存占比：读取 23.53%｜写入 17.65%", output)
+        self.assertNotIn("去重 IP", output)
         self.assertLess(len(output), 4096)
 
     def test_key_expiry_supports_permanent_expired_and_invalid_values(self):
@@ -1401,6 +1627,7 @@ class AccountWeeklyAutoResetTests(unittest.TestCase):
                     "observed_reset_at": "2026-09-14T09:03:10Z",
                     "approval": {
                         "token": "a1b2c3d4",
+                        "batch_id": "a1b2c3d4",
                         "reset_at": "2026-09-14T09:03:10Z",
                         "deadline_at": 1180,
                         "status": "pending",

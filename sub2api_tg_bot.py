@@ -78,6 +78,7 @@ BATCH_RESET_SESSION_TTL = 300
 AUTO_RESET_MIN_ADVANCE_SECONDS = 3600
 AUTO_RESET_APPROVAL_SECONDS = 180
 OVERVIEW_PAGE_SIZE = 8
+IP_HISTORY_PAGE_SIZE = 10
 
 
 def log_failure(event, error):
@@ -380,8 +381,20 @@ def admin_keyboard(bindings, selected_user_id=None):
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
-def overview_keyboard(page, total_pages):
+def overview_keyboard(bindings, page, total_pages):
     rows = []
+    page_candidates = reset_candidates(bindings)[
+        page * OVERVIEW_PAGE_SIZE:(page + 1) * OVERVIEW_PAGE_SIZE
+    ]
+    ip_buttons = []
+    for target_user_id, binding in page_candidates:
+        key_name = binding["key_name"]
+        label = key_name if len(key_name) <= 60 else key_name[:57] + "..."
+        ip_buttons.append({
+            "text": f"🌐 {label}",
+            "callback_data": f"ip_detail:{target_user_id}:0:{page}",
+        })
+    rows.extend([ip_buttons[index:index + 2] for index in range(0, len(ip_buttons), 2)])
     if total_pages > 1:
         previous_page = max(0, page - 1)
         next_page = min(total_pages - 1, page + 1)
@@ -397,6 +410,33 @@ def overview_keyboard(page, total_pages):
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
+def ip_history_keyboard(target_user_id, page, total_pages, overview_page):
+    rows = []
+    if total_pages > 1:
+        rows.append([
+            {
+                "text": "◀️",
+                "callback_data": f"ip_detail:{target_user_id}:{max(0, page - 1)}:{overview_page}",
+            },
+            {
+                "text": f"{page + 1}/{total_pages}",
+                "callback_data": f"ip_detail:{target_user_id}:{page}:{overview_page}",
+            },
+            {
+                "text": "▶️",
+                "callback_data": f"ip_detail:{target_user_id}:{min(total_pages - 1, page + 1)}:{overview_page}",
+            },
+        ])
+    rows.extend([
+        [{
+            "text": "🔄 刷新",
+            "callback_data": f"ip_detail:{target_user_id}:{page}:{overview_page}",
+        }],
+        [{"text": "◀️ 返回 Key 总览", "callback_data": f"overview:{overview_page}"}],
+    ])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
 def rollback_key_keyboard(bindings):
     buttons = []
     for target_user_id, binding in reset_candidates(bindings):
@@ -406,8 +446,44 @@ def rollback_key_keyboard(bindings):
             "callback_data": f"rollback_key:{target_user_id}",
         })
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.append([{"text": "◀️ 返回", "callback_data": "rollback_back:0"}])
+    rows.append([{"text": "◀️ 返回", "callback_data": "rollback_start:0"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def rollback_mode_keyboard():
+    return json.dumps({"inline_keyboard": [
+        [{"text": "👤 回滚单个 Key", "callback_data": "rollback_single:0"}],
+        [{"text": "👥 回滚所有绑定 Key", "callback_data": "rollback_all:0"}],
+        [{"text": "◀️ 返回", "callback_data": "rollback_back:0"}],
+    ]}, ensure_ascii=False)
+
+
+def rollback_batch_keyboard(batches):
+    rows = []
+    for batch in batches:
+        batch_id = batch.get("batch_id")
+        if not isinstance(batch_id, str) or not re.fullmatch(r"[0-9a-f]{8,32}", batch_id):
+            continue
+        source = "自动" if batch.get("reset_source") == "auto" else "手动"
+        rows.append([{
+            "text": (
+                f"{format_timestamp(batch.get('created_at'))}｜{source}｜"
+                f"{num(batch.get('key_count'))} 个 Key"
+            ),
+            "callback_data": f"rollback_all_prompt:{batch_id}",
+        }])
+    rows.append([{"text": "◀️ 返回", "callback_data": "rollback_start:0"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def rollback_all_confirmation_keyboard(batch_id, key_count):
+    return json.dumps({"inline_keyboard": [
+        [{
+            "text": f"✅ 确认回滚全部 {key_count} 个 Key",
+            "callback_data": f"rollback_all_confirm:{batch_id}",
+        }],
+        [{"text": "◀️ 返回版本列表", "callback_data": "rollback_all:0"}],
+    ]}, ensure_ascii=False)
 
 
 def rollback_backup_keyboard(target_user_id, backups):
@@ -422,7 +498,7 @@ def rollback_backup_keyboard(target_user_id, backups):
             "text": f"#{backup_id}｜{created_at}｜{source}",
             "callback_data": f"rollback_prompt:{target_user_id}:{backup_id}",
         }])
-    rows.append([{"text": "◀️ 返回选择 Key", "callback_data": "rollback_start:0"}])
+    rows.append([{"text": "◀️ 返回选择 Key", "callback_data": "rollback_single:0"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
@@ -457,6 +533,41 @@ def format_rollback_backup(key_name, backup):
         "",
         "确认后将覆盖当前六个速率限制字段，并定向刷新该 Key 的缓存。",
     ])
+
+
+def find_complete_backup_batch(bindings, batch_id):
+    if not isinstance(batch_id, str) or not re.fullmatch(r"[0-9a-f]{8,32}", batch_id):
+        raise ValueError("Invalid backup batch ID")
+    data = query_rate_limit_backup_batches(bindings) or {}
+    if data.get("error"):
+        raise RuntimeError(f"Backup batch lookup failed: {data.get('error')}")
+    for batch in data.get("batches") or []:
+        if batch.get("batch_id") == batch_id:
+            return batch
+    raise RuntimeError("Backup batch is incomplete or no longer available")
+
+
+def format_all_rollback_confirmation(batch):
+    backups = batch.get("backups") or []
+    source = "自动重置" if batch.get("reset_source") == "auto" else "手动重置"
+    lines = [
+        "⚠️ 确认回滚所有绑定 Key？",
+        "",
+        f"版本时间：{format_timestamp(batch.get('created_at'))}",
+        f"备份来源：{source}",
+        f"可回滚：{len(backups)} / {num(batch.get('key_count'))} 个 Key",
+        "",
+    ]
+    lines.extend(f"• {backup.get('key_name') or '-'}" for backup in backups[:30])
+    if len(backups) > 30:
+        lines.append(f"• …另有 {len(backups) - 30} 个 Key")
+    lines.extend([
+        "",
+        "将恢复每个 Key 的 5 小时、每日、每周用量及对应窗口时间。",
+        "不会修改 quota_used，也不会删除历史用量记录。",
+        "每个 Key 都会定向刷新 Redis 限速缓存。",
+    ])
+    return "\n".join(lines)
 
 
 def format_reset_backup_snapshot(key_name, backup):
@@ -535,9 +646,9 @@ def reset_key_rate_limit_usage(key_id):
     return json.loads(response_body.decode("utf-8")) if response_body else None
 
 
-def backup_and_reset_key(key_name, account_id, reset_source):
+def backup_and_reset_key(key_name, account_id, reset_source, batch_id):
     with _RESET_OPERATION_LOCK:
-        backup = create_rate_limit_backup(key_name, account_id, reset_source) or {}
+        backup = create_rate_limit_backup(key_name, account_id, reset_source, batch_id) or {}
         if backup.get("error"):
             raise RuntimeError(f"Rate-limit backup failed: {backup.get('error')}")
         key_id = backup.get("key_id")
@@ -556,6 +667,7 @@ def backup_and_reset_key(key_name, account_id, reset_source):
 
 def reset_selected_keys(bindings, selected_user_ids):
     selected_user_ids = set(selected_user_ids)
+    batch_id = secrets.token_hex(8)
     results = []
     for target_user_id, binding in reset_candidates(bindings):
         if target_user_id not in selected_user_ids:
@@ -564,7 +676,9 @@ def reset_selected_keys(bindings, selected_user_ids):
         reset_completed = False
         backup_completed = False
         try:
-            backup = backup_and_reset_key(key_name, binding["account_id"], "manual")
+            backup = backup_and_reset_key(
+                key_name, binding["account_id"], "manual", batch_id
+            )
             backup_completed = True
             reset_completed = True
             checked_data = query_key_usage(key_name, binding["account_id"]) or {}
@@ -890,6 +1004,35 @@ def query_key_usage(key_name, account_id=None):
     return run_psql_json(sql, {"key_name": key_name, "account_id": str(account_id)})
 
 
+def query_key_ip_history(key_name, page=0, page_size=IP_HISTORY_PAGE_SIZE):
+    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
+        raise ValueError("Invalid key name")
+    if isinstance(page, bool) or not isinstance(page, int) or not 0 <= page <= 1000:
+        raise ValueError("Invalid IP history page")
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= 20
+    ):
+        raise ValueError("Invalid IP history page size")
+    sql = (
+        "SELECT sub2api_tg_bot_api.key_ip_history("
+        ":'key_name', :'offset'::integer, :'limit'::integer)::text;"
+    )
+    return run_psql_json(sql, {
+        "key_name": key_name,
+        "offset": str(page * page_size),
+        "limit": str(page_size),
+    })
+
+
+def query_key_overview(key_name):
+    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
+        raise ValueError("Invalid key name")
+    sql = "SELECT sub2api_tg_bot_api.key_overview(:'key_name')::text;"
+    return run_psql_json(sql, {"key_name": key_name})
+
+
 def query_account_estimate(account_id):
     if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
         raise ValueError("Invalid account ID in binding config")
@@ -904,7 +1047,7 @@ def query_account_weekly_reset(account_id):
     return run_psql_json(sql, {"account_id": str(account_id)})
 
 
-def create_rate_limit_backup(key_name, account_id, reset_source):
+def create_rate_limit_backup(key_name, account_id, reset_source, batch_id):
     if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
         raise ValueError("Invalid key name")
     if account_id is not None and (
@@ -913,15 +1056,30 @@ def create_rate_limit_backup(key_name, account_id, reset_source):
         raise ValueError("Invalid account ID")
     if reset_source not in {"manual", "auto"}:
         raise ValueError("Invalid reset source")
+    if not isinstance(batch_id, str) or not re.fullmatch(r"[0-9a-f]{8,32}", batch_id):
+        raise ValueError("Invalid backup batch ID")
     sql = (
         "SELECT sub2api_tg_bot_api.backup_rate_limits("
-        ":'key_name', NULLIF(:'account_id', '')::bigint, :'reset_source')::text;"
+        ":'key_name', NULLIF(:'account_id', '')::bigint, "
+        ":'reset_source', :'batch_id')::text;"
     )
     return run_psql_write_json(sql, {
         "key_name": key_name,
         "account_id": "" if account_id is None else str(account_id),
         "reset_source": reset_source,
+        "batch_id": batch_id,
     })
+
+
+def query_rate_limit_backup_batches(bindings):
+    key_names = [binding["key_name"] for _user_id, binding in reset_candidates(bindings)]
+    if not key_names:
+        return {"batches": []}
+    sql = (
+        "SELECT sub2api_tg_bot_api.rate_limit_backup_batches("
+        ":'key_names'::jsonb)::text;"
+    )
+    return run_psql_json(sql, {"key_names": json.dumps(key_names, ensure_ascii=False)})
 
 
 def query_rate_limit_backups(key_name):
@@ -956,20 +1114,70 @@ def find_rate_limit_backup(key_name, backup_id):
 def rollback_key_rate_limits(key_name, account_id, backup_id):
     with _RESET_OPERATION_LOCK:
         key_id, backup = find_rate_limit_backup(key_name, backup_id)
-        if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
-            raise RuntimeError("Backup lookup did not return a valid key ID")
-        # The official reset invalidates Sub2API's targeted Redis rate-limit
-        # cache. Restoring the database snapshot afterwards makes the next
-        # request reload all six restored values without broad Redis access.
-        reset_key_rate_limit_usage(key_id)
-        restored = restore_rate_limit_backup(backup_id, key_name) or {}
-        if restored.get("error"):
-            raise RuntimeError(f"Backup restore failed: {restored.get('error')}")
-        checked = query_key_usage(key_name, account_id) or {}
-        checked_key = checked.get("key") or {}
-        if not checked_key:
-            raise RuntimeError("Rollback completed but post-check failed")
-        return {"backup": backup, "restored": restored, "key": checked_key}
+        return _rollback_key_rate_limits_unlocked(
+            key_name, account_id, key_id, backup_id, backup
+        )
+
+
+def _rollback_key_rate_limits_unlocked(key_name, account_id, key_id, backup_id, backup):
+    if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
+        raise RuntimeError("Backup lookup did not return a valid key ID")
+    # The official reset invalidates Sub2API's targeted Redis rate-limit cache.
+    # Restoring afterwards makes the next request reload all restored values.
+    reset_key_rate_limit_usage(key_id)
+    restored = restore_rate_limit_backup(backup_id, key_name) or {}
+    if restored.get("error"):
+        raise RuntimeError(f"Backup restore failed: {restored.get('error')}")
+    checked = query_key_usage(key_name, account_id) or {}
+    checked_key = checked.get("key") or {}
+    if not checked_key:
+        raise RuntimeError("Rollback completed but post-check failed")
+    return {"backup": backup, "restored": restored, "key": checked_key}
+
+
+def rollback_all_key_rate_limits(bindings, batch_id):
+    with _RESET_OPERATION_LOCK:
+        batch = find_complete_backup_batch(bindings, batch_id)
+        bindings_by_name = {
+            binding["key_name"]: binding
+            for _user_id, binding in reset_candidates(bindings)
+        }
+        prepared = []
+        for backup in batch.get("backups") or []:
+            key_name = backup.get("key_name")
+            binding = bindings_by_name.get(key_name)
+            backup_id = backup.get("backup_id")
+            if not binding:
+                raise RuntimeError("Configured key is missing")
+            key_id, current_backup = find_rate_limit_backup(key_name, backup_id)
+            prepared.append((key_name, binding, backup_id, key_id, current_backup))
+        results = []
+        for key_name, binding, backup_id, key_id, current_backup in prepared:
+            try:
+                _rollback_key_rate_limits_unlocked(
+                    key_name, binding["account_id"], key_id, backup_id, current_backup
+                )
+                results.append({"key_name": key_name, "status": "success"})
+            except Exception as error:
+                log_failure(f"rollback all key={key_name}", error)
+                results.append({"key_name": key_name or "-", "status": "failed"})
+        return batch, results
+
+
+def format_all_rollback_results(batch, results):
+    success_count = sum(result.get("status") == "success" for result in results)
+    failed_count = len(results) - success_count
+    lines = [
+        "✅ 全员回滚完成" if failed_count == 0 else "⚠️ 全员回滚完成，部分 Key 失败",
+        "",
+        f"版本时间：{format_timestamp(batch.get('created_at'))}",
+        f"成功：{success_count}",
+        f"失败：{failed_count}",
+    ]
+    for result in results:
+        if result.get("status") != "success":
+            lines.append(f"❌ {result.get('key_name')}")
+    return "\n".join(lines)
 
 
 def collect_key_overview(bindings):
@@ -977,7 +1185,7 @@ def collect_key_overview(bindings):
     for target_user_id, binding in reset_candidates(bindings):
         key_name = binding["key_name"]
         try:
-            data = query_key_usage(key_name, binding["account_id"]) or {}
+            data = query_key_overview(key_name) or {}
             key = data.get("key") or {}
             if not key:
                 raise RuntimeError("Overview query did not return API key data")
@@ -986,6 +1194,8 @@ def collect_key_overview(bindings):
                 "last_used_at": key.get("last_used_at"),
                 "rate_limit_7d": key.get("rate_limit_7d"),
                 "usage_7d": key.get("usage_7d"),
+                "today_ip_count": (data.get("ip_counts") or {}).get("today"),
+                "yesterday_ip_count": (data.get("ip_counts") or {}).get("yesterday"),
             })
         except Exception as error:
             log_failure(f"overview target={masked_id(target_user_id)}", error)
@@ -1117,14 +1327,50 @@ def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE, accounts
     for item in page_items:
         lines.extend(["", f"🔑 {item['key_name']}"])
         if item.get("error"):
-            lines.extend(["• 最后使用：数据不可用", "• 每周额度：数据不可用"])
+            lines.extend([
+                "• 最后使用：数据不可用",
+                "• 每周额度：数据不可用",
+                "• 去重 IP：数据不可用",
+            ])
             continue
         last_used_at = item.get("last_used_at")
         lines.append(
             f"• 最后使用：{format_timestamp(last_used_at) if last_used_at else '暂无使用记录'}"
         )
         append_limit(lines, "每周额度", item.get("rate_limit_7d"), item.get("usage_7d"))
+        lines.append(
+            f"• 去重 IP：今日 {num(item.get('today_ip_count'))}｜"
+            f"昨日 {num(item.get('yesterday_ip_count'))}"
+        )
     append_account_overview(lines, accounts or [], now)
+    return "\n".join(lines), page, total_pages
+
+
+def format_key_ip_history(key_name, data, page=0, page_size=IP_HISTORY_PAGE_SIZE):
+    if data.get("error"):
+        raise RuntimeError(f"IP history query failed: {data.get('error')}")
+    total = data.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise RuntimeError("IP history query did not return a valid total")
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(max(page, 0), total_pages - 1)
+    lines = [
+        f"🌐 {key_name}｜近 3 日去重 IP",
+        "",
+        f"统计范围：{format_timestamp(data.get('window_start'))} 至当前",
+        f"去重 IP：{total} 个",
+    ]
+    ips = data.get("ips") or []
+    if not ips:
+        lines.extend(["", "暂无 IP 记录。"])
+    for index, item in enumerate(ips, start=page * page_size + 1):
+        lines.extend([
+            "",
+            f"{index}. {item.get('ip_address') or '-'}",
+            f"   • 首次：{format_timestamp(item.get('first_seen'))}",
+            f"   • 最近：{format_timestamp(item.get('last_seen'))}",
+            f"   • 请求：{num(item.get('requests'))} 次",
+        ])
     return "\n".join(lines), page, total_pages
 
 
@@ -1244,12 +1490,17 @@ def execute_auto_reset_approval(state, account_id, account_state, admins, config
     if not isinstance(pending_keys, list):
         pending_keys = []
     approval["keys"] = [key_name for key_name in pending_keys if key_name in configured_key_names]
+    batch_id = approval.get("batch_id")
+    if not isinstance(batch_id, str) or not re.fullmatch(r"[0-9a-f]{8,32}", batch_id):
+        batch_id = secrets.token_hex(8)
+        approval["batch_id"] = batch_id
+        save_auto_reset_state(state)
     results = []
     for key_name in list(approval["keys"]):
         try:
             approval["keys"].remove(key_name)
             save_auto_reset_state(state)
-            backup = backup_and_reset_key(key_name, account_id, "auto")
+            backup = backup_and_reset_key(key_name, account_id, "auto", batch_id)
             results.append({
                 "key_name": key_name,
                 "status": "success",
@@ -1365,6 +1616,7 @@ def check_account_weekly_resets(now=None):
                         if legacy_pending_keys and not isinstance(account_state.get("approval"), dict):
                             account_state["approval"] = {
                                 "token": secrets.token_hex(4),
+                                "batch_id": secrets.token_hex(8),
                                 "reset_at": account_state.get("observed_reset_at"),
                                 "deadline_at": None,
                                 "status": "pending",
@@ -1439,6 +1691,7 @@ def check_account_weekly_resets(now=None):
                         account_state["observed_reset_at"] = current_reset_at
                         account_state["approval"] = {
                             "token": secrets.token_hex(4),
+                            "batch_id": secrets.token_hex(8),
                             "reset_at": current_reset_at,
                             "deadline_at": None,
                             "status": "pending",
@@ -1663,13 +1916,14 @@ def handle_callback_query(callback):
     user_id = str(user.get("id"))
     action, separator, target_user_id = callback_data.partition(":")
     if not callback_id or not separator or action not in {
-        "usage", "overview", "overview_back",
+        "usage", "overview", "overview_back", "ip_detail",
         "batch_start", "batch_toggle", "batch_all", "batch_clear",
         "batch_review", "batch_back", "batch_confirm", "batch_cancel",
         "reset_prompt", "reset_confirm", "reset_cancel",
         "auto_approve", "auto_reject",
-        "rollback_start", "rollback_key", "rollback_prompt",
-        "rollback_confirm", "rollback_back",
+        "rollback_start", "rollback_single", "rollback_key", "rollback_prompt",
+        "rollback_confirm", "rollback_all", "rollback_all_prompt",
+        "rollback_all_confirm", "rollback_back",
     }:
         return
     if not is_private_user_chat(chat, user):
@@ -1755,8 +2009,68 @@ def handle_callback_query(callback):
                 tg("editMessageText", {
                     "chat_id": chat_id,
                     "message_id": message_id,
+                    "text": "↩️ Key 使用量回滚\n\n请选择回滚方式：",
+                    "reply_markup": rollback_mode_keyboard(),
+                })
+                return
+            if action == "rollback_single":
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
                     "text": "↩️ 请选择需要回滚的 Key：",
                     "reply_markup": rollback_key_keyboard(bindings),
+                })
+                return
+            if action == "rollback_all":
+                data = query_rate_limit_backup_batches(bindings) or {}
+                if data.get("error"):
+                    raise RuntimeError(f"Backup batch lookup failed: {data.get('error')}")
+                batches = data.get("batches") or []
+                tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": (
+                        "📦 选择全员回滚版本\n\n"
+                        "只显示包含当前全部绑定 Key 的完整备份版本。"
+                        if batches else
+                        "📦 暂无可用的全员回滚版本。\n\n"
+                        "旧备份和未覆盖全部绑定 Key 的批次仍可单 Key 回滚。"
+                    ),
+                    "reply_markup": rollback_batch_keyboard(batches),
+                })
+                return
+            if action in {"rollback_all_prompt", "rollback_all_confirm"}:
+                batch_id = target_user_id
+                batch = find_complete_backup_batch(bindings, batch_id)
+                key_count = len(batch.get("backups") or [])
+                if action == "rollback_all_prompt":
+                    tg("answerCallbackQuery", {"callback_query_id": callback_id})
+                    tg("editMessageText", {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "text": format_all_rollback_confirmation(batch),
+                        "reply_markup": rollback_all_confirmation_keyboard(
+                            batch_id, key_count
+                        ),
+                    })
+                    return
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": f"正在回滚全部 {key_count} 个 Key…",
+                })
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": f"⏳ 正在回滚全部 {key_count} 个 Key，请稍候…",
+                })
+                batch, results = rollback_all_key_rate_limits(bindings, batch_id)
+                tg("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": format_all_rollback_results(batch, results),
+                    "reply_markup": admin_keyboard(bindings),
                 })
                 return
             rollback_user_id, backup_separator, backup_id_text = target_user_id.partition(":")
@@ -1847,6 +2161,54 @@ def handle_callback_query(callback):
                 "reply_markup": admin_keyboard(bindings),
             })
             return
+        if action == "ip_detail":
+            parts = target_user_id.split(":")
+            if len(parts) != 3 or any(not part.isdigit() for part in parts):
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "IP 查询信息无效，请重新发送 /check。",
+                    "show_alert": "true",
+                })
+                return
+            ip_user_id, ip_page_text, overview_page_text = parts
+            binding = bindings.get(ip_user_id)
+            if not binding:
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "该 Key 绑定已不存在。",
+                    "show_alert": "true",
+                })
+                return
+            allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
+            if not allowed:
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": f"查询过于频繁，请 {retry_after} 秒后再试。",
+                    "show_alert": "true",
+                })
+                return
+            requested_ip_page = int(ip_page_text)
+            overview_page = int(overview_page_text)
+            data = query_key_ip_history(binding["key_name"], requested_ip_page) or {}
+            reply, ip_page, total_pages = format_key_ip_history(
+                binding["key_name"], data, requested_ip_page
+            )
+            if ip_page != requested_ip_page:
+                data = query_key_ip_history(binding["key_name"], ip_page) or {}
+                reply, ip_page, total_pages = format_key_ip_history(
+                    binding["key_name"], data, ip_page
+                )
+            reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": reply,
+                "reply_markup": ip_history_keyboard(
+                    ip_user_id, ip_page, total_pages, overview_page
+                ),
+            })
+            return
         if action == "overview":
             if not target_user_id.isdigit():
                 tg("answerCallbackQuery", {
@@ -1874,7 +2236,7 @@ def handle_callback_query(callback):
                 "chat_id": chat.get("id"),
                 "message_id": message.get("message_id"),
                 "text": reply,
-                "reply_markup": overview_keyboard(page, total_pages),
+                "reply_markup": overview_keyboard(bindings, page, total_pages),
             })
             return
         if action in {"reset_prompt", "reset_confirm", "reset_cancel"}:
@@ -2053,7 +2415,7 @@ def handle_callback_query(callback):
             error_text = "批量重置操作失败，请重新发送 /check。"
         elif action.startswith("rollback_"):
             error_text = "回滚操作失败；备份仍保留，请重新发送 /check 后重试。"
-        elif action.startswith("overview"):
+        elif action.startswith("overview") or action == "ip_detail":
             error_text = "总览查询失败，请稍后再试。"
         else:
             error_text = "查询失败，请稍后再试。"
