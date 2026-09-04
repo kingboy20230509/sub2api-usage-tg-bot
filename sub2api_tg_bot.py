@@ -1,2213 +1,1285 @@
-#!/usr/bin/env python3
-import json
-import os
-import re
-import secrets
-import signal
-import threading
-import subprocess
-import sys
-import time
-import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from zoneinfo import ZoneInfo
-
-
-def read_secret(name):
-    value = os.environ.get(name, "")
-    file_path = os.environ.get(f"{name}_FILE", "").strip()
-    if value and file_path:
-        raise RuntimeError(f"Set only one of {name} or {name}_FILE")
-    if not file_path:
-        return value
-    if not os.path.isabs(file_path):
-        raise RuntimeError(f"{name}_FILE must be an absolute path")
-    try:
-        with open(file_path, "r", encoding="utf-8") as secret_file:
-            value = secret_file.read(4097)
-    except OSError as error:
-        raise RuntimeError(f"Unable to read {name}_FILE") from error
-    if len(value) > 4096:
-        raise RuntimeError(f"{name}_FILE is too large")
-    return value.rstrip("\r\n")
-
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.environ.get("SUB2API_TG_BOT_CONFIG", os.path.join(BASE_DIR, "config.json"))
-TOKEN = read_secret("TELEGRAM_BOT_TOKEN").strip()
-SUB2API_BASE_URL = os.environ.get("SUB2API_BASE_URL", "").strip().rstrip("/")
-SUB2API_ADMIN_API_KEY = read_secret("SUB2API_ADMIN_API_KEY").strip()
-SUB2API_ADMIN_TIMEOUT = int(os.environ.get("SUB2API_ADMIN_TIMEOUT", "10"))
-LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
-LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
-ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
-ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
-AUTO_RESET_STATE_PATH = os.environ.get(
-    "AUTO_RESET_STATE_PATH", os.path.join(BASE_DIR, "auto_reset_state.json")
-)
-AUTO_RESET_CHECK_INTERVAL = int(os.environ.get("AUTO_RESET_CHECK_INTERVAL", "60"))
-PSQL_BIN = os.environ.get("PSQL_BIN", "/usr/bin/psql").strip()
-PGHOST = os.environ.get("PGHOST", "127.0.0.1").strip()
-PGPORT = os.environ.get("PGPORT", "5432").strip()
-PGDATABASE = os.environ.get("PGDATABASE", "sub2api").strip()
-PGUSER = os.environ.get("PGUSER", "sub2api_tg_bot").strip()
-PGPASSWORD = read_secret("PGPASSWORD")
-PGSSLMODE = os.environ.get("PGSSLMODE", "prefer").strip()
-PG_ALLOW_INSECURE_PRIVATE_NETWORK = os.environ.get("PG_ALLOW_INSECURE_PRIVATE_NETWORK", "0").strip()
-UPDATE_WORKERS = int(os.environ.get("UPDATE_WORKERS", "4"))
-UPDATE_MAX_PENDING = int(os.environ.get("UPDATE_MAX_PENDING", "16"))
-CHECK_COOLDOWN = int(os.environ.get("CHECK_COOLDOWN", "10"))
-ADMIN_CHECK_COOLDOWN = int(os.environ.get("ADMIN_CHECK_COOLDOWN", "2"))
-POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "10"))
-API = f"https://api.telegram.org/bot{TOKEN}"
-KEY_NAME_RE = re.compile(r"^[\w .:@+-]{1,100}$")
-PG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,62}$")
-COMPOSE_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
-PSQL_VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_RATE_LIMIT_LOCK = threading.Lock()
-_LAST_CHECK_BY_USER = {}
-_BATCH_RESET_LOCK = threading.Lock()
-_BATCH_RESET_SESSIONS = {}
-_AUTO_RESET_LOCK = threading.Lock()
-_RESET_OPERATION_LOCK = threading.Lock()
-BATCH_RESET_SESSION_TTL = 300
-AUTO_RESET_MIN_ADVANCE_SECONDS = 3600
-AUTO_RESET_APPROVAL_SECONDS = 180
-OVERVIEW_PAGE_SIZE = 8
-
-
-def log_failure(event, error):
-    print(f"{event} failed error={type(error).__name__}", file=sys.stderr, flush=True)
-
-
-def masked_id(value):
-    value = str(value or "")
-    return "***" + value[-4:] if value else "unknown"
-
-
-def validate_runtime_config():
-    if not TOKEN or ":" not in TOKEN or "replace_me" in TOKEN.lower():
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing or invalid")
-    if not 1 <= UPDATE_WORKERS <= 32:
-        raise RuntimeError("UPDATE_WORKERS must be between 1 and 32")
-    if not UPDATE_WORKERS <= UPDATE_MAX_PENDING <= 256:
-        raise RuntimeError("UPDATE_MAX_PENDING must be between UPDATE_WORKERS and 256")
-    if not 1 <= CHECK_COOLDOWN <= 3600:
-        raise RuntimeError("CHECK_COOLDOWN must be between 1 and 3600 seconds")
-    if not 1 <= ADMIN_CHECK_COOLDOWN <= 3600:
-        raise RuntimeError("ADMIN_CHECK_COOLDOWN must be between 1 and 3600 seconds")
-    if not 1 <= POLL_TIMEOUT <= 50:
-        raise RuntimeError("POLL_TIMEOUT must be between 1 and 50 seconds")
-    if not 1 <= SUB2API_ADMIN_TIMEOUT <= 60:
-        raise RuntimeError("SUB2API_ADMIN_TIMEOUT must be between 1 and 60 seconds")
-    if not 60 <= AUTO_RESET_CHECK_INTERVAL <= 3600:
-        raise RuntimeError("AUTO_RESET_CHECK_INTERVAL must be between 60 and 3600 seconds")
-    if bool(SUB2API_BASE_URL) != bool(SUB2API_ADMIN_API_KEY):
-        raise RuntimeError("SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY must be configured together")
-    if SUB2API_BASE_URL:
-        parsed = urllib.parse.urlsplit(SUB2API_BASE_URL)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise RuntimeError("SUB2API_BASE_URL is invalid")
-        try:
-            parsed.port
-        except ValueError as error:
-            raise RuntimeError("SUB2API_BASE_URL is invalid") from error
-        local_hosts = {"127.0.0.1", "::1", "localhost"}
-        if (
-            parsed.scheme == "http"
-            and parsed.hostname not in local_hosts
-            and not COMPOSE_SERVICE_NAME_RE.fullmatch(parsed.hostname)
-        ):
-            raise RuntimeError("SUB2API_BASE_URL must use HTTPS outside a private Compose network")
-        if (
-            not SUB2API_ADMIN_API_KEY
-            or "replace_me" in SUB2API_ADMIN_API_KEY.lower()
-            or any(char in SUB2API_ADMIN_API_KEY for char in "\r\n\0")
-        ):
-            raise RuntimeError("SUB2API_ADMIN_API_KEY is invalid")
-    if not os.path.isabs(PSQL_BIN) or not os.path.isfile(PSQL_BIN) or not os.access(PSQL_BIN, os.X_OK):
-        raise RuntimeError("PSQL_BIN must point to an executable psql client")
-    if not PGHOST or any(char in PGHOST for char in "\r\n\0"):
-        raise RuntimeError("PGHOST is missing or invalid")
-    if not PGPORT.isdigit() or not 1 <= int(PGPORT) <= 65535:
-        raise RuntimeError("PGPORT must be between 1 and 65535")
-    if not PG_NAME_RE.fullmatch(PGDATABASE) or not PG_NAME_RE.fullmatch(PGUSER):
-        raise RuntimeError("PGDATABASE and PGUSER contain invalid characters")
-    if not PGPASSWORD or "replace_me" in PGPASSWORD.lower() or any(char in PGPASSWORD for char in "\r\n\0"):
-        raise RuntimeError("PGPASSWORD must contain the read-only bot database password")
-    if PGSSLMODE not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
-        raise RuntimeError("PGSSLMODE is invalid")
-    if PG_ALLOW_INSECURE_PRIVATE_NETWORK not in {"0", "1"}:
-        raise RuntimeError("PG_ALLOW_INSECURE_PRIVATE_NETWORK must be 0 or 1")
-    database_is_local = PGHOST in {"127.0.0.1", "::1", "localhost"} or PGHOST.startswith("/")
-    database_uses_tls = PGSSLMODE in {"require", "verify-ca", "verify-full"}
-    if not database_is_local and not database_uses_tls:
-        if (
-            PG_ALLOW_INSECURE_PRIVATE_NETWORK != "1"
-            or PGSSLMODE != "disable"
-            or not COMPOSE_SERVICE_NAME_RE.fullmatch(PGHOST)
-        ):
-            raise RuntimeError(
-                "Remote PostgreSQL must use TLS, or explicitly allow a single-label Compose service "
-                "on a trusted private network with PGSSLMODE=disable"
-            )
-
-
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def config_bindings(config):
-    bindings = config.get("bindings") or {}
-    if not isinstance(bindings, dict):
-        raise ValueError("bindings must be an object")
-    normalized = {}
-    for user_id, value in bindings.items():
-        user_id = str(user_id)
-        if isinstance(value, str):
-            key_name = value
-            account_id = None
-        elif isinstance(value, dict):
-            if set(value) != {"key_name", "account_id"}:
-                raise ValueError("Binding objects must contain only key_name and account_id")
-            key_name = value.get("key_name")
-            account_id = value.get("account_id")
-            if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-                raise ValueError("account_id must be a positive integer")
-        else:
-            raise ValueError("Binding must be a key name string or an object")
-        if not user_id.isdigit() or not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
-            raise ValueError("Invalid Telegram ID or key name in binding config")
-        normalized[user_id] = {"key_name": key_name, "account_id": account_id}
-    return normalized
-
-
-def config_admins(config):
-    admins = config.get("admins") or []
-    if not isinstance(admins, list):
-        raise ValueError("admins must be an array")
-    normalized = {str(user_id) for user_id in admins}
-    if any(not user_id.isdigit() for user_id in normalized):
-        raise ValueError("Invalid Telegram ID in admins config")
-    return normalized
-
-
-def reset_candidates(bindings):
-    candidates = []
-    seen_key_names = set()
-    sorted_bindings = sorted(bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0]))
-    for target_user_id, binding in sorted_bindings:
-        key_name = binding["key_name"]
-        if key_name in seen_key_names:
-            continue
-        seen_key_names.add(key_name)
-        candidates.append((target_user_id, binding))
-    return candidates
-
-
-def batch_reset_keyboard(bindings, selected_user_ids):
-    selected_user_ids = set(selected_user_ids)
-    candidate_ids = {target_user_id for target_user_id, _binding in reset_candidates(bindings)}
-    selected_user_ids.intersection_update(candidate_ids)
-    buttons = []
-    for target_user_id, binding in reset_candidates(bindings):
-        prefix = "âœ… " if target_user_id in selected_user_ids else "â¬œ "
-        key_name = binding["key_name"]
-        max_name_length = 64 - len(prefix)
-        button_text = prefix + (
-            key_name if len(key_name) <= max_name_length else key_name[:max_name_length - 3] + "..."
-        )
-        buttons.append({"text": button_text, "callback_data": f"batch_toggle:{target_user_id}"})
-    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.extend([
-        [
-            {"text": "â˜‘ï¸ å…¨é€‰", "callback_data": "batch_all:0"},
-            {"text": "æ¸…ç©º", "callback_data": "batch_clear:0"},
-        ],
-        [{
-            "text": f"ðŸ”´ é‡ç½®æ‰€é€‰ï¼ˆ{len(selected_user_ids)}ï¼‰",
-            "callback_data": "batch_review:0",
-        }],
-        [{"text": "å–æ¶ˆ", "callback_data": "batch_cancel:0"}],
-    ])
-    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
-
-
-def batch_reset_selection_text(selected_count, total_count):
-    return (
-        "ðŸ”„ æ‰¹é‡é‡ç½®é€ŸçŽ‡é™åˆ¶\n\n"
-        "è¯·é€‰æ‹©éœ€è¦é‡ç½®çš„ Keyã€‚å†æ¬¡ç‚¹å‡»å¯å–æ¶ˆé€‰æ‹©ã€‚\n"
-        f"å·²é€‰æ‹©ï¼š{selected_count} / {total_count}"
-    )
-
-
-def batch_reset_review_text(bindings, selected_user_ids):
-    selected_user_ids = set(selected_user_ids)
-    selected_candidates = [
-        binding for target_user_id, binding in reset_candidates(bindings)
-        if target_user_id in selected_user_ids
-    ]
-    lines = [
-        "âš ï¸ ç¡®è®¤æ‰¹é‡é‡ç½®ï¼Ÿ",
-        "",
-        f"å³å°†é‡ç½®ä»¥ä¸‹ {len(selected_candidates)} ä¸ª Keyï¼š",
-        "",
-    ]
-    for binding in selected_candidates[:30]:
-        lines.append(f"â€¢ {binding['key_name']}")
-    if len(selected_candidates) > 30:
-        lines.append(f"â€¢ â€¦å¦æœ‰ {len(selected_candidates) - 30} ä¸ª Key")
-    lines.extend([
-        "",
-        "å°†æ¸…é›¶ 5 å°æ—¶ã€æ¯æ—¥å’Œ 7 å¤©é™é€Ÿè®¡æ•°ã€‚",
-        "ä¸ä¼šæ¸…é›¶æ€»é¢åº¦ quota_usedï¼Œä¹Ÿä¸ä¼šåˆ é™¤åŽ†å²ç”¨é‡è®°å½•ã€‚",
-    ])
-    return "\n".join(lines)
-
-
-def batch_reset_confirmation_keyboard(selected_count):
-    return json.dumps({"inline_keyboard": [
-        [{"text": f"âœ… ç¡®è®¤é‡ç½® {selected_count} ä¸ª Key", "callback_data": "batch_confirm:0"}],
-        [
-            {"text": "â—€ï¸ è¿”å›žé€‰æ‹©", "callback_data": "batch_back:0"},
-            {"text": "å–æ¶ˆ", "callback_data": "batch_cancel:0"},
-        ],
-    ]}, ensure_ascii=False)
-
-
-def start_batch_reset_session(admin_user_id, chat_id, message_id, now=None):
-    now = time.monotonic() if now is None else now
-    with _BATCH_RESET_LOCK:
-        _BATCH_RESET_SESSIONS[str(admin_user_id)] = {
-            "chat_id": str(chat_id),
-            "message_id": message_id,
-            "selected": set(),
-            "updated_at": now,
-        }
-    return set()
-
-
-def change_batch_reset_selection(
-    admin_user_id,
-    chat_id,
-    message_id,
-    valid_user_ids,
-    operation,
-    target_user_id=None,
-    now=None,
-):
-    now = time.monotonic() if now is None else now
-    valid_user_ids = set(valid_user_ids)
-    with _BATCH_RESET_LOCK:
-        admin_user_id = str(admin_user_id)
-        session = _BATCH_RESET_SESSIONS.get(admin_user_id)
-        if (
-            not session
-            or now - session["updated_at"] > BATCH_RESET_SESSION_TTL
-            or session["chat_id"] != str(chat_id)
-            or session["message_id"] != message_id
-        ):
-            _BATCH_RESET_SESSIONS.pop(admin_user_id, None)
-            return None
-        session["selected"].intersection_update(valid_user_ids)
-        if operation == "toggle":
-            if target_user_id not in valid_user_ids:
-                return None
-            if target_user_id in session["selected"]:
-                session["selected"].remove(target_user_id)
-            else:
-                session["selected"].add(target_user_id)
-        elif operation == "all":
-            session["selected"] = set(valid_user_ids)
-        elif operation == "clear":
-            session["selected"].clear()
-        elif operation != "keep":
-            raise ValueError("Invalid batch reset selection operation")
-        session["updated_at"] = now
-        return set(session["selected"])
-
-
-def finish_batch_reset_session(admin_user_id, chat_id, message_id, valid_user_ids=None, now=None):
-    now = time.monotonic() if now is None else now
-    with _BATCH_RESET_LOCK:
-        admin_user_id = str(admin_user_id)
-        session = _BATCH_RESET_SESSIONS.get(admin_user_id)
-        if (
-            not session
-            or now - session["updated_at"] > BATCH_RESET_SESSION_TTL
-            or session["chat_id"] != str(chat_id)
-            or session["message_id"] != message_id
-        ):
-            _BATCH_RESET_SESSIONS.pop(admin_user_id, None)
-            return None
-        _BATCH_RESET_SESSIONS.pop(admin_user_id, None)
-        selected = set(session["selected"])
-        if valid_user_ids is not None:
-            selected.intersection_update(valid_user_ids)
-        return selected
-
-
-def admin_keyboard(bindings, selected_user_id=None):
-    buttons = []
-    sorted_bindings = sorted(bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0]))
-    for user_id, binding in sorted_bindings:
-        key_name = binding["key_name"]
-        button_text = key_name if len(key_name) <= 64 else key_name[:61] + "..."
-        buttons.append({"text": button_text, "callback_data": f"usage:{user_id}"})
-    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.append([{"text": "ðŸ“Š Key æ€»è§ˆ", "callback_data": "overview:0"}])
-    if reset_api_configured():
-        rows.append([{
-            "text": "âš ï¸ æ‰¹é‡é‡ç½®é€ŸçŽ‡é™åˆ¶",
-            "callback_data": "batch_start:0",
-        }])
-        rows.append([{
-            "text": "â†©ï¸ å›žæ»š Key ä½¿ç”¨é‡",
-            "callback_data": "rollback_start:0",
-        }])
-    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
-
-
-def overview_keyboard(page, total_pages):
-    rows = []
-    if total_pages > 1:
-        previous_page = max(0, page - 1)
-        next_page = min(total_pages - 1, page + 1)
-        rows.append([
-            {"text": "â—€ï¸", "callback_data": f"overview:{previous_page}"},
-            {"text": f"{page + 1}/{total_pages}", "callback_data": f"overview:{page}"},
-            {"text": "â–¶ï¸", "callback_data": f"overview:{next_page}"},
-        ])
-    rows.extend([
-        [{"text": "ðŸ”„ åˆ·æ–°æ€»è§ˆ", "callback_data": f"overview:{page}"}],
-        [{"text": "â—€ï¸ è¿”å›ž", "callback_data": "overview_back:0"}],
-    ])
-    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
-
-
-def rollback_key_keyboard(bindings):
-    buttons = []
-    for target_user_id, binding in reset_candidates(bindings):
-        key_name = binding["key_name"]
-        buttons.append({
-            "text": key_name if len(key_name) <= 64 else key_name[:61] + "...",
-            "callback_data": f"rollback_key:{target_user_id}",
-        })
-    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.append([{"text": "â—€ï¸ è¿”å›ž", "callback_data": "rollback_back:0"}])
-    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
-
-
-def rollback_backup_keyboard(target_user_id, backups):
-    rows = []
-    for backup in backups:
-        backup_id = backup.get("backup_id")
-        if isinstance(backup_id, bool) or not isinstance(backup_id, int) or backup_id <= 0:
-            continue
-        source = "è‡ªåŠ¨" if backup.get("reset_source") == "auto" else "æ‰‹åŠ¨"
-        created_at = format_timestamp(backup.get("created_at"))
-        rows.append([{
-            "text": f"#{backup_id}ï½œ{created_at}ï½œ{source}",
-            "callback_data": f"rollback_prompt:{target_user_id}:{backup_id}",
-        }])
-    rows.append([{"text": "â—€ï¸ è¿”å›žé€‰æ‹© Key", "callback_data": "rollback_start:0"}])
-    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
-
-
-def rollback_confirmation_keyboard(target_user_id, backup_id):
-    return json.dumps({"inline_keyboard": [
-        [{
-            "text": f"âœ… ç¡®è®¤å›žæ»šåˆ°å¤‡ä»½ #{backup_id}",
-            "callback_data": f"rollback_confirm:{target_user_id}:{backup_id}",
-        }],
-        [{
-            "text": "â—€ï¸ è¿”å›žå¤‡ä»½åˆ—è¡¨",
-            "callback_data": f"rollback_key:{target_user_id}",
-        }],
-    ]}, ensure_ascii=False)
-
-
-def format_rollback_backup(key_name, backup):
-    snapshot = backup.get("snapshot") or {}
-    source = "è‡ªåŠ¨é‡ç½®" if backup.get("reset_source") == "auto" else "æ‰‹åŠ¨é‡ç½®"
-    return "\n".join([
-        "âš ï¸ ç¡®è®¤å®Œæ•´å›žæ»šï¼Ÿ",
-        "",
-        f"Keyï¼š{key_name}",
-        f"å¤‡ä»½ï¼š#{backup.get('backup_id')}ï½œ{source}",
-        f"å¤‡ä»½æ—¶é—´ï¼š{format_timestamp(backup.get('created_at'))}",
-        f"5 å°æ—¶ç”¨é‡ï¼š{money(snapshot.get('usage_5h'))}",
-        f"æ¯æ—¥ç”¨é‡ï¼š{money(snapshot.get('usage_1d'))}",
-        f"æ¯å‘¨ç”¨é‡ï¼š{money(snapshot.get('usage_7d'))}",
-        f"5 å°æ—¶çª—å£ï¼š{format_timestamp(snapshot.get('window_5h_start'))}",
-        f"æ¯æ—¥çª—å£ï¼š{format_timestamp(snapshot.get('window_1d_start'))}",
-        f"æ¯å‘¨çª—å£ï¼š{format_timestamp(snapshot.get('window_7d_start'))}",
-        "",
-        "ç¡®è®¤åŽå°†è¦†ç›–å½“å‰å…­ä¸ªé€ŸçŽ‡é™åˆ¶å­—æ®µï¼Œå¹¶å®šå‘åˆ·æ–°è¯¥ Key çš„ç¼“å­˜ã€‚",
-    ])
-
-
-def format_reset_backup_snapshot(key_name, backup):
-    snapshot = backup.get("snapshot") or {}
-    lines = [f"ðŸ”‘ {key_name}"]
-    last_used_at = snapshot.get("last_used_at")
-    lines.append(
-        f"â€¢ æœ€åŽä½¿ç”¨ï¼š{format_timestamp(last_used_at) if last_used_at else 'æš‚æ— ä½¿ç”¨è®°å½•'}"
-    )
-    append_limit(
-        lines,
-        "æ¯å‘¨é¢åº¦",
-        snapshot.get("rate_limit_7d"),
-        snapshot.get("usage_7d"),
-    )
-    return "\n".join(lines)
-
-
-def format_reset_backup_snapshots(results):
-    snapshots = [
-        format_reset_backup_snapshot(result["key_name"], result["backup"])
-        for result in results
-        if isinstance(result.get("backup"), dict)
-    ]
-    return "\n\n".join(snapshots)
-
-
-def tg(method, params=None, timeout=10):
-    if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
-    data = urllib.parse.urlencode(params or {}).encode("utf-8")
-    req = urllib.request.Request(f"{API}/{method}", data=data)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram API error: {payload}")
-    return payload.get("result")
-
-
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-class ResetAfterBackupError(RuntimeError):
-    def __init__(self, backup):
-        super().__init__("Reset failed after backup")
-        self.backup = backup
-
-
-def reset_api_configured():
-    return bool(SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY)
-
-
-def reset_key_rate_limit_usage(key_id):
-    if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
-        raise ValueError("Invalid API key ID")
-    if not reset_api_configured():
-        raise RuntimeError("Sub2API reset API is not configured")
-    body = json.dumps({"reset_rate_limit_usage": True}).encode("utf-8")
-    request = urllib.request.Request(
-        f"{SUB2API_BASE_URL}/api/v1/admin/api-keys/{key_id}",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-api-key": SUB2API_ADMIN_API_KEY,
-        },
-        method="PUT",
-    )
-    opener = urllib.request.build_opener(NoRedirectHandler())
-    with opener.open(request, timeout=SUB2API_ADMIN_TIMEOUT) as response:
-        response_body = response.read(1_048_577)
-    if len(response_body) > 1_048_576:
-        raise RuntimeError("Sub2API response is too large")
-    return json.loads(response_body.decode("utf-8")) if response_body else None
-
-
-def backup_and_reset_key(key_name, account_id, reset_source):
-    with _RESET_OPERATION_LOCK:
-        backup = create_rate_limit_backup(key_name, account_id, reset_source) or {}
-        if backup.get("error"):
-            raise RuntimeError(f"Rate-limit backup failed: {backup.get('error')}")
-        key_id = backup.get("key_id")
-        backup_id = backup.get("backup_id")
-        if (
-            isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0
-            or isinstance(backup_id, bool) or not isinstance(backup_id, int) or backup_id <= 0
-        ):
-            raise RuntimeError("Rate-limit backup did not return valid IDs")
-        try:
-            reset_key_rate_limit_usage(key_id)
-        except Exception as error:
-            raise ResetAfterBackupError(backup) from error
-        return backup
-
-
-def reset_selected_keys(bindings, selected_user_ids):
-    selected_user_ids = set(selected_user_ids)
-    results = []
-    for target_user_id, binding in reset_candidates(bindings):
-        if target_user_id not in selected_user_ids:
-            continue
-        key_name = binding["key_name"]
-        reset_completed = False
-        backup_completed = False
-        try:
-            backup = backup_and_reset_key(key_name, binding["account_id"], "manual")
-            backup_completed = True
-            reset_completed = True
-            checked_data = query_key_usage(key_name, binding["account_id"]) or {}
-            checked_key = checked_data.get("key") or {}
-            if not checked_key:
-                raise RuntimeError("Post-check did not return API key data")
-            results.append({
-                "key_name": key_name,
-                "status": "success",
-                "backup": backup,
-                "detail": (
-                    f"5h {checked_key.get('usage_5h', '?')} / "
-                    f"æ—¥ {checked_key.get('usage_1d', '?')} / "
-                    f"å‘¨ {checked_key.get('usage_7d', '?')} / "
-                    f"å¤‡ä»½ #{backup['backup_id']}"
-                ),
-            })
-        except Exception as error:
-            if isinstance(error, ResetAfterBackupError):
-                backup_completed = True
-            log_failure(
-                f"batch reset target={masked_id(target_user_id)} recheck={str(reset_completed).lower()}",
-                error,
-            )
-            result = {
-                "key_name": key_name,
-                "status": "warning" if reset_completed else "failed",
-                "detail": (
-                    "é‡ç½®æˆåŠŸä¸”å·²æœ‰å¤‡ä»½ï¼Œä½†å¤æŸ¥å¤±è´¥"
-                    if reset_completed else
-                    "å·²å¤‡ä»½ï¼Œä½†é‡ç½®å¤±è´¥" if backup_completed else
-                    "å¤‡ä»½å¤±è´¥ï¼Œæœªæ‰§è¡Œé‡ç½®"
-                ),
-            }
-            if reset_completed:
-                result["backup"] = backup
-            results.append(result)
-    return results
-
-
-def format_batch_reset_results(results, config):
-    success_count = sum(result["status"] == "success" for result in results)
-    warning_count = sum(result["status"] == "warning" for result in results)
-    failed_count = sum(result["status"] == "failed" for result in results)
-    lines = [
-        "âœ… æ‰¹é‡é‡ç½®å®Œæˆ",
-        "",
-        f"æ€»è®¡ï¼š{len(results)}",
-        f"æˆåŠŸï¼š{success_count}",
-        f"éœ€å¤æŸ¥ï¼š{warning_count}",
-        f"å¤±è´¥ï¼š{failed_count}",
-        "",
-    ]
-    icons = {"success": "âœ…", "warning": "âš ï¸", "failed": "âŒ"}
-    displayed_results = sorted(
-        results,
-        key=lambda result: ({"failed": 0, "warning": 1, "success": 2}[result["status"]], result["key_name"].casefold()),
-    )[:30]
-    for result in displayed_results:
-        lines.append(f"{icons[result['status']]} {result['key_name']}ï¼š{result['detail']}")
-    if len(results) > len(displayed_results):
-        lines.append(f"â€¦å¦æœ‰ {len(results) - len(displayed_results)} ä¸ªç»“æžœæœªå±•å¼€ï¼Œè¯·å•ç‹¬æŸ¥è¯¢ç¡®è®¤ã€‚")
-    lines.extend(["", f"ðŸ”„ å¤æŸ¥æ—¶é—´ï¼š{format_refresh_timestamp(config)}"])
-    return "\n".join(lines)
-
-
-def _run_psql_json(sql, variables=None, allow_write=False):
-    cmd = [PSQL_BIN, "-X", "--set=ON_ERROR_STOP=1", "-tAX"]
-    if allow_write:
-        cmd.append("--quiet")
-    for name, value in sorted((variables or {}).items()):
-        if not PSQL_VARIABLE_RE.fullmatch(name):
-            raise ValueError("Invalid psql variable name")
-        cmd.append(f"--set={name}={value}")
-    # psql does not interpolate :'name' variables in text passed with --command.
-    # Reading the fixed query from stdin keeps values in psql variables while
-    # ensuring interpolation happens before PostgreSQL receives the statement.
-    cmd.extend(["--file", "-"])
-    env = {
-        "HOME": "/nonexistent",
-        "LANG": "C",
-        "LC_ALL": "C",
-        "PGAPPNAME": "sub2api-tg-bot",
-        "PGCLIENTENCODING": "UTF8",
-        "PGCONNECT_TIMEOUT": "5",
-        "PGDATABASE": PGDATABASE,
-        "PGHOST": PGHOST,
-        "PGOPTIONS": (
-            "-c statement_timeout=10000 -c lock_timeout=2000"
-            if allow_write
-            else "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=2000"
-        ),
-        "PGPASSFILE": "/dev/null",
-        "PGPASSWORD": PGPASSWORD,
-        "PGPORT": PGPORT,
-        "PGSSLMODE": PGSSLMODE,
-        "PGUSER": PGUSER,
-    }
-    out = subprocess.check_output(
-        cmd,
-        input=("SET default_transaction_read_only=off;\n" + sql) if allow_write else sql,
-        env=env,
-        encoding="utf-8",
-        stderr=subprocess.STDOUT,
-        timeout=12,
-    ).strip()
-    if not out:
-        return None
-    return json.loads(out)
-
-
-def run_psql_json(sql, variables=None):
-    return _run_psql_json(sql, variables, allow_write=False)
-
-
-def run_psql_write_json(sql, variables=None):
-    return _run_psql_json(sql, variables, allow_write=True)
-
-
-def dec(v):
-    if v is None:
-        return Decimal("0")
-    try:
-        return Decimal(str(v))
-    except InvalidOperation:
-        return Decimal("0")
-
-
-def money(v):
-    d = dec(v)
-    s = f"{d:.2f}".rstrip("0").rstrip(".")
-    return s if s else "0"
-
-
-def num(v):
-    return str(int(v or 0))
-
-
-def format_tokens(v):
-    value = max(dec(v), Decimal("0"))
-    if value >= Decimal("1000000000"):
-        scaled = value / Decimal("1000000000")
-        suffix = "B"
-        decimals = 2
-    elif value >= Decimal("1000000"):
-        scaled = value / Decimal("1000000")
-        suffix = "M"
-        decimals = 2
-    else:
-        scaled = value / Decimal("1000")
-        suffix = "k"
-        decimals = 1 if value >= Decimal("1000") else 2
-        if scaled < Decimal("0.01"):
-            decimals = 3
-    text = f"{scaled:.{decimals}f}".rstrip("0").rstrip(".")
-    return f"{text or '0'}{suffix}"
-
-
-def progress_bar(used, total, width=12):
-    used = max(dec(used), Decimal("0"))
-    total = dec(total)
-    if total <= 0:
-        return ""
-    ratio = min(used / total, Decimal("1"))
-    filled = min(width, max(0, int(ratio * width + Decimal("0.5"))))
-    return f"[{'â–ˆ' * filled}{'â–‘' * (width - filled)}] {money(ratio * 100)}%"
-
-
-def format_timestamp(value):
-    if not value:
-        return "-"
-    text = str(value)
-    try:
-        timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if timestamp.tzinfo is not None:
-            timestamp = timestamp.astimezone(ZoneInfo("Asia/Shanghai"))
-        return timestamp.strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return text
-
-
-def format_date_range(start, end):
-    if not start or not end:
-        return None
-    return f"{format_timestamp(start)[:10]} ï½ž {format_timestamp(end)[:10]}"
-
-
-def format_refresh_timestamp(config):
-    timezone_name = config.get("timezone") or "Asia/Shanghai"
-    try:
-        timezone = ZoneInfo(str(timezone_name))
-    except (KeyError, TypeError, ValueError):
-        timezone = ZoneInfo("Asia/Shanghai")
-    return datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def format_status(value):
-    status = str(value or "-")
-    return {
-        "active": "æ­£å¸¸",
-        "disabled": "ç¦ç”¨",
-        "expired": "å·²è¿‡æœŸ",
-    }.get(status.lower(), status)
-
-
-def cache_percentage_text(values):
-    values = values or {}
-    input_tokens = max(dec(values.get("input_tokens")), Decimal("0"))
-    cache_creation = max(dec(values.get("cache_creation_tokens")), Decimal("0"))
-    cache_read = max(dec(values.get("cache_read_tokens")), Decimal("0"))
-    total_input = input_tokens + cache_creation + cache_read
-    if total_input <= 0:
-        return "æš‚æ— æ•°æ®"
-    read_percent = cache_read / total_input * 100
-    creation_percent = cache_creation / total_input * 100
-    return f"è¯»å– {money(read_percent)}%ï½œå†™å…¥ {money(creation_percent)}%"
-
-
-def append_limit(lines, label, limit_value, used_value):
-    limit = dec(limit_value)
-    used = dec(used_value)
-    if limit <= 0:
-        lines.append(f"â€¢ {label}ï¼šä¸é™ï¼ˆå·²ç”¨ {money(used)}ï¼‰")
-        return
-    remaining = max(limit - used, Decimal("0"))
-    summary = f"â€¢ {label}ï¼šå·²ç”¨ {money(used)} / é™é¢ {money(limit)} / å‰©ä½™ {money(remaining)}"
-    if used > limit:
-        summary += f" / è¶…å‡º {money(used - limit)}"
-    lines.extend([summary, f"  {progress_bar(used, limit)}"])
-
-
-def parse_upstream_timestamp(value):
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        if isinstance(value, (int, float, Decimal)) or re.fullmatch(r"\d+(?:\.\d+)?", str(value)):
-            epoch = float(value)
-            if epoch > 10_000_000_000:
-                epoch /= 1000
-            return datetime.fromtimestamp(epoch, timezone.utc)
-        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp
-    except (OverflowError, OSError, TypeError, ValueError):
-        return None
-
-
-def reset_remaining_text(value, now=None):
-    reset_at = parse_upstream_timestamp(value)
-    if reset_at is None:
-        return None
-    current = datetime.now(timezone.utc) if now is None else now
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    seconds = int((reset_at - current).total_seconds())
-    if seconds <= 0:
-        return "ç­‰å¾…å¿«ç…§æ›´æ–°"
-    days, remainder = divmod(seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
-    if days:
-        return f"{days}d" + (f" {hours}h" if hours else "")
-    if hours:
-        return f"{hours}h" + (f" {minutes}m" if minutes else "")
-    return f"{max(1, minutes)}m"
-
-
-def format_key_expiry(value, now=None):
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return "æ°¸ä¸è¿‡æœŸ"
-    expires_at = parse_upstream_timestamp(value)
-    if expires_at is None:
-        return "æ•°æ®ä¸å¯ç”¨"
-    current = datetime.now(timezone.utc) if now is None else now
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    timestamp = expires_at.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
-    seconds = int((expires_at - current).total_seconds())
-    if seconds <= 0:
-        return f"{timestamp}ï½œå·²è¿‡æœŸ"
-    days, remainder = divmod(seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
-    if days:
-        remaining = f"{days}d" + (f" {hours}h" if hours else "")
-    elif hours:
-        remaining = f"{hours}h" + (f" {minutes}m" if minutes else "")
-    else:
-        remaining = f"{max(1, minutes)}m"
-    return f"{timestamp}ï½œå‰©ä½™ï¼š{remaining}"
-
-
-def append_account_reset(lines, reset_at, now=None):
-    remaining = reset_remaining_text(reset_at, now)
-    if remaining:
-        timestamp = parse_upstream_timestamp(reset_at).astimezone(ZoneInfo("Asia/Shanghai"))
-        lines.append(f"  é‡ç½®æ—¶é—´ï¼š{timestamp.strftime('%Y-%m-%d %H:%M:%S')}ï½œå‰©ä½™ï¼š{remaining}")
-
-
-def append_model_section(lines, title, models):
-    lines.extend(["", title])
-    if not models:
-        lines.append("â€¢ æš‚æ— ä½¿ç”¨è®°å½•")
-        return
-    for index, model in enumerate(models):
-        if index:
-            lines.append("")
-        lines.extend([
-            f"â€¢ {model.get('model') or '-'}ï¼š{num(model.get('requests'))} æ¬¡ï½œè´¹ç”¨ {money(model.get('actual_cost'))}",
-            f"  Tokensï¼šè¾“å…¥ {format_tokens(model.get('input_tokens'))} / è¾“å‡º {format_tokens(model.get('output_tokens'))}",
-            f"  ç¼“å­˜å æ¯”ï¼š{cache_percentage_text(model)}",
-        ])
-
-
-def query_key_usage(key_name, account_id=None):
-    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
-        raise ValueError("Invalid key name in binding config")
-    if account_id is not None and (isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0):
-        raise ValueError("Invalid account ID in binding config")
-    if account_id is None:
-        sql = "SELECT sub2api_tg_bot_api.usage(:'key_name')::text;"
-        return run_psql_json(sql, {"key_name": key_name})
-    sql = "SELECT sub2api_tg_bot_api.usage_with_account(:'key_name', :'account_id'::bigint)::text;"
-    return run_psql_json(sql, {"key_name": key_name, "account_id": str(account_id)})
-
-
-def query_account_estimate(account_id):
-    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-        raise ValueError("Invalid account ID in binding config")
-    sql = "SELECT sub2api_tg_bot_api.account_estimate(:'account_id'::bigint)::text;"
-    return run_psql_json(sql, {"account_id": str(account_id)})
-
-
-def query_account_weekly_reset(account_id):
-    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-        raise ValueError("Invalid account ID in binding config")
-    sql = "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;"
-    return run_psql_json(sql, {"account_id": str(account_id)})
-
-
-def create_rate_limit_backup(key_name, account_id, reset_source):
-    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
-        raise ValueError("Invalid key name")
-    if account_id is not None and (
-        isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0
-    ):
-        raise ValueError("Invalid account ID")
-    if reset_source not in {"manual", "auto"}:
-        raise ValueError("Invalid reset source")
-    sql = (
-        "SELECT sub2api_tg_bot_api.backup_rate_limits("
-        ":'key_name', NULLIF(:'account_id', '')::bigint, :'reset_source')::text;"
-    )
-    return run_psql_write_json(sql, {
-        "key_name": key_name,
-        "account_id": "" if account_id is None else str(account_id),
-        "reset_source": reset_source,
-    })
-
-
-def query_rate_limit_backups(key_name):
-    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
-        raise ValueError("Invalid key name")
-    sql = "SELECT sub2api_tg_bot_api.rate_limit_backups(:'key_name')::text;"
-    return run_psql_json(sql, {"key_name": key_name})
-
-
-def restore_rate_limit_backup(backup_id, key_name):
-    if isinstance(backup_id, bool) or not isinstance(backup_id, int) or backup_id <= 0:
-        raise ValueError("Invalid backup ID")
-    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
-        raise ValueError("Invalid key name")
-    sql = (
-        "SELECT sub2api_tg_bot_api.restore_rate_limit_backup("
-        ":'backup_id'::bigint, :'key_name')::text;"
-    )
-    return run_psql_write_json(sql, {"backup_id": str(backup_id), "key_name": key_name})
-
-
-def find_rate_limit_backup(key_name, backup_id):
-    data = query_rate_limit_backups(key_name) or {}
-    if data.get("error"):
-        raise RuntimeError(f"Backup lookup failed: {data.get('error')}")
-    for backup in data.get("backups") or []:
-        if backup.get("backup_id") == backup_id:
-            return data.get("key_id"), backup
-    raise RuntimeError("Backup does not belong to this configured key")
-
-
-def rollback_key_rate_limits(key_name, account_id, backup_id):
-    with _RESET_OPERATION_LOCK:
-        key_id, backup = find_rate_limit_backup(key_name, backup_id)
-        if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
-            raise RuntimeError("Backup lookup did not return a valid key ID")
-        # The official reset invalidates Sub2API's targeted Redis rate-limit
-        # cache. Restoring the database snapshot afterwards makes the next
-        # request reload all six restored values without broad Redis access.
-        reset_key_rate_limit_usage(key_id)
-        restored = restore_rate_limit_backup(backup_id, key_name) or {}
-        if restored.get("error"):
-            raise RuntimeError(f"Backup restore failed: {restored.get('error')}")
-        checked = query_key_usage(key_name, account_id) or {}
-        checked_key = checked.get("key") or {}
-        if not checked_key:
-            raise RuntimeError("Rollback completed but post-check failed")
-        return {"backup": backup, "restored": restored, "key": checked_key}
-
-
-def collect_key_overview(bindings):
-    overview = []
-    for target_user_id, binding in reset_candidates(bindings):
-        key_name = binding["key_name"]
-        try:
-            data = query_key_usage(key_name, binding["account_id"]) or {}
-            key = data.get("key") or {}
-            if not key:
-                raise RuntimeError("Overview query did not return API key data")
-            overview.append({
-                "key_name": key_name,
-                "last_used_at": key.get("last_used_at"),
-                "rate_limit_7d": key.get("rate_limit_7d"),
-                "usage_7d": key.get("usage_7d"),
-            })
-        except Exception as error:
-            log_failure(f"overview target={masked_id(target_user_id)}", error)
-            overview.append({"key_name": key_name, "error": True})
-    return overview
-
-
-def collect_account_overview(bindings):
-    account_bindings = {}
-    for _target_user_id, binding in sorted(
-        bindings.items(), key=lambda item: (item[1]["key_name"].casefold(), item[0])
-    ):
-        account_id = binding["account_id"]
-        if account_id is None:
-            continue
-        key_names = account_bindings.setdefault(account_id, [])
-        if binding["key_name"] not in key_names:
-            key_names.append(binding["key_name"])
-
-    overview = []
-    for account_id, key_names in account_bindings.items():
-        try:
-            data = query_account_estimate(account_id) or {}
-            if data.get("error"):
-                raise RuntimeError("Account estimate query did not return account data")
-            overview.append({
-                "account_id": account_id,
-                "account_name": data.get("name"),
-                "key_names": key_names,
-                "used_7d_percent": data.get("used_7d_percent"),
-                "consumed_amount": data.get("consumed_amount"),
-                "snapshot_updated_at": data.get("snapshot_updated_at"),
-                "reset_7d_at": data.get("window_end"),
-            })
-        except Exception as error:
-            log_failure(f"account overview account={masked_id(account_id)}", error)
-            overview.append({"account_id": account_id, "key_names": key_names, "error": True})
-    return overview
-
-
-def mask_account_name(value):
-    name = str(value or "").strip()
-    if "@" not in name:
-        return name or "æœªå‘½åè´¦å·"
-    local, domain = name.rsplit("@", 1)
-    if not local or not domain:
-        return name
-    return f"{local[:3]}***@{domain}"
-
-
-def account_estimated_total(consumed_amount, used_percent):
-    if consumed_amount is None or used_percent is None:
-        return None
-    percent = dec(used_percent)
-    if percent <= 0:
-        return None
-    return max(dec(consumed_amount), Decimal("0")) * Decimal("100") / percent
-
-
-def append_account_overview(lines, accounts, now=None):
-    lines.extend(["", "ðŸ’° ç»‘å®šè´¦å·é‡‘é¢é¢„ä¼°"])
-    if not accounts:
-        lines.append("â€¢ æš‚æ— é…ç½®äº† account_id çš„ç»‘å®šè´¦å·ã€‚")
-        return
-
-    total_consumed = Decimal("0")
-    total_estimated = Decimal("0")
-    consumed_count = 0
-    estimated_count = 0
-    for account in accounts:
-        lines.extend(["", f"ðŸ‘¤ {mask_account_name(account.get('account_name'))}"])
-        lines.append(f"â€¢ ç»‘å®š Keyï¼š{'ã€'.join(account.get('key_names') or []) or '-'}")
-        if account.get("error"):
-            lines.extend([
-                "â€¢ è´¦å·ä½¿ç”¨ï¼šæ•°æ®ä¸å¯ç”¨",
-                "â€¢ å·²æ¶ˆè€—é‡‘é¢ï¼šæ•°æ®ä¸å¯ç”¨",
-                "â€¢ é¢„ä¼°æ€»é‡‘é¢ï¼šæ•°æ®ä¸å¯ç”¨",
-            ])
-            continue
-
-        used_percent = account.get("used_7d_percent")
-        consumed_amount = account.get("consumed_amount")
-        if used_percent is None:
-            lines.append("â€¢ è´¦å·ä½¿ç”¨ï¼šæš‚æ— æ•°æ®")
-        else:
-            percent = max(dec(used_percent), Decimal("0"))
-            lines.extend([
-                f"â€¢ è´¦å·ä½¿ç”¨ï¼š{money(percent)}%",
-                f"  {progress_bar(percent, 100)}",
-            ])
-        append_account_reset(lines, account.get("reset_7d_at"), now)
-        if consumed_amount is None:
-            lines.append("â€¢ å·²æ¶ˆè€—é‡‘é¢ï¼šæš‚æ— æ•°æ®")
-        else:
-            consumed = max(dec(consumed_amount), Decimal("0"))
-            total_consumed += consumed
-            consumed_count += 1
-            lines.append(f"â€¢ å·²æ¶ˆè€—é‡‘é¢ï¼š${money(consumed)}")
-        estimated = account_estimated_total(consumed_amount, used_percent)
-        if estimated is None:
-            lines.append("â€¢ é¢„ä¼°æ€»é‡‘é¢ï¼šæš‚æ— æ•°æ®")
-        else:
-            total_estimated += estimated
-            estimated_count += 1
-            lines.append(f"â€¢ é¢„ä¼°æ€»é‡‘é¢ï¼šçº¦ ${money(estimated)}")
-
-    lines.extend(["", "ðŸ“¦ å…¨éƒ¨è´¦å·æ±‡æ€»"])
-    lines.append(
-        f"â€¢ å·²æ¶ˆè€—é‡‘é¢ï¼š${money(total_consumed)}"
-        if consumed_count == len(accounts) else "â€¢ å·²æ¶ˆè€—é‡‘é¢ï¼šæ•°æ®ä¸å®Œæ•´"
-    )
-    lines.append(
-        f"â€¢ é¢„ä¼°æ€»é‡‘é¢ï¼šçº¦ ${money(total_estimated)}"
-        if estimated_count == len(accounts) else "â€¢ é¢„ä¼°æ€»é‡‘é¢ï¼šæ•°æ®ä¸å®Œæ•´"
-    )
-
-
-def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE, accounts=None, now=None):
-    if isinstance(page, bool) or not isinstance(page, int):
-        raise ValueError("Invalid overview page")
-    if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
-        raise ValueError("Invalid overview page size")
-    total_pages = max(1, (len(overview) + page_size - 1) // page_size)
-    page = min(max(page, 0), total_pages - 1)
-    page_items = overview[page * page_size:(page + 1) * page_size]
-    lines = ["ðŸ“Š Key æ€»è§ˆ"]
-    if not page_items:
-        lines.extend(["", "æš‚æ— å·²ç»‘å®š Keyã€‚"])
-    for item in page_items:
-        lines.extend(["", f"ðŸ”‘ {item['key_name']}"])
-        if item.get("error"):
-            lines.extend(["â€¢ æœ€åŽä½¿ç”¨ï¼šæ•°æ®ä¸å¯ç”¨", "â€¢ æ¯å‘¨é¢åº¦ï¼šæ•°æ®ä¸å¯ç”¨"])
-            continue
-        last_used_at = item.get("last_used_at")
-        lines.append(
-            f"â€¢ æœ€åŽä½¿ç”¨ï¼š{format_timestamp(last_used_at) if last_used_at else 'æš‚æ— ä½¿ç”¨è®°å½•'}"
-        )
-        append_limit(lines, "æ¯å‘¨é¢åº¦", item.get("rate_limit_7d"), item.get("usage_7d"))
-    append_account_overview(lines, accounts or [], now)
-    return "\n".join(lines), page, total_pages
-
-
-def load_alert_state():
-    try:
-        with open(ALERT_STATE_PATH, "r", encoding="utf-8") as f:
-            value = json.load(f)
-        return value if isinstance(value, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        log_failure("alert state load", e)
-        return {}
-
-
-def save_alert_state(state):
-    tmp = ALERT_STATE_PATH + ".tmp"
-    os.makedirs(os.path.dirname(ALERT_STATE_PATH) or ".", exist_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, ALERT_STATE_PATH)
-    os.chmod(ALERT_STATE_PATH, 0o600)
-
-
-def load_auto_reset_state():
-    try:
-        with open(AUTO_RESET_STATE_PATH, "r", encoding="utf-8") as f:
-            value = json.load(f)
-        return value if isinstance(value, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        log_failure("auto reset state load", e)
-        return {}
-
-
-def save_auto_reset_state(state):
-    tmp = AUTO_RESET_STATE_PATH + ".tmp"
-    os.makedirs(os.path.dirname(AUTO_RESET_STATE_PATH) or ".", exist_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, AUTO_RESET_STATE_PATH)
-    os.chmod(AUTO_RESET_STATE_PATH, 0o600)
-
-
-def canonical_reset_timestamp(value):
-    parsed = parse_upstream_timestamp(value)
-    if parsed is None:
-        return None
-    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def configured_account_keys(bindings):
-    result = {}
-    for _user_id, binding in reset_candidates(bindings):
-        account_id = binding["account_id"]
-        if account_id is not None:
-            result.setdefault(account_id, []).append(binding["key_name"])
-    return result
-
-
-def notify_admins(admins, text):
-    delivered = 0
-    for admin_user_id in sorted(admins):
-        try:
-            tg("sendMessage", {"chat_id": admin_user_id, "text": text})
-            delivered += 1
-        except Exception as error:
-            log_failure(f"notify admin={masked_id(admin_user_id)}", error)
-    return delivered
-
-
-def auto_reset_approval_keyboard(account_id, token):
-    return json.dumps({"inline_keyboard": [[
-        {"text": "âœ… åŒæ„é‡ç½®", "callback_data": f"auto_approve:{account_id}:{token}"},
-        {"text": "âŒ ä¸é‡ç½®", "callback_data": f"auto_reject:{account_id}:{token}"},
-    ]]}, ensure_ascii=False)
-
-
-def notify_auto_reset_approval(admins, account_id, reset_at, key_names, token):
-    lines = [
-        "âš ï¸ æ£€æµ‹åˆ°ä¸Šæ¸¸è´¦å· 7 æ—¥çª—å£æ›´æ–°",
-        f"è´¦å· IDï¼š{account_id}",
-        f"æ–°çš„ 7 æ—¥é‡ç½®æ—¶é—´ï¼š{format_timestamp(reset_at)}",
-        "æ¶‰åŠ Keyï¼š" + "ã€".join(key_names),
-        "",
-        "è¯·åœ¨ 3 åˆ†é’Ÿå†…é€‰æ‹©ï¼›æ— äººæ“ä½œå°†è‡ªåŠ¨å¤‡ä»½å¹¶é‡ç½®ã€‚",
-    ]
-    delivered = 0
-    reply_markup = auto_reset_approval_keyboard(account_id, token)
-    for admin_user_id in sorted(admins):
-        try:
-            tg("sendMessage", {
-                "chat_id": admin_user_id,
-                "text": "\n".join(lines),
-                "reply_markup": reply_markup,
-            })
-            delivered += 1
-        except Exception as error:
-            log_failure(f"auto reset approval admin={masked_id(admin_user_id)}", error)
-    return delivered
-
-
-def execute_auto_reset_approval(state, account_id, account_state, admins, configured_key_names):
-    approval = account_state.get("approval")
-    if not isinstance(approval, dict) or approval.get("status") != "approved":
-        return []
-    pending_keys = approval.get("keys")
-    if not isinstance(pending_keys, list):
-        pending_keys = []
-    approval["keys"] = [key_name for key_name in pending_keys if key_name in configured_key_names]
-    results = []
-    for key_name in list(approval["keys"]):
-        try:
-            approval["keys"].remove(key_name)
-            save_auto_reset_state(state)
-            backup = backup_and_reset_key(key_name, account_id, "auto")
-            results.append({
-                "key_name": key_name,
-                "status": "success",
-                "backup_id": backup["backup_id"],
-                "backup": backup,
-            })
-            notify_admins(
-                admins,
-                "\n".join([
-                    "âœ… ä¸Šæ¸¸è´¦å·å‘¨çª—å£æ›´æ–°ï¼ŒKey å·²è‡ªåŠ¨é‡ç½®",
-                    f"è´¦å· IDï¼š{account_id}",
-                    f"Keyï¼š{key_name}",
-                    f"æ–°çš„ 7 æ—¥é‡ç½®æ—¶é—´ï¼š{format_timestamp(approval.get('reset_at'))}",
-                    f"å›žæ»šå¤‡ä»½ï¼š#{backup['backup_id']}",
-                    "",
-                    format_reset_backup_snapshot(key_name, backup),
-                ]),
-            )
-        except Exception as error:
-            if key_name in configured_key_names and key_name not in approval["keys"]:
-                approval["keys"].append(key_name)
-                try:
-                    save_auto_reset_state(state)
-                except Exception as state_error:
-                    log_failure(
-                        f"auto reset state restore account={masked_id(account_id)} key={key_name}",
-                        state_error,
-                    )
-            log_failure(f"auto reset account={masked_id(account_id)} key={key_name}", error)
-            results.append({"key_name": key_name, "status": "failed"})
-            notify_admins(
-                admins,
-                "\n".join([
-                    "âŒ ä¸Šæ¸¸è´¦å·å‘¨çª—å£æ›´æ–°ï¼Œä½† Key è‡ªåŠ¨é‡ç½®å¤±è´¥",
-                    f"è´¦å· IDï¼š{account_id}",
-                    f"Keyï¼š{key_name}",
-                    f"æ–°çš„ 7 æ—¥é‡ç½®æ—¶é—´ï¼š{format_timestamp(approval.get('reset_at'))}",
-                    "Bot å°†åœ¨ä¸‹æ¬¡æ£€æŸ¥æ—¶é‡è¯•ï¼Œä¹Ÿå¯ä»¥ä½¿ç”¨æ‰‹åŠ¨é‡ç½®åŠŸèƒ½ã€‚",
-                ]),
-            )
-    if not approval["keys"]:
-        account_state.pop("approval", None)
-    save_auto_reset_state(state)
-    return results
-
-
-def decide_auto_reset_approval(account_id, token, approve):
-    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-        raise ValueError("Invalid account ID")
-    if not re.fullmatch(r"[0-9a-f]{8}", token or ""):
-        raise ValueError("Invalid approval token")
-    with _AUTO_RESET_LOCK:
-        cfg = load_config()
-        bindings = config_bindings(cfg)
-        admins = config_admins(cfg)
-        account_keys = configured_account_keys(bindings)
-        state = load_auto_reset_state()
-        account_state = (state.get("accounts") or {}).get(str(account_id))
-        approval = account_state.get("approval") if isinstance(account_state, dict) else None
-        if (
-            not isinstance(approval, dict)
-            or approval.get("token") != token
-            or approval.get("status") != "pending"
-        ):
-            return {"status": "expired"}
-        if not approve:
-            account_state.pop("approval", None)
-            save_auto_reset_state(state)
-            notify_admins(admins, f"â›” ç®¡ç†å‘˜å·²æ‹’ç»è´¦å· {account_id} çš„æœ¬æ¬¡ Key è‡ªåŠ¨é‡ç½®ã€‚")
-            return {"status": "rejected"}
-        approval["status"] = "approved"
-        save_auto_reset_state(state)
-        notify_admins(admins, f"âœ… ç®¡ç†å‘˜å·²æ‰¹å‡†è´¦å· {account_id} çš„æœ¬æ¬¡ Key è‡ªåŠ¨é‡ç½®ï¼Œæ­£åœ¨æ‰§è¡Œã€‚")
-        results = execute_auto_reset_approval(
-            state,
-            account_id,
-            account_state,
-            admins,
-            account_keys.get(account_id, []),
-        )
-        return {"status": "approved", "results": results}
-
-
-def check_account_weekly_resets(now=None):
-    if not reset_api_configured():
-        return
-    now = time.time() if now is None else now
-    try:
-        with _AUTO_RESET_LOCK:
-            cfg = load_config()
-            bindings = config_bindings(cfg)
-            admins = config_admins(cfg)
-            account_keys = configured_account_keys(bindings)
-            state = load_auto_reset_state()
-            account_states = state.get("accounts")
-            if not isinstance(account_states, dict):
-                account_states = {}
-                state["accounts"] = account_states
-
-            configured_account_ids = {str(account_id) for account_id in account_keys}
-            changed = False
-            for stale_account_id in set(account_states) - configured_account_ids:
-                del account_states[stale_account_id]
-                changed = True
-
-            for account_id, key_names in account_keys.items():
-                account_state_key = str(account_id)
-                try:
-                    account_state = account_states.get(account_state_key)
-                    if isinstance(account_state, dict):
-                        had_legacy_pending_keys = "pending_keys" in account_state
-                        legacy_pending_keys = account_state.pop("pending_keys", [])
-                        if legacy_pending_keys and not isinstance(account_state.get("approval"), dict):
-                            account_state["approval"] = {
-                                "token": secrets.token_hex(4),
-                                "reset_at": account_state.get("observed_reset_at"),
-                                "deadline_at": None,
-                                "status": "pending",
-                                "keys": [key for key in legacy_pending_keys if key in key_names],
-                            }
-                        if had_legacy_pending_keys:
-                            changed = True
-
-                        approval = account_state.get("approval")
-                        if isinstance(approval, dict):
-                            approval["keys"] = [
-                                key for key in approval.get("keys", []) if key in key_names
-                            ]
-                            if not approval["keys"]:
-                                account_state.pop("approval", None)
-                                changed = True
-                            elif approval.get("deadline_at") is None:
-                                save_auto_reset_state(state)
-                                delivered = notify_auto_reset_approval(
-                                    admins,
-                                    account_id,
-                                    approval.get("reset_at"),
-                                    approval["keys"],
-                                    approval.get("token"),
-                                )
-                                if delivered:
-                                    approval["deadline_at"] = now + AUTO_RESET_APPROVAL_SECONDS
-                                    changed = True
-                            elif (
-                                approval.get("status") == "pending"
-                                and now >= approval.get("deadline_at")
-                            ):
-                                approval["status"] = "approved"
-                                save_auto_reset_state(state)
-                                notify_admins(
-                                    admins,
-                                    f"â±ï¸ 3 åˆ†é’Ÿå†…æ— äººæ“ä½œï¼Œè´¦å· {account_id} çš„ Key å°†è‡ªåŠ¨é‡ç½®ã€‚",
-                                )
-                                execute_auto_reset_approval(
-                                    state, account_id, account_state, admins, key_names,
-                                )
-                            elif approval.get("status") == "approved":
-                                execute_auto_reset_approval(
-                                    state, account_id, account_state, admins, key_names,
-                                )
-
-                    snapshot = query_account_weekly_reset(account_id) or {}
-                    if snapshot.get("error"):
-                        raise RuntimeError("Account weekly reset query did not return account data")
-                    current_reset_at = canonical_reset_timestamp(snapshot.get("reset_7d_at"))
-                    if current_reset_at is None:
-                        continue
-
-                    account_state = account_states.get(account_state_key)
-                    if not isinstance(account_state, dict):
-                        account_states[account_state_key] = {"observed_reset_at": current_reset_at}
-                        changed = True
-                        continue
-
-                    observed_reset_at = canonical_reset_timestamp(account_state.get("observed_reset_at"))
-
-                    if observed_reset_at is None:
-                        account_state["observed_reset_at"] = current_reset_at
-                        account_state.pop("approval", None)
-                        changed = True
-                        continue
-
-                    current_dt = parse_upstream_timestamp(current_reset_at)
-                    observed_dt = parse_upstream_timestamp(observed_reset_at)
-                    reset_advance_seconds = (current_dt - observed_dt).total_seconds()
-                    if reset_advance_seconds >= AUTO_RESET_MIN_ADVANCE_SECONDS:
-                        account_state["observed_reset_at"] = current_reset_at
-                        account_state["approval"] = {
-                            "token": secrets.token_hex(4),
-                            "reset_at": current_reset_at,
-                            "deadline_at": None,
-                            "status": "pending",
-                            "keys": list(key_names),
-                        }
-                        changed = True
-                        save_auto_reset_state(state)
-                        delivered = notify_auto_reset_approval(
-                            admins, account_id, current_reset_at, key_names,
-                            account_state["approval"]["token"],
-                        )
-                        if delivered:
-                            account_state["approval"]["deadline_at"] = (
-                                now + AUTO_RESET_APPROVAL_SECONDS
-                            )
-                        continue
-                    if reset_advance_seconds > 0:
-                        account_state["observed_reset_at"] = current_reset_at
-                        changed = True
-                        continue
-                except Exception as error:
-                    log_failure(f"auto reset check account={masked_id(account_id)}", error)
-            if changed:
-                save_auto_reset_state(state)
-    except Exception as error:
-        log_failure("auto reset scan", error)
-
-
-def check_weekly_alerts():
-    try:
-        cfg = load_config()
-        bindings = config_bindings(cfg)
-        state = load_alert_state()
-        changed = False
-        for user_id, binding in bindings.items():
-            try:
-                key_name = binding["key_name"]
-                data = query_key_usage(key_name, binding["account_id"]) or {}
-                key = data.get("key") or {}
-                limit = dec(key.get("rate_limit_7d"))
-                used = dec(key.get("usage_7d"))
-                if limit <= 0:
-                    continue
-                remaining = limit - used
-                ratio = remaining / limit
-                window = str(key.get("window_7d_start") or "unknown")
-                state_key = f"{user_id}:{key_name}:{window}"
-                if ratio <= Decimal("0.20") and state_key not in state:
-                    text = (
-                        f"âš ï¸ å‘¨é™é¢æé†’\n"
-                        f"Keyï¼š{key_name}\n"
-                        f"å‘¨é™é¢ï¼š{money(limit)}\n"
-                        f"å·²ç”¨ï¼š{money(used)}\n"
-                        f"å‰©ä½™ï¼š{money(max(remaining, Decimal('0')))}ï¼ˆ{money(max(ratio, Decimal('0')) * 100)}%ï¼‰"
-                    )
-                    tg("sendMessage", {"chat_id": user_id, "text": text})
-                    state[state_key] = {"alerted_at": time.time()}
-                    changed = True
-                    print(f"weekly alert sent user={masked_id(user_id)} remaining={ratio:.4f}", flush=True)
-            except Exception as e:
-                log_failure(f"weekly alert check user={masked_id(user_id)}", e)
-        if changed:
-            save_alert_state(state)
-    except Exception as e:
-        log_failure("weekly alert scan", e)
-
-
-def alert_loop():
-    time.sleep(10)
-    while True:
-        check_weekly_alerts()
-        time.sleep(max(ALERT_CHECK_INTERVAL, 60))
-
-
-def auto_reset_loop():
-    time.sleep(10)
-    while True:
-        check_account_weekly_resets()
-        time.sleep(max(AUTO_RESET_CHECK_INTERVAL, 60))
-
-
-def format_usage(key_name, data, now=None):
-    if data.get("error") == "duplicate_key_name":
-        return (
-            f"âš ï¸ æ£€æµ‹åˆ°å¤šä¸ªåŒå Keyï¼š{key_name}\n\n"
-            "ä¸ºé¿å…æ˜¾ç¤ºé”™è¯¯ç”¨æˆ·çš„æ•°æ®ï¼Œè¯·å…ˆåœ¨ Sub2API ä¸­å°† Key åç§°ä¿®æ”¹ä¸ºå”¯ä¸€åç§°ã€‚"
-        )
-    k = data.get("key")
-    if not k:
-        return f"æœªæ‰¾åˆ°ç»‘å®šçš„ keyï¼š{key_name}"
-    seven_days = data.get("seven_days") or {}
-    today = data.get("today") or {}
-    models_today = data.get("models_today") or []
-    models_7d = data.get("models_7d") or []
-    upstream_account = data.get("upstream_account") or {}
-    lines = [
-        f"ðŸ”‘ Keyï¼š{k.get('name')}",
-        f"ðŸ“… åˆ°æœŸæ—¶é—´ï¼š{format_key_expiry(k.get('expires_at'), now)}",
-        f"çŠ¶æ€ï¼š{format_status(k.get('status'))}",
-        "",
-        "â± é™é¢",
-    ]
-    append_limit(lines, "5 å°æ—¶", k.get("rate_limit_5h"), k.get("usage_5h"))
-    if dec(k.get("rate_limit_5h")) > 0:
-        append_account_reset(lines, upstream_account.get("reset_5h_at"), now)
-    append_limit(lines, "æ¯æ—¥", k.get("rate_limit_1d"), k.get("usage_1d"))
-    append_limit(lines, "æ¯å‘¨", k.get("rate_limit_7d"), k.get("usage_7d"))
-    if dec(k.get("rate_limit_7d")) > 0:
-        append_account_reset(lines, upstream_account.get("reset_7d_at"), now)
-    if upstream_account.get("error") == "not_found":
-        lines.append(f"  âš ï¸ æœªæ‰¾åˆ°é…ç½®çš„ä¸Šæ¸¸è´¦å· IDï¼š{upstream_account.get('id')}")
-    lines.extend([
-        "",
-        "ðŸ“… ä»Šæ—¥ç”¨é‡",
-        f"â€¢ è¯·æ±‚ï¼š{num(today.get('requests'))}",
-        f"â€¢ Tokensï¼šè¾“å…¥ {format_tokens(today.get('input_tokens'))} / è¾“å‡º {format_tokens(today.get('output_tokens'))}",
-        f"â€¢ ç¼“å­˜å æ¯”ï¼š{cache_percentage_text(today)}",
-        f"â€¢ è´¹ç”¨ï¼š{money(today.get('actual_cost'))}",
-    ])
-    append_model_section(lines, "ðŸ¤– ä»Šæ—¥æ¨¡åž‹ Top 5", models_today)
-    lines.extend([
-        "",
-        "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”",
-        "",
-        "ðŸ“Š 7å¤©ç”¨é‡",
-    ])
-    seven_days_range = format_date_range(seven_days.get("window_start"), seven_days.get("window_end"))
-    if seven_days_range:
-        lines.append(f"ç»Ÿè®¡èŒƒå›´ï¼š{seven_days_range}")
-    lines.extend([
-        f"â€¢ è¯·æ±‚ï¼š{num(seven_days.get('requests'))}",
-        f"â€¢ Tokensï¼šè¾“å…¥ {format_tokens(seven_days.get('input_tokens'))} / è¾“å‡º {format_tokens(seven_days.get('output_tokens'))}",
-        f"â€¢ ç¼“å­˜å æ¯”ï¼š{cache_percentage_text(seven_days)}",
-        f"â€¢ è´¹ç”¨ï¼š{money(seven_days.get('actual_cost'))}",
-    ])
-    if k.get("last_used_at"):
-        lines.append(f"â€¢ æœ€è¿‘ä½¿ç”¨ï¼š{format_timestamp(k.get('last_used_at'))}")
-    append_model_section(lines, "ðŸ¤– 7å¤©æ¨¡åž‹ Top 5", models_7d)
-    return "\n".join(lines)
-
-
-def is_private_user_chat(chat, user):
-    chat_id = chat.get("id")
-    user_id = user.get("id")
-    return chat.get("type") == "private" and chat_id is not None and str(chat_id) == str(user_id)
-
-
-def allow_check(user_id, now=None, cooldown=None):
-    now = time.monotonic() if now is None else now
-    cooldown = CHECK_COOLDOWN if cooldown is None else cooldown
-    with _RATE_LIMIT_LOCK:
-        last = _LAST_CHECK_BY_USER.get(user_id)
-        if last is not None and now - last < cooldown:
-            return False, max(1, int(cooldown - (now - last) + 0.999))
-        _LAST_CHECK_BY_USER[user_id] = now
-        if len(_LAST_CHECK_BY_USER) > 4096:
-            cutoff = now - max(max(CHECK_COOLDOWN, ADMIN_CHECK_COOLDOWN) * 2, 60)
-            stale = [key for key, value in _LAST_CHECK_BY_USER.items() if value < cutoff]
-            for key in stale:
-                _LAST_CHECK_BY_USER.pop(key, None)
-        return True, 0
-
-
-def handle_message(msg):
-    chat = msg.get("chat", {})
-    user = msg.get("from", {})
-    text_in = (msg.get("text") or "").strip()
-    chat_id = chat.get("id")
-    user_id = str(user.get("id"))
-    if not chat_id or not text_in:
-        return
-    cmd = text_in.split()[0].split("@", 1)[0].lower()
-    if cmd not in ("/start", "/check"):
-        return
-    if not is_private_user_chat(chat, user):
-        tg("sendMessage", {"chat_id": chat_id, "text": "ä¸ºä¿æŠ¤ç”¨é‡ä¿¡æ¯ï¼Œè¯·ç§èŠæœºå™¨äººæŸ¥è¯¢ã€‚"})
-        return
-    if cmd == "/start":
-        tg("sendMessage", {"chat_id": chat_id, "text": "å‘é€ /check æŸ¥è¯¢ä½ ç»‘å®šçš„ Sub2API key ç”¨é‡ã€‚"})
-        return
-    cfg = load_config()
-    bindings = config_bindings(cfg)
-    if user_id in config_admins(cfg):
-        if not bindings:
-            tg("sendMessage", {"chat_id": chat_id, "text": "å½“å‰æ²¡æœ‰é…ç½®ä»»ä½•ç”¨æˆ·ç»‘å®šã€‚"})
-            return
-        tg("sendMessage", {
-            "chat_id": chat_id,
-            "text": "è¯·é€‰æ‹©è¦æŸ¥çœ‹çš„ Keyï¼š",
-            "reply_markup": admin_keyboard(bindings),
-        })
-        return
-    allowed, retry_after = allow_check(user_id)
-    if not allowed:
-        tg("sendMessage", {"chat_id": chat_id, "text": f"æŸ¥è¯¢è¿‡äºŽé¢‘ç¹ï¼Œè¯· {retry_after} ç§’åŽå†è¯•ã€‚"})
-        return
-    binding = bindings.get(user_id)
-    if not binding:
-        tg("sendMessage", {"chat_id": chat_id, "text": "ä½ çš„ Telegram ID è¿˜æ²¡æœ‰ç»‘å®š keyã€‚"})
-        return
-    key_name = binding["key_name"]
-    t0 = time.perf_counter()
-    try:
-        data = query_key_usage(key_name, binding["account_id"])
-        t1 = time.perf_counter()
-        reply = format_usage(key_name, data or {})
-        t2 = time.perf_counter()
-        tg("sendMessage", {"chat_id": chat_id, "text": reply})
-        t3 = time.perf_counter()
-        print(f"check completed user={masked_id(user_id)} query={t1-t0:.3f}s format={t2-t1:.3f}s send={t3-t2:.3f}s total={t3-t0:.3f}s", flush=True)
-    except Exception as e:
-        log_failure(f"check user={masked_id(user_id)}", e)
-        tg("sendMessage", {"chat_id": chat_id, "text": "æŸ¥è¯¢å¤±è´¥ï¼Œè¯·ç¨åŽå†è¯•ã€‚"})
-
-
-def handle_callback_query(callback):
-    callback_id = callback.get("id")
-    callback_data = callback.get("data") or ""
-    message = callback.get("message") or {}
-    chat = message.get("chat") or {}
-    user = callback.get("from") or {}
-    user_id = str(user.get("id"))
-    action, separator, target_user_id = callback_data.partition(":")
-    if not callback_id or not separator or action not in {
-        "usage", "overview", "overview_back",
-        "batch_start", "batch_toggle", "batch_all", "batch_clear",
-        "batch_review", "batch_back", "batch_confirm", "batch_cancel",
-        "reset_prompt", "reset_confirm", "reset_cancel",
-        "auto_approve", "auto_reject",
-        "rollback_start", "rollback_key", "rollback_prompt",
-        "rollback_confirm", "rollback_back",
-    }:
-        return
-    if not is_private_user_chat(chat, user):
-        tg("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": "ä¸ºä¿æŠ¤ç”¨é‡ä¿¡æ¯ï¼Œè¯·ç§èŠæœºå™¨äººæŸ¥è¯¢ã€‚",
-            "show_alert": "true",
-        })
-        return
-    try:
-        cfg = load_config()
-        bindings = config_bindings(cfg)
-        if user_id not in config_admins(cfg):
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": "ä½ æ²¡æœ‰ç®¡ç†å‘˜æƒé™ã€‚",
-                "show_alert": "true",
-            })
-            return
-        if action in {"auto_approve", "auto_reject"}:
-            account_id_text, token_separator, token = target_user_id.partition(":")
-            if not token_separator or not account_id_text.isdigit():
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "å®¡æ‰¹ä¿¡æ¯æ— æ•ˆæˆ–å·²è¿‡æœŸã€‚",
-                    "show_alert": "true",
-                })
-                return
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": "æ­£åœ¨å¤„ç†æœ¬æ¬¡å†³å®šâ€¦",
-            })
-            decision = decide_auto_reset_approval(
-                int(account_id_text), token, action == "auto_approve",
-            )
-            status = decision.get("status")
-            if status == "expired":
-                decision_text = "âš ï¸ æœ¬æ¬¡è‡ªåŠ¨é‡ç½®å®¡æ‰¹å·²è¢«å…¶ä»–ç®¡ç†å‘˜å¤„ç†æˆ–å·²ç»å¤±æ•ˆã€‚"
-            elif status == "rejected":
-                decision_text = f"â›” å·²æ‹’ç»è´¦å· {account_id_text} çš„æœ¬æ¬¡ Key è‡ªåŠ¨é‡ç½®ã€‚"
-            else:
-                results = decision.get("results") or []
-                success_count = sum(result.get("status") == "success" for result in results)
-                failed_count = sum(result.get("status") == "failed" for result in results)
-                decision_text = (
-                    f"âœ… å·²æ‰¹å‡†è´¦å· {account_id_text} çš„æœ¬æ¬¡ Key è‡ªåŠ¨é‡ç½®ã€‚\n"
-                    f"æˆåŠŸï¼š{success_count}ï¼›å¤±è´¥å¾…é‡è¯•ï¼š{failed_count}"
-                )
-            tg("editMessageText", {
-                "chat_id": chat.get("id"),
-                "message_id": message.get("message_id"),
-                "text": decision_text,
-            })
-            return
-        if action.startswith("rollback_"):
-            chat_id = chat.get("id")
-            message_id = message.get("message_id")
-            if message_id is None:
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "è¯¥æ“ä½œå·²å¤±æ•ˆï¼Œè¯·é‡æ–°å‘é€ /checkã€‚",
-                    "show_alert": "true",
-                })
-                return
-            if action != "rollback_back" and not reset_api_configured():
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "å›žæ»šåŠŸèƒ½å°šæœªé…ç½®ã€‚",
-                    "show_alert": "true",
-                })
-                return
-            if action == "rollback_back":
-                tg("answerCallbackQuery", {"callback_query_id": callback_id})
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": "è¯·é€‰æ‹©è¦æŸ¥çœ‹çš„ Keyï¼š",
-                    "reply_markup": admin_keyboard(bindings),
-                })
-                return
-            if action == "rollback_start":
-                tg("answerCallbackQuery", {"callback_query_id": callback_id})
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": "â†©ï¸ è¯·é€‰æ‹©éœ€è¦å›žæ»šçš„ Keyï¼š",
-                    "reply_markup": rollback_key_keyboard(bindings),
-                })
-                return
-            rollback_user_id, backup_separator, backup_id_text = target_user_id.partition(":")
-            if action == "rollback_key":
-                rollback_user_id = target_user_id
-            if (
-                not rollback_user_id.isdigit()
-                or (action != "rollback_key" and (
-                    not backup_separator or not backup_id_text.isdigit()
-                ))
-            ):
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "å›žæ»šä¿¡æ¯æ— æ•ˆï¼Œè¯·é‡æ–°å¼€å§‹ã€‚",
-                    "show_alert": "true",
-                })
-                return
-            binding = bindings.get(rollback_user_id)
-            if not binding:
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "è¯¥ Key ç»‘å®šå·²ä¸å­˜åœ¨ã€‚",
-                    "show_alert": "true",
-                })
-                return
-            key_name = binding["key_name"]
-            if action == "rollback_key":
-                data = query_rate_limit_backups(key_name) or {}
-                backups = data.get("backups") or []
-                tg("answerCallbackQuery", {"callback_query_id": callback_id})
-                text = (
-                    f"â†©ï¸ {key_name} æœ€è¿‘çš„å›žæ»šå¤‡ä»½ï¼š"
-                    if backups else
-                    f"â†©ï¸ {key_name} æš‚æ— å¯å›žæ»šå¤‡ä»½ã€‚"
-                )
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": text,
-                    "reply_markup": rollback_backup_keyboard(rollback_user_id, backups),
-                })
-                return
-            backup_id = int(backup_id_text)
-            if action == "rollback_prompt":
-                _key_id, backup = find_rate_limit_backup(key_name, backup_id)
-                tg("answerCallbackQuery", {"callback_query_id": callback_id})
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": format_rollback_backup(key_name, backup),
-                    "reply_markup": rollback_confirmation_keyboard(rollback_user_id, backup_id),
-                })
-                return
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": f"æ­£åœ¨å›žæ»š {key_name}â€¦",
-            })
-            tg("editMessageText", {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": f"â³ æ­£åœ¨å›žæ»š {key_name} åˆ°å¤‡ä»½ #{backup_id}ï¼Œè¯·ç¨å€™â€¦",
-            })
-            result = rollback_key_rate_limits(
-                key_name, binding["account_id"], backup_id,
-            )
-            checked_key = result["key"]
-            tg("editMessageText", {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": "\n".join([
-                    "âœ… Key ä½¿ç”¨é‡å·²å®Œæ•´å›žæ»š",
-                    f"Keyï¼š{key_name}",
-                    f"å¤‡ä»½ï¼š#{backup_id}",
-                    f"5 å°æ—¶ï¼š{money(checked_key.get('usage_5h'))}",
-                    f"æ¯æ—¥ï¼š{money(checked_key.get('usage_1d'))}",
-                    f"æ¯å‘¨ï¼š{money(checked_key.get('usage_7d'))}",
-                    "Sub2API ç¼“å­˜å·²å®šå‘å¤±æ•ˆã€‚",
-                ]),
-                "reply_markup": admin_keyboard(bindings),
-            })
-            return
-        if action == "overview_back":
-            tg("answerCallbackQuery", {"callback_query_id": callback_id})
-            tg("editMessageText", {
-                "chat_id": chat.get("id"),
-                "message_id": message.get("message_id"),
-                "text": "è¯·é€‰æ‹©è¦æŸ¥çœ‹çš„ Keyï¼š",
-                "reply_markup": admin_keyboard(bindings),
-            })
-            return
-        if action == "overview":
-            if not target_user_id.isdigit():
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "æ€»è§ˆé¡µç æ— æ•ˆï¼Œè¯·é‡æ–°å‘é€ /checkã€‚",
-                    "show_alert": "true",
-                })
-                return
-            allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
-            if not allowed:
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": f"æŸ¥è¯¢è¿‡äºŽé¢‘ç¹ï¼Œè¯· {retry_after} ç§’åŽå†è¯•ã€‚",
-                    "show_alert": "true",
-                })
-                return
-            tg("answerCallbackQuery", {"callback_query_id": callback_id})
-            overview = collect_key_overview(bindings)
-            accounts = collect_account_overview(bindings)
-            reply, page, total_pages = format_key_overview(
-                overview, int(target_user_id), accounts=accounts
-            )
-            reply += f"\n\nðŸ”„ åˆ·æ–°æ—¶é—´ï¼š{format_refresh_timestamp(cfg)}"
-            tg("editMessageText", {
-                "chat_id": chat.get("id"),
-                "message_id": message.get("message_id"),
-                "text": reply,
-                "reply_markup": overview_keyboard(page, total_pages),
-            })
-            return
-        if action in {"reset_prompt", "reset_confirm", "reset_cancel"}:
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": "é‡ç½®å…¥å£å·²æ›´æ–°ï¼Œè¯·é‡æ–°å‘é€ /checkã€‚",
-                "show_alert": "true",
-            })
-            return
-        if action.startswith("batch_"):
-            chat_id = chat.get("id")
-            message_id = message.get("message_id")
-            if message_id is None:
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "è¯¥æ“ä½œå·²å¤±æ•ˆï¼Œè¯·é‡æ–°å‘é€ /checkã€‚",
-                    "show_alert": "true",
-                })
-                return
-            if action != "batch_cancel" and not reset_api_configured():
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "é‡ç½®åŠŸèƒ½å°šæœªé…ç½®ã€‚",
-                    "show_alert": "true",
-                })
-                return
-            candidates = reset_candidates(bindings)
-            valid_user_ids = {candidate_user_id for candidate_user_id, _binding in candidates}
-            if action == "batch_start":
-                if not candidates:
-                    tg("answerCallbackQuery", {
-                        "callback_query_id": callback_id,
-                        "text": "å½“å‰æ²¡æœ‰å¯é‡ç½®çš„ Keyã€‚",
-                        "show_alert": "true",
-                    })
-                    return
-                selected_user_ids = start_batch_reset_session(user_id, chat_id, message_id)
-                tg("answerCallbackQuery", {"callback_query_id": callback_id})
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": batch_reset_selection_text(0, len(candidates)),
-                    "reply_markup": batch_reset_keyboard(bindings, selected_user_ids),
-                })
-                return
-            if action == "batch_cancel":
-                finish_batch_reset_session(user_id, chat_id, message_id)
-                tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": "å·²å–æ¶ˆ"})
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": "è¯·é€‰æ‹©è¦æŸ¥çœ‹çš„ Keyï¼š",
-                    "reply_markup": admin_keyboard(bindings),
-                })
-                return
-            if action == "batch_confirm":
-                selected_user_ids = finish_batch_reset_session(
-                    user_id, chat_id, message_id, valid_user_ids,
-                )
-                if selected_user_ids is None:
-                    tg("answerCallbackQuery", {
-                        "callback_query_id": callback_id,
-                        "text": "é€‰æ‹©å·²è¿‡æœŸï¼Œè¯·é‡æ–°å¼€å§‹ã€‚",
-                        "show_alert": "true",
-                    })
-                    return
-                if not selected_user_ids:
-                    tg("answerCallbackQuery", {
-                        "callback_query_id": callback_id,
-                        "text": "æ‰€é€‰ Key å·²ä¸å­˜åœ¨ï¼Œè¯·é‡æ–°å¼€å§‹ã€‚",
-                        "show_alert": "true",
-                    })
-                    return
-                selected_count = len(selected_user_ids)
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": f"æ­£åœ¨é‡ç½® {selected_count} ä¸ª Keyâ€¦",
-                })
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": f"â³ æ­£åœ¨é‡ç½®å¹¶å¤æŸ¥ {selected_count} ä¸ª Keyï¼Œè¯·ç¨å€™â€¦",
-                })
-                results = reset_selected_keys(bindings, selected_user_ids)
-                reset_backup_text = format_reset_backup_snapshots(results)
-                if reset_backup_text:
-                    notify_admins(config_admins(cfg), reset_backup_text)
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": format_batch_reset_results(results, cfg),
-                    "reply_markup": admin_keyboard(bindings),
-                })
-                return
-            operation = {
-                "batch_toggle": "toggle",
-                "batch_all": "all",
-                "batch_clear": "clear",
-                "batch_review": "keep",
-                "batch_back": "keep",
-            }[action]
-            selected_user_ids = change_batch_reset_selection(
-                user_id,
-                chat_id,
-                message_id,
-                valid_user_ids,
-                operation,
-                target_user_id if operation == "toggle" else None,
-            )
-            if selected_user_ids is None:
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "é€‰æ‹©å·²è¿‡æœŸæˆ– Key å·²å˜æ›´ï¼Œè¯·é‡æ–°å¼€å§‹ã€‚",
-                    "show_alert": "true",
-                })
-                return
-            if action == "batch_review":
-                if not selected_user_ids:
-                    tg("answerCallbackQuery", {
-                        "callback_query_id": callback_id,
-                        "text": "è¯·è‡³å°‘é€‰æ‹©ä¸€ä¸ª Keyã€‚",
-                        "show_alert": "true",
-                    })
-                    return
-                tg("answerCallbackQuery", {"callback_query_id": callback_id})
-                tg("editMessageText", {
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": batch_reset_review_text(bindings, selected_user_ids),
-                    "reply_markup": batch_reset_confirmation_keyboard(len(selected_user_ids)),
-                })
-                return
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": f"å·²é€‰æ‹© {len(selected_user_ids)} ä¸ª Key",
-            })
-            tg("editMessageText", {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": batch_reset_selection_text(len(selected_user_ids), len(candidates)),
-                "reply_markup": batch_reset_keyboard(bindings, selected_user_ids),
-            })
-            return
-        binding = bindings.get(target_user_id)
-        if not binding:
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": "è¯¥ç»‘å®šå·²ä¸å­˜åœ¨ï¼Œè¯·é‡æ–°å‘é€ /checkã€‚",
-                "show_alert": "true",
-            })
-            return
-        key_name = binding["key_name"]
-        allowed, retry_after = allow_check(user_id, cooldown=ADMIN_CHECK_COOLDOWN)
-        if not allowed:
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": f"æŸ¥è¯¢è¿‡äºŽé¢‘ç¹ï¼Œè¯· {retry_after} ç§’åŽå†è¯•ã€‚",
-                "show_alert": "true",
-            })
-            return
-        tg("answerCallbackQuery", {"callback_query_id": callback_id})
-        data = query_key_usage(key_name, binding["account_id"])
-        reply = format_usage(key_name, data or {})
-        reply += f"\n\nðŸ”„ åˆ·æ–°æ—¶é—´ï¼š{format_refresh_timestamp(cfg)}"
-        tg("editMessageText", {
-            "chat_id": chat.get("id"),
-            "message_id": message.get("message_id"),
-            "text": reply,
-            "reply_markup": admin_keyboard(bindings, target_user_id),
-        })
-    except Exception as error:
-        log_failure(f"admin {action} user={masked_id(user_id)}", error)
-        if action == "batch_confirm":
-            error_text = "æ‰¹é‡é‡ç½®æ‰§è¡Œå¼‚å¸¸ï¼Œè¯·é‡æ–°å‘é€ /check æŸ¥è¯¢å½“å‰ç”¨é‡ã€‚"
-        elif action.startswith("batch_"):
-            error_text = "æ‰¹é‡é‡ç½®æ“ä½œå¤±è´¥ï¼Œè¯·é‡æ–°å‘é€ /checkã€‚"
-        elif action.startswith("rollback_"):
-            error_text = "å›žæ»šæ“ä½œå¤±è´¥ï¼›å¤‡ä»½ä»ä¿ç•™ï¼Œè¯·é‡æ–°å‘é€ /check åŽé‡è¯•ã€‚"
-        elif action.startswith("overview"):
-            error_text = "æ€»è§ˆæŸ¥è¯¢å¤±è´¥ï¼Œè¯·ç¨åŽå†è¯•ã€‚"
-        else:
-            error_text = "æŸ¥è¯¢å¤±è´¥ï¼Œè¯·ç¨åŽå†è¯•ã€‚"
-        tg("sendMessage", {"chat_id": chat.get("id"), "text": error_text})
-
-
-def handle_update(update):
-    message = update.get("message")
-    if isinstance(message, dict):
-        handle_message(message)
-        return
-    callback = update.get("callback_query")
-    if isinstance(callback, dict):
-        handle_callback_query(callback)
-
-
-class UpdateDispatcher:
-    def __init__(self, workers, max_pending):
-        self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="telegram-update")
-        self.slots = threading.BoundedSemaphore(max_pending)
-        self.seen_lock = threading.Lock()
-        self.seen_updates = {}
-
-    def submit(self, update_id, update):
-        now = time.monotonic()
-        with self.seen_lock:
-            cutoff = now - 86400
-            stale = [key for key, value in self.seen_updates.items() if value < cutoff]
-            for key in stale:
-                self.seen_updates.pop(key, None)
-            if update_id in self.seen_updates:
-                return "duplicate"
-            if len(self.seen_updates) >= 4096:
-                oldest = min(self.seen_updates, key=self.seen_updates.get)
-                self.seen_updates.pop(oldest, None)
-            if not self.slots.acquire(blocking=False):
-                return "busy"
-            self.seen_updates[update_id] = now
-        try:
-            future = self.executor.submit(handle_update, update)
-        except Exception:
-            with self.seen_lock:
-                self.seen_updates.pop(update_id, None)
-            self.slots.release()
-            raise
-        future.add_done_callback(self._completed)
-        return "accepted"
-
-    def _completed(self, future):
-        self.slots.release()
-        if future.cancelled():
-            return
-        error = future.exception()
-        if error is not None:
-            log_failure("webhook update", error)
-
-    def shutdown(self):
-        self.executor.shutdown(wait=True, cancel_futures=True)
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "Sub2ApiTgBot/1.2"
-
-    def setup(self):
-        super().setup()
-        self.connection.settimeout(10)
-
-    def respond(self, status, body=b""):
-        self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path == "/health":
-            self.respond(200, b"ok")
-        else:
-            self.respond(404)
-
-    def log_message(self, fmt, *args):
-        return
-
-
-def dispatch_update_batch(updates, dispatcher, offset=None):
-    for update in updates:
-        if not isinstance(update, dict) or type(update.get("update_id")) is not int:
-            continue
-        update_id = update["update_id"]
-        next_offset = max(offset or 0, update_id + 1)
-        if not isinstance(update.get("message"), dict) and not isinstance(update.get("callback_query"), dict):
-            offset = next_offset
-            continue
-        result = dispatcher.submit(update_id, update)
-        if result == "busy":
-            return offset, True
-        offset = next_offset
-    return offset, False
-
-
-def poll_updates(dispatcher, stop_event):
-    offset = None
-    failures = 0
-    while not stop_event.is_set():
-        params = {
-            "timeout": str(POLL_TIMEOUT),
-            "limit": "100",
-            "allowed_updates": json.dumps(["message", "callback_query"]),
-        }
-        if offset is not None:
-            params["offset"] = str(offset)
-        try:
-            updates = tg("getUpdates", params, timeout=POLL_TIMEOUT + 5)
-            if not isinstance(updates, list):
-                raise RuntimeError("Telegram getUpdates returned a non-list result")
-            offset, busy = dispatch_update_batch(updates, dispatcher, offset)
-            failures = 0
-            if busy:
-                stop_event.wait(1)
-        except Exception as error:
-            log_failure("telegram polling", error)
-            failures += 1
-            stop_event.wait(min(30, 2 ** min(failures - 1, 5)))
-
-
-def main():
-    validate_runtime_config()
-    stop_event = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
-    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
-    tg("deleteWebhook", {"drop_pending_updates": "false"})
-    tg("setMyCommands", {"commands": json.dumps([
-        {"command": "check", "description": "æŸ¥è¯¢ç»‘å®š key çš„ç”¨é‡"},
-        {"command": "start", "description": "ä½¿ç”¨è¯´æ˜Ž"},
-    ], ensure_ascii=False)})
-    print("sub2api tg bot long polling started", flush=True)
-    threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
-    if reset_api_configured():
-        threading.Thread(target=auto_reset_loop, name="account-weekly-resets", daemon=True).start()
-    dispatcher = UpdateDispatcher(UPDATE_WORKERS, UPDATE_MAX_PENDING)
-    httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    httpd.daemon_threads = True
-    health_thread = threading.Thread(target=httpd.serve_forever, name="health-server", daemon=True)
-    health_thread.start()
-    try:
-        poll_updates(dispatcher, stop_event)
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        health_thread.join(timeout=2)
-        dispatcher.shutdown()
-
-
-if __name__ == "__main__":
-    main()
+þŠmþ&yºÞÃòân¶«Ëñè™æë{Ü™ßì…éez{ì†X§{nÿn)ÿ¦Ã©z¶­Š‰ç¢Ú^®h­µçHÈKÝ\Ü‹Øš[‹Ù[ˆ]ÛŒÂš[\ÜœÛÛ‚š[\ÜÜÂš[\Ü™Bš[\ÜÙXÜ™]Âš[\ÜÚYÛ˜[š[\Ü™XY[™Âš[\ÜÝXœ›ØÙ\ÜÂš[\ÜÞ\Âš[\Ü[YBš[\Ü\›X‹œ\œÙBš[\Ü\›X‹œ™\]Y\Ý™œ›ÛHÛÛ˜Ý\œ™[™]\™\È[\Ü™XYÛÛ^XÝ]Ü‚™œ›ÛH]][YH[\Ü]][YK[Y^›Û™B™œ›ÛHXÚ[X[[\ÜXÚ[X[[˜[YÜ\˜][Û‚™œ›ÛHœÙ\™\ˆ[\Ü˜\ÙR™\]Y\Ý[™\‹™XY[™ÒÙ\™\‚™œ›ÛH›Û™Z[™›È[\Ü›Û™R[™›Â‚‚™Yˆ™XYÜÙXÜ™]
+˜[YJN‚ˆ˜[YHHÜË™[š\›Û‹™Ù]
+˜[YKˆŠBˆš[WÜ]HÜË™[š\›Û‹™Ù]
+ˆžÛ˜[Y_WÑ’SH‹ˆŠKœÝš\
+
+BˆYˆ˜[YH[™š[WÜ]‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ”Ù]Û›HÛ™HÙˆÛ˜[Y_HÜˆÛ˜[Y_WÑ’SHŠBˆYˆ›Ýš[WÜ]‚ˆ™]\›ˆ˜[YBˆYˆ›ÝÜËœ]š\ØXœÊš[WÜ]
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆžÛ˜[Y_WÑ’SH]\Ý™H[ˆXœÛÛ]H]ŠBˆžN‚ˆÚ]Ü[Šš[WÜ]œˆ‹[˜ÛÙ[™ÏH]‹NŠH\ÈÙXÜ™]Ùš[N‚ˆ˜[YHHÙXÜ™]Ùš[Kœ™XY
+MÊBˆ^Ù\ÔÑ\œ›Üˆ\È\œ›ÜŽ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ•[˜X›HÈ™XYÛ˜[Y_WÑ’SHŠHœ›ÛH\œ›Ü‚ˆYˆ[Š˜[YJHˆMŽ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆžÛ˜[Y_WÑ’SH\ÈÛÈ\™ÙHŠBˆ™]\›ˆ˜[YKœœÝš\
+——ˆŠB‚‚TÑWÑTˆHÜËœ]™\›˜[YJÜËœ]˜XœÜ]
+×Ùš[W×ÊJBÓÓ‘’Q×ÔUHÜË™[š\›Û‹™Ù]
+”ÕPŒTWÕ×Ð“ÕÐÓÓ‘’QÈ‹ÜËœ]š›Ú[ŠTÑWÑT‹˜ÛÛ™šYËšœÛÛˆŠJB•ÒÑSˆH™XYÜÙXÜ™]
+•SQÔSWÐ“ÕÕÒÑSˆŠKœÝš\
+
+B”ÕPŒTWÐTÑWÕT“HÜË™[š\›Û‹™Ù]
+”ÕPŒTWÐTÑWÕT“‹ˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠB”ÕPŒTWÐQRS—ÐTWÒÑVHH™XYÜÙXÜ™]
+”ÕPŒTWÐQRS—ÐTWÒÑVHŠKœÝš\
+
+B”ÕPŒTWÐQRS—ÕSQSÕUH[
+ÜË™[š\›Û‹™Ù]
+”ÕPŒTWÐQRS—ÕSQSÕU‹ŒLŠJB“TÕS—ÒÔÕHÜË™[š\›Û‹™Ù]
+“TÕS—ÒÔÕ‹ŒLËŒŒŒHŠB“TÕS—ÔÔ•H[
+ÜË™[š\›Û‹™Ù]
+“TÕS—ÔÔ•‹ŽNHŠJBST•ÔÕUWÔUHÜË™[š\›Û‹™Ù]
+ST•ÔÕUWÔU‹ÜËœ]š›Ú[ŠTÑWÑT‹˜[\ÜÝ]KšœÛÛˆŠJBST•ÐÒPÒ×ÒS•T•SH[
+ÜË™[š\›Û‹™Ù]
+ST•ÐÒPÒ×ÒS•T•S‹ŒŠJBUU×Ô‘TÑUÔÕUWÔUHÜË™[š\›Û‹™Ù]
+ˆUU×Ô‘TÑUÔÕUWÔU‹ÜËœ]š›Ú[ŠTÑWÑT‹˜]]×Ü™\Ù]ÜÝ]KšœÛÛˆŠBŠBUU×Ô‘TÑUÐÒPÒ×ÒS•T•SH[
+ÜË™[š\›Û‹™Ù]
+UU×Ô‘TÑUÐÒPÒ×ÒS•T•S‹ŒŠJB”ÔSÐ’SˆHÜË™[š\›Û‹™Ù]
+”ÔSÐ’Sˆ‹‹Ý\Ü‹Øš[‹ÜÜ[ŠKœÝš\
+
+B”ÒÔÕHÜË™[š\›Û‹™Ù]
+”ÒÔÕ‹ŒLËŒŒŒHŠKœÝš\
+
+B”ÔÔ•HÜË™[š\›Û‹™Ù]
+”ÔÔ•‹MÌˆŠKœÝš\
+
+B”ÑUPTÑHHÜË™[š\›Û‹™Ù]
+”ÑUPTÑH‹œÝXŒ˜\HŠKœÝš\
+
+B”ÕTÑTˆHÜË™[š\›Û‹™Ù]
+”ÕTÑTˆ‹œÝXŒ˜\WÝ×Ø›ÝŠKœÝš\
+
+B”ÔTÔÕÓÔ‘H™XYÜÙXÜ™]
+”ÔTÔÕÓÔ‘ŠB”ÔÔÓSÑHHÜË™[š\›Û‹™Ù]
+”ÔÔÓSÑH‹œ™Y™\ˆŠKœÝš\
+
+B”×ÐSÕ×ÒS”ÑPÕT‘WÔ’UUWÓ‘UÓÔ’ÈHÜË™[š\›Û‹™Ù]
+”×ÐSÕ×ÒS”ÑPÕT‘WÔ’UUWÓ‘UÓÔ’È‹ŒŠKœÝš\
+
+B•TUWÕÓÔ’ÑT”ÈH[
+ÜË™[š\›Û‹™Ù]
+•TUWÕÓÔ’ÑT”È‹ŠJB•TUWÓPVÔS‘S‘ÈH[
+ÜË™[š\›Û‹™Ù]
+•TUWÓPVÔS‘S‘È‹ŒMˆŠJBÒPÒ×ÐÓÓÓÕÓˆH[
+ÜË™[š\›Û‹™Ù]
+ÒPÒ×ÐÓÓÓÕÓˆ‹ŒLŠJBQRS—ÐÒPÒ×ÐÓÓÓÕÓˆH[
+ÜË™[š\›Û‹™Ù]
+QRS—ÐÒPÒ×ÐÓÓÓÕÓˆ‹ŒˆŠJB”ÓÕSQSÕUH[
+ÜË™[š\›Û‹™Ù]
+”ÓÕSQSÕU‹ŒLŠJBTHHˆšÎ‹ËØ\K[YÜ˜[K›Ü™ËØ›ÝÕÒÑSŸH‚’ÑVWÓSQWÔ‘HH™K˜ÛÛ\[Jˆ—–×ÈŽ
+ËW^ÌKLIŠB”×ÓSQWÔ‘HH™K˜ÛÛ\[Jˆ—–ÐKV˜K^—×VÐKV˜K^ŒNWË‹W^ÌŒŸIŠBÓÓTÔÑWÔÑT•’PÑWÓSQWÔ‘HH™K˜ÛÛ\[Jˆ—–ÐKV˜K^ŒNWVÐKV˜K^ŒNWËW^ÌŒŸIŠB”ÔSÕT’PP“WÔ‘HH™K˜ÛÛ\[Jˆ—–ÐKV˜K^—×VÐKV˜K^ŒNW×J‰ŠB—ÔUWÓSRUÓÐÒÈH™XY[™Ë“ØÚÊ
+B—ÓTÕÐÒPÒ×Ð–WÕTÑTˆHßB—ÐUÒÔ‘TÑUÓÐÒÈH™XY[™Ë“ØÚÊ
+B—ÐUÒÔ‘TÑUÔÑTÔÒSÓ”ÈHßB—ÐUU×Ô‘TÑUÓÐÒÈH™XY[™Ë“ØÚÊ
+B—Ô‘TÑUÓÔTUSÓ—ÓÐÒÈH™XY[™Ë“ØÚÊ
+BUÒÔ‘TÑUÔÑTÔÒSÓ—ÕHÌUU×Ô‘TÑUÓRS—ÐQSÑWÔÑPÓÓ‘ÈHÍŒUU×Ô‘TÑUÐT“ÕSÔÑPÓÓ‘ÈHN“Õ‘T•’QU×ÔQÑWÔÒV‘HH’TÒTÕÔ–WÔQÑWÔÒV‘HHL‚‚™YˆÙ×Ù˜Z[\™J]™[\œ›ÜŠN‚ˆš[
+ˆžÙ]™[H˜Z[Y\œ›Ü^Ý\J\œ›ÜŠK—×Û˜[YW×ßH‹š[O\Þ\ËœÝ\œ‹›\ÚUYJB‚‚™YˆX\ÚÙYÚY
+˜[YJN‚ˆ˜[YHHÝŠ˜[YHÜˆˆŠBˆ™]\›ˆŠŠŠˆˆ
+È˜[YVËM—HYˆ˜[YH[ÙH[šÛ›ÝÛˆ‚‚‚™Yˆ˜[Y]WÜ[[YWØÛÛ™šYÊ
+N‚ˆYˆ›ÝÒÑSˆÜˆŽˆˆ›Ý[ˆÒÑSˆÜˆœ™\XÙWÛYHˆ[ˆÒÑS‹›ÝÙ\Š
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ•SQÔSWÐ“ÕÕÒÑSˆ\ÈZ\ÜÚ[™ÈÜˆ[˜[YŠBˆYˆ›ÝHHTUWÕÓÔ’ÑT”ÈHÌŽ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ•TUWÕÓÔ’ÑT”È]\Ý™H™]ÙY[ˆH[™ÌˆŠBˆYˆ›ÝTUWÕÓÔ’ÑT”ÈHTUWÓPVÔS‘S‘ÈHMŽ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ•TUWÓPVÔS‘S‘È]\Ý™H™]ÙY[ˆTUWÕÓÔ’ÑT”È[™MˆŠBˆYˆ›ÝHHÒPÒ×ÐÓÓÓÕÓˆHÍŒ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠÒPÒ×ÐÓÓÓÕÓˆ]\Ý™H™]ÙY[ˆH[™ÍŒÙXÛÛ™ÈŠBˆYˆ›ÝHHQRS—ÐÒPÒ×ÐÓÓÓÕÓˆHÍŒ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠQRS—ÐÒPÒ×ÐÓÓÓÕÓˆ]\Ý™H™]ÙY[ˆH[™ÍŒÙXÛÛ™ÈŠBˆYˆ›ÝHHÓÕSQSÕUHL‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÓÕSQSÕU]\Ý™H™]ÙY[ˆH[™LÙXÛÛ™ÈŠBˆYˆ›ÝHHÕPŒTWÐQRS—ÕSQSÕUHŒ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÕPŒTWÐQRS—ÕSQSÕU]\Ý™H™]ÙY[ˆH[™ŒÙXÛÛ™ÈŠBˆYˆ›ÝŒHUU×Ô‘TÑUÐÒPÒ×ÒS•T•SHÍŒ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠUU×Ô‘TÑUÐÒPÒ×ÒS•T•S]\Ý™H™]ÙY[ˆŒ[™ÍŒÙXÛÛ™ÈŠBˆYˆ›ÛÛ
+ÕPŒTWÐTÑWÕT“
+HOH›ÛÛ
+ÕPŒTWÐQRS—ÐTWÒÑVJN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÕPŒTWÐTÑWÕT“[™ÕPŒTWÐQRS—ÐTWÒÑVH]\Ý™HÛÛ™šYÝ\™YÙÙ]\ˆŠBˆYˆÕPŒTWÐTÑWÕT“‚ˆ\œÙYH\›X‹œ\œÙK\›Ü]
+ÕPŒTWÐTÑWÕT“
+BˆYˆ
+ˆ\œÙYœØÚ[YH›Ý[ˆÈš‹šÈŸBˆÜˆ›Ý\œÙYšÜÝ˜[YBˆÜˆ\œÙY\Ù\›˜[YH\È›Ý›Û™BˆÜˆ\œÙYœ\ÜÝÛÜ™\È›Ý›Û™BˆÜˆ\œÙYœ]Y\žBˆÜˆ\œÙY™œ˜YÛY[ˆ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÕPŒTWÐTÑWÕT“\È[˜[YŠBˆžN‚ˆ\œÙYœÜˆ^Ù\˜[YQ\œ›Üˆ\È\œ›ÜŽ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÕPŒTWÐTÑWÕT“\È[˜[YŠHœ›ÛH\œ›Ü‚ˆØØ[ÚÜÝÈHÈŒLËŒŒŒH‹ŽŽŒH‹›ØØ[ÜÝŸBˆYˆ
+ˆ\œÙYœØÚ[YHOHš‚ˆ[™\œÙYšÜÝ˜[YH›Ý[ˆØØ[ÚÜÝÂˆ[™›ÝÓÓTÔÑWÔÑT•’PÑWÓSQWÔ‘K™[X]Ú
+\œÙYšÜÝ˜[YJBˆ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÕPŒTWÐTÑWÕT“]\Ý\ÙHÈÝ]ÚYHHš]˜]HÛÛ\ÜÙH™]ÛÜšÈŠBˆYˆ
+ˆ›ÝÕPŒTWÐQRS—ÐTWÒÑVBˆÜˆœ™\XÙWÛYHˆ[ˆÕPŒTWÐQRS—ÐTWÒÑVK›ÝÙ\Š
+BˆÜˆ[žJÚ\ˆ[ˆÕPŒTWÐQRS—ÐTWÒÑVH›ÜˆÚ\ˆ[ˆ———ŠBˆ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÕPŒTWÐQRS—ÐTWÒÑVH\È[˜[YŠBˆYˆ›ÝÜËœ]š\ØXœÊÔSÐ’SŠHÜˆ›ÝÜËœ]š\Ùš[JÔSÐ’SŠHÜˆ›ÝÜË˜XØÙ\ÜÊÔSÐ’S‹ÜË–ÓÒÊN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÔSÐ’Sˆ]\ÝÚ[È[ˆ^XÝ]X›HÜ[ÛY[ŠBˆYˆ›ÝÒÔÕÜˆ[žJÚ\ˆ[ˆÒÔÕ›ÜˆÚ\ˆ[ˆ———ŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÒÔÕ\ÈZ\ÜÚ[™ÈÜˆ[˜[YŠBˆYˆ›ÝÔÔ•š\ÙYÚ]
+
+HÜˆ›ÝHH[
+ÔÔ•
+HHMLÍN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÔÔ•]\Ý™H™]ÙY[ˆH[™MLÍHŠBˆYˆ›Ý×ÓSQWÔ‘K™[X]Ú
+ÑUPTÑJHÜˆ›Ý×ÓSQWÔ‘K™[X]Ú
+ÕTÑTŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÑUPTÑH[™ÕTÑTˆÛÛZ[ˆ[˜[YÚ\˜XÝ\œÈŠBˆYˆ›ÝÔTÔÕÓÔ‘Üˆœ™\XÙWÛYHˆ[ˆÔTÔÕÓÔ‘›ÝÙ\Š
+HÜˆ[žJÚ\ˆ[ˆÔTÔÕÓÔ‘›ÜˆÚ\ˆ[ˆ———ŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÔTÔÕÓÔ‘]\ÝÛÛZ[ˆH™XY[Û›H›Ý]X˜\ÙH\ÜÝÛÜ™ŠBˆYˆÔÔÓSÑH›Ý[ˆÈ™\ØX›H‹˜[ÝÈ‹œ™Y™\ˆ‹œ™\]Z\™H‹™\šYžKXØH‹™\šYžKY[ŸN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÔÔÓSÑH\È[˜[YŠBˆYˆ×ÐSÕ×ÒS”ÑPÕT‘WÔ’UUWÓ‘UÓÔ’È›Ý[ˆÈŒ‹ŒHŸN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”×ÐSÕ×ÒS”ÑPÕT‘WÔ’UUWÓ‘UÓÔ’È]\Ý™HÜˆHŠBˆ]X˜\ÙWÚ\×ÛØØ[HÒÔÕ[ˆÈŒLËŒŒŒH‹ŽŽŒH‹›ØØ[ÜÝŸHÜˆÒÔÕœÝ\ÝÚ]
+‹ÈŠBˆ]X˜\ÙWÝ\Ù\×ÝÈHÔÔÓSÑH[ˆÈœ™\]Z\™H‹™\šYžKXØH‹™\šYžKY[ŸBˆYˆ›Ý]X˜\ÙWÚ\×ÛØØ[[™›Ý]X˜\ÙWÝ\Ù\×ÝÎ‚ˆYˆ
+ˆ×ÐSÕ×ÒS”ÑPÕT‘WÔ’UUWÓ‘UÓÔ’ÈOHŒH‚ˆÜˆÔÔÓSÑHOH™\ØX›H‚ˆÜˆ›ÝÓÓTÔÑWÔÑT•’PÑWÓSQWÔ‘K™[X]Ú
+ÒÔÕ
+Bˆ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ”™[[ÝHÜÝÜ™TÔS]\Ý\ÙHËÜˆ^XÚ]H[ÝÈHÚ[™ÛK[X™[ÛÛ\ÜÙHÙ\šXÙH‚ˆ›ÛˆH\ÝYš]˜]H™]ÛÜšÈÚ]ÔÔÓSÑOY\ØX›H‚ˆ
+B‚‚™YˆØYØÛÛ™šYÊ
+N‚ˆÚ]Ü[ŠÓÓ‘’Q×ÔUœˆ‹[˜ÛÙ[™ÏH]‹NŠH\ÈŽ‚ˆ™]\›ˆœÛÛ‹›ØY
+ŠB‚‚™YˆÛÛ™šY×Øš[™[™ÜÊÛÛ™šYÊN‚ˆš[™[™ÜÈHÛÛ™šYË™Ù]
+˜š[™[™ÜÈŠHÜˆßBˆYˆ›Ý\Ú[œÝ[˜ÙJš[™[™ÜËXÝ
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜š[™[™ÜÈ]\Ý™H[ˆØš™XÝŠBˆ›Ü›X[^™YHßBˆ›Üˆ\Ù\—ÚY˜[YH[ˆš[™[™ÜËš][\Ê
+N‚ˆ\Ù\—ÚYHÝŠ\Ù\—ÚY
+BˆYˆ\Ú[œÝ[˜ÙJ˜[YKÝŠN‚ˆÙ^WÛ˜[YHH˜[YBˆXØÛÝ[ÚYH›Û™Bˆ[Yˆ\Ú[œÝ[˜ÙJ˜[YKXÝ
+N‚ˆYˆÙ]
+˜[YJHOHÈšÙ^WÛ˜[YH‹˜XØÛÝ[ÚYŸN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[™[™ÈØš™XÝÈ]\ÝÛÛZ[ˆÛ›HÙ^WÛ˜[YH[™XØÛÝ[ÚYŠBˆÙ^WÛ˜[YHH˜[YK™Ù]
+šÙ^WÛ˜[YHŠBˆXØÛÝ[ÚYH˜[YK™Ù]
+˜XØÛÝ[ÚYŠBˆYˆ\Ú[œÝ[˜ÙJXØÛÝ[ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÚY[
+HÜˆXØÛÝ[ÚYH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜XØÛÝ[ÚY]\Ý™HHÜÚ]]™H[YÙ\ˆŠBˆ[ÙN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠš[™[™È]\Ý™HHÙ^H˜[YHÝš[™ÈÜˆ[ˆØš™XÝŠBˆYˆ›Ý\Ù\—ÚYš\ÙYÚ]
+
+HÜˆ›Ý\Ú[œÝ[˜ÙJÙ^WÛ˜[YKÝŠHÜˆ›ÝÑVWÓSQWÔ‘K™[X]Ú
+Ù^WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y[YÜ˜[HQÜˆÙ^H˜[YH[ˆš[™[™ÈÛÛ™šYÈŠBˆ›Ü›X[^™YÝ\Ù\—ÚYHHÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YK˜XØÛÝ[ÚYŽˆXØÛÝ[ÚYBˆ™]\›ˆ›Ü›X[^™Y‚‚™YˆÛÛ™šY×ØYZ[œÊÛÛ™šYÊN‚ˆYZ[œÈHÛÛ™šYË™Ù]
+˜YZ[œÈŠHÜˆ×BˆYˆ›Ý\Ú[œÝ[˜ÙJYZ[œË\Ý
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜YZ[œÈ]\Ý™H[ˆ\œ˜^HŠBˆ›Ü›X[^™YHÜÝŠ\Ù\—ÚY
+H›Üˆ\Ù\—ÚY[ˆYZ[œßBˆYˆ[žJ›Ý\Ù\—ÚYš\ÙYÚ]
+
+H›Üˆ\Ù\—ÚY[ˆ›Ü›X[^™Y
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y[YÜ˜[HQ[ˆYZ[œÈÛÛ™šYÈŠBˆ™]\›ˆ›Ü›X[^™Y‚‚™Yˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊN‚ˆØ[™Y]\ÈH×BˆÙY[—ÚÙ^WÛ˜[Y\ÈHÙ]
+
+BˆÛÜYØš[™[™ÜÈHÛÜY
+š[™[™ÜËš][\Ê
+KÙ^O[[X™H][Nˆ
+][VÌWVÈšÙ^WÛ˜[YH—K˜Ø\ÙY›Û
+
+K][VÌJJBˆ›Üˆ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆÛÜYØš[™[™ÜÎ‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—BˆYˆÙ^WÛ˜[YH[ˆÙY[—ÚÙ^WÛ˜[Y\Î‚ˆÛÛ[YBˆÙY[—ÚÙ^WÛ˜[Y\Ë˜Y
+Ù^WÛ˜[YJBˆØ[™Y]\Ë˜\[™
+
+\™Ù]Ý\Ù\—ÚYš[™[™ÊJBˆ™]\›ˆØ[™Y]\Â‚‚™Yˆ˜]ÚÜ™\Ù]ÚÙ^X›Ø\™
+š[™[™ÜËÙ[XÝYÝ\Ù\—ÚYÊN‚ˆÙ[XÝYÝ\Ù\—ÚYÈHÙ]
+Ù[XÝYÝ\Ù\—ÚYÊBˆØ[™Y]WÚYÈHÝ\™Ù]Ý\Ù\—ÚY›Üˆ\™Ù]Ý\Ù\—ÚYØš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊ_BˆÙ[XÝYÝ\Ù\—ÚYËš[\œÙXÝ[Û—Ý\]JØ[™Y]WÚYÊBˆ]ÛœÈH×Bˆ›Üˆ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊN‚ˆ™Yš^H¸§!HˆYˆ\™Ù]Ý\Ù\—ÚY[ˆÙ[XÝYÝ\Ù\—ÚYÈ[ÙH¸«'‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—BˆX^Û˜[YWÛ[™ÝHH[Š™Yš^
+Bˆ]Û—Ý^H™Yš^
+È
+ˆÙ^WÛ˜[YHYˆ[ŠÙ^WÛ˜[YJHHX^Û˜[YWÛ[™Ý[ÙHÙ^WÛ˜[YVÎ›X^Û˜[YWÛ[™ÝH×H
+È‹‹‹ˆ‚ˆ
+Bˆ]ÛœË˜\[™
+È^Žˆ]Û—Ý^˜Ø[˜XÚ×Ù]HŽˆˆ˜˜]ÚÝÙÙÛNžÝ\™Ù]Ý\Ù\—ÚYHŸJBˆ›ÝÜÈHØ]ÛœÖÚ[™^š[™^
+È—H›Üˆ[™^[ˆ˜[™ÙJ[Š]ÛœÊKŠWBˆ›ÝÜË™^[™
+ÂˆÂˆÈ^Žˆ¸¦${î#È9aj:`"H‹˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚØ[ŒŸKˆÈ^Žˆ¹®!yênˆ‹˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚØÛX\ŽŒŸKˆKˆÞÂˆ^Žˆˆ¼'å-:aãyïk¹¢`:`"{ï"Û[ŠÙ[XÝYÝ\Ù\—ÚYÊ_{ï"H‹ˆ˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚÜ™]šY]ÎŒ‹ˆWKˆÞÈ^Žˆ¹cå¹­¢‹˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚØØ[˜Ù[ŒŸWKˆJBˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™Žˆ›ÝÜßK[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ˜]ÚÜ™\Ù]ÜÙ[XÝ[Û—Ý^
+Ù[XÝYØÛÝ[Ý[ØÛÝ[
+N‚ˆ™]\›ˆ
+ˆ¼'å!9¢nzaãúaãyïkº`'ùã¡úfd9b-——ˆ‚ˆº+íú`"y¢êzg :) zaãyïk¹æ¡Ù^xà ¹a£y«(yà®yaîùcëùcå¹­¢:`"y¢êxà —ˆ‚ˆˆ¹mìº`"y¢ê{ï&žÜÙ[XÝYØÛÝ[HÈÝÝ[ØÛÝ[H‚ˆ
+B‚‚™Yˆ˜]ÚÜ™\Ù]Ü™]šY]×Ý^
+š[™[™ÜËÙ[XÝYÝ\Ù\—ÚYÊN‚ˆÙ[XÝYÝ\Ù\—ÚYÈHÙ]
+Ù[XÝYÝ\Ù\—ÚYÊBˆÙ[XÝYØØ[™Y]\ÈHÂˆš[™[™È›Üˆ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊBˆYˆ\™Ù]Ý\Ù\—ÚY[ˆÙ[XÝYÝ\Ù\—ÚYÂˆBˆ[™\ÈHÂˆ¸¦¨;î#È9èkº+©9¢nzaãúaãyïk»ï'È‹ˆˆ‹ˆˆ¹clùl!ºaãyïk¹.éy."ÈÛ[ŠÙ[XÝYØØ[™Y]\Ê_H9.*ˆÙ^{ï&ˆ‹ˆˆ‹ˆBˆ›Üˆš[™[™È[ˆÙ[XÝYØØ[™Y]\ÖÎŒÌN‚ˆ[™\Ë˜\[™
+ˆ¸ (ˆØš[™[™ÖÉÚÙ^WÛ˜[YI×_HŠBˆYˆ[ŠÙ[XÝYØØ[™Y]\ÊHˆÌ‚ˆ[™\Ë˜\[™
+ˆ¸ (ˆ8 )¹cé¹§"HÛ[ŠÙ[XÝYØØ[™Y]\ÊHHÌH9.*ˆÙ^HŠBˆ[™\Ë™^[™
+Âˆˆ‹ˆ¹l!¹®!zfíˆH9l#ù¥í¸à y«ãù¥éyd£È9i*zfd:`'ú+¨y¥l8à ˆ‹ˆ¹.#y/&¹®!zfí¹ .úh§yn©ˆ][ÝWÝ\ÙY;ï#9.gù.#y/&¹b(:fi9c¡¹cì¹å*:aãú+¬9oexà ˆ‹ˆJBˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊB‚‚™Yˆ˜]ÚÜ™\Ù]ØÛÛ™š\›X][Û—ÚÙ^X›Ø\™
+Ù[XÝYØÛÝ[
+N‚ˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™ŽˆÂˆÞÈ^Žˆˆ¸§!H9èkº+©:aãyïkˆÜÙ[XÝYØÛÝ[H9.*ˆÙ^H‹˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚØÛÛ™š\›NŒŸWKˆÂˆÈ^Žˆ¸¥à;î#È:/å9fçº`"y¢êH‹˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚØ˜XÚÎŒŸKˆÈ^Žˆ¹cå¹­¢‹˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚØØ[˜Ù[ŒŸKˆKˆ_K[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™YˆÝ\Ø˜]ÚÜ™\Ù]ÜÙ\ÜÚ[ÛŠYZ[—Ý\Ù\—ÚYÚ]ÚYY\ÜØYÙWÚY›ÝÏS›Û™JN‚ˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+HYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆÚ]ÐUÒÔ‘TÑUÓÐÒÎ‚ˆÐUÒÔ‘TÑUÔÑTÔÒSÓ”ÖÜÝŠYZ[—Ý\Ù\—ÚY
+WHHÂˆ˜Ú]ÚYŽˆÝŠÚ]ÚY
+Kˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆœÙ[XÝYŽˆÙ]
+
+Kˆ\]YØ]Žˆ›ÝËˆBˆ™]\›ˆÙ]
+
+B‚‚™YˆÚ[™ÙWØ˜]ÚÜ™\Ù]ÜÙ[XÝ[ÛŠˆYZ[—Ý\Ù\—ÚYˆÚ]ÚYˆY\ÜØYÙWÚYˆ˜[YÝ\Ù\—ÚYËˆÜ\˜][Û‹ˆ\™Ù]Ý\Ù\—ÚYS›Û™Kˆ›ÝÏS›Û™KŠN‚ˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+HYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆ˜[YÝ\Ù\—ÚYÈHÙ]
+˜[YÝ\Ù\—ÚYÊBˆÚ]ÐUÒÔ‘TÑUÓÐÒÎ‚ˆYZ[—Ý\Ù\—ÚYHÝŠYZ[—Ý\Ù\—ÚY
+BˆÙ\ÜÚ[ÛˆHÐUÒÔ‘TÑUÔÑTÔÒSÓ”Ë™Ù]
+YZ[—Ý\Ù\—ÚY
+BˆYˆ
+ˆ›ÝÙ\ÜÚ[Û‚ˆÜˆ›ÝÈHÙ\ÜÚ[Û–È\]YØ]—HˆUÒÔ‘TÑUÔÑTÔÒSÓ—ÕˆÜˆÙ\ÜÚ[Û–È˜Ú]ÚY—HOHÝŠÚ]ÚY
+BˆÜˆÙ\ÜÚ[Û–È›Y\ÜØYÙWÚY—HOHY\ÜØYÙWÚYˆ
+N‚ˆÐUÒÔ‘TÑUÔÑTÔÒSÓ”ËœÜ
+YZ[—Ý\Ù\—ÚY›Û™JBˆ™]\›ˆ›Û™BˆÙ\ÜÚ[Û–ÈœÙ[XÝY—Kš[\œÙXÝ[Û—Ý\]J˜[YÝ\Ù\—ÚYÊBˆYˆÜ\˜][ÛˆOHÙÙÛHŽ‚ˆYˆ\™Ù]Ý\Ù\—ÚY›Ý[ˆ˜[YÝ\Ù\—ÚYÎ‚ˆ™]\›ˆ›Û™BˆYˆ\™Ù]Ý\Ù\—ÚY[ˆÙ\ÜÚ[Û–ÈœÙ[XÝY—N‚ˆÙ\ÜÚ[Û–ÈœÙ[XÝY—Kœ™[[Ý™J\™Ù]Ý\Ù\—ÚY
+Bˆ[ÙN‚ˆÙ\ÜÚ[Û–ÈœÙ[XÝY—K˜Y
+\™Ù]Ý\Ù\—ÚY
+Bˆ[YˆÜ\˜][ÛˆOH˜[Ž‚ˆÙ\ÜÚ[Û–ÈœÙ[XÝY—HHÙ]
+˜[YÝ\Ù\—ÚYÊBˆ[YˆÜ\˜][ÛˆOH˜ÛX\ˆŽ‚ˆÙ\ÜÚ[Û–ÈœÙ[XÝY—K˜ÛX\Š
+Bˆ[YˆÜ\˜][ÛˆOHšÙY\Ž‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y˜]Ú™\Ù]Ù[XÝ[ÛˆÜ\˜][ÛˆŠBˆÙ\ÜÚ[Û–È\]YØ]—HH›ÝÂˆ™]\›ˆÙ]
+Ù\ÜÚ[Û–ÈœÙ[XÝY—JB‚‚™Yˆš[š\ÚØ˜]ÚÜ™\Ù]ÜÙ\ÜÚ[ÛŠYZ[—Ý\Ù\—ÚYÚ]ÚYY\ÜØYÙWÚY˜[YÝ\Ù\—ÚYÏS›Û™K›ÝÏS›Û™JN‚ˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+HYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆÚ]ÐUÒÔ‘TÑUÓÐÒÎ‚ˆYZ[—Ý\Ù\—ÚYHÝŠYZ[—Ý\Ù\—ÚY
+BˆÙ\ÜÚ[ÛˆHÐUÒÔ‘TÑUÔÑTÔÒSÓ”Ë™Ù]
+YZ[—Ý\Ù\—ÚY
+BˆYˆ
+ˆ›ÝÙ\ÜÚ[Û‚ˆÜˆ›ÝÈHÙ\ÜÚ[Û–È\]YØ]—HˆUÒÔ‘TÑUÔÑTÔÒSÓ—ÕˆÜˆÙ\ÜÚ[Û–È˜Ú]ÚY—HOHÝŠÚ]ÚY
+BˆÜˆÙ\ÜÚ[Û–È›Y\ÜØYÙWÚY—HOHY\ÜØYÙWÚYˆ
+N‚ˆÐUÒÔ‘TÑUÔÑTÔÒSÓ”ËœÜ
+YZ[—Ý\Ù\—ÚY›Û™JBˆ™]\›ˆ›Û™BˆÐUÒÔ‘TÑUÔÑTÔÒSÓ”ËœÜ
+YZ[—Ý\Ù\—ÚY›Û™JBˆÙ[XÝYHÙ]
+Ù\ÜÚ[Û–ÈœÙ[XÝY—JBˆYˆ˜[YÝ\Ù\—ÚYÈ\È›Ý›Û™N‚ˆÙ[XÝYš[\œÙXÝ[Û—Ý\]J˜[YÝ\Ù\—ÚYÊBˆ™]\›ˆÙ[XÝY‚‚™YˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜËÙ[XÝYÝ\Ù\—ÚYS›Û™JN‚ˆ]ÛœÈH×BˆÛÜYØš[™[™ÜÈHÛÜY
+š[™[™ÜËš][\Ê
+KÙ^O[[X™H][Nˆ
+][VÌWVÈšÙ^WÛ˜[YH—K˜Ø\ÙY›Û
+
+K][VÌJJBˆ›Üˆ\Ù\—ÚYš[™[™È[ˆÛÜYØš[™[™ÜÎ‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—Bˆ]Û—Ý^HÙ^WÛ˜[YHYˆ[ŠÙ^WÛ˜[YJHH[ÙHÙ^WÛ˜[YVÎŒWH
+È‹‹‹ˆ‚ˆ]ÛœË˜\[™
+È^Žˆ]Û—Ý^˜Ø[˜XÚ×Ù]HŽˆˆ\ØYÙNžÝ\Ù\—ÚYHŸJBˆ›ÝÜÈHØ]ÛœÖÚ[™^š[™^
+È—H›Üˆ[™^[ˆ˜[™ÙJ[Š]ÛœÊKŠWBˆ›ÝÜË˜\[™
+ÞÈ^Žˆ¼'äâˆÙ^H9 .ú)â‹˜Ø[˜XÚ×Ù]HŽˆ›Ý™\šY]ÎŒŸWJBˆYˆ™\Ù]Ø\WØÛÛ™šYÝ\™Y
+
+N‚ˆ›ÝÜË˜\[™
+ÞÂˆ^Žˆ¸¦¨;î#È9¢nzaãúaãyïkº`'ùã¡úfd9b-ˆ‹ˆ˜Ø[˜XÚ×Ù]HŽˆ˜˜]ÚÜÝ\Œ‹ˆWJBˆ›ÝÜË˜\[™
+ÞÂˆ^Žˆ¸¡ª{î#È9fç¹®æˆÙ^H9/oùå*:aãÈ‹ˆ˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×ÜÝ\Œ‹ˆWJBˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™Žˆ›ÝÜßK[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™YˆÝ™\šY]×ÚÙ^X›Ø\™
+š[™[™ÜËYÙKÝ[ÜYÙ\ÊN‚ˆ›ÝÜÈH×BˆYÙWØØ[™Y]\ÈH™\Ù]ØØ[™Y]\Êš[™[™ÜÊVÂˆYÙH
+ˆÕ‘T•’QU×ÔQÑWÔÒV‘NŠYÙH
+ÈJH
+ˆÕ‘T•’QU×ÔQÑWÔÒV‘BˆBˆ\Ø]ÛœÈH×Bˆ›Üˆ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆYÙWØØ[™Y]\Î‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—BˆX™[HÙ^WÛ˜[YHYˆ[ŠÙ^WÛ˜[YJHHŒ[ÙHÙ^WÛ˜[YVÎM×H
+È‹‹‹ˆ‚ˆ\Ø]ÛœË˜\[™
+Âˆ^Žˆˆ¼'ã$ÛX™[H‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆš\Ù]Z[žÝ\™Ù]Ý\Ù\—ÚYNŒžÜYÙ_H‹ˆJBˆ›ÝÜË™^[™
+Ú\Ø]ÛœÖÚ[™^š[™^
+È—H›Üˆ[™^[ˆ˜[™ÙJ[Š\Ø]ÛœÊKŠWJBˆYˆÝ[ÜYÙ\ÈˆN‚ˆ™]š[Ý\×ÜYÙHHX^
+YÙHHJBˆ™^ÜYÙHHZ[ŠÝ[ÜYÙ\ÈHKYÙH
+ÈJBˆ›ÝÜË˜\[™
+ÂˆÈ^Žˆ¸¥à;î#È‹˜Ø[˜XÚ×Ù]HŽˆˆ›Ý™\šY]ÎžÜ™]š[Ý\×ÜYÙ_HŸKˆÈ^ŽˆˆžÜYÙH
+È_KÞÝÝ[ÜYÙ\ßH‹˜Ø[˜XÚ×Ù]HŽˆˆ›Ý™\šY]ÎžÜYÙ_HŸKˆÈ^Žˆ¸¥­»î#È‹˜Ø[˜XÚ×Ù]HŽˆˆ›Ý™\šY]ÎžÛ™^ÜYÙ_HŸKˆJBˆ›ÝÜË™^[™
+ÂˆÞÈ^Žˆ¼'å!9b-ù¥¬9 .ú)â‹˜Ø[˜XÚ×Ù]HŽˆˆ›Ý™\šY]ÎžÜYÙ_HŸWKˆÞÈ^Žˆ¸¥à;î#È:/å9fçˆ‹˜Ø[˜XÚ×Ù]HŽˆ›Ý™\šY]×Ø˜XÚÎŒŸWKˆJBˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™Žˆ›ÝÜßK[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ\Ú\ÝÜžWÚÙ^X›Ø\™
+\™Ù]Ý\Ù\—ÚYYÙKÝ[ÜYÙ\ËÝ™\šY]×ÜYÙJN‚ˆ›ÝÜÈH×BˆYˆÝ[ÜYÙ\ÈˆN‚ˆ›ÝÜË˜\[™
+ÂˆÂˆ^Žˆ¸¥à;î#È‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆš\Ù]Z[žÝ\™Ù]Ý\Ù\—ÚYNžÛX^
+YÙHHJ_NžÛÝ™\šY]×ÜYÙ_H‹ˆKˆÂˆ^ŽˆˆžÜYÙH
+È_KÞÝÝ[ÜYÙ\ßH‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆš\Ù]Z[žÝ\™Ù]Ý\Ù\—ÚYNžÜYÙ_NžÛÝ™\šY]×ÜYÙ_H‹ˆKˆÂˆ^Žˆ¸¥­»î#È‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆš\Ù]Z[žÝ\™Ù]Ý\Ù\—ÚYNžÛZ[ŠÝ[ÜYÙ\ÈHKYÙH
+ÈJ_NžÛÝ™\šY]×ÜYÙ_H‹ˆKˆJBˆ›ÝÜË™^[™
+ÂˆÞÂˆ^Žˆ¼'å!9b-ù¥¬‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆš\Ù]Z[žÝ\™Ù]Ý\Ù\—ÚYNžÜYÙ_NžÛÝ™\šY]×ÜYÙ_H‹ˆWKˆÞÈ^Žˆ¸¥à;î#È:/å9fçˆÙ^H9 .ú)â‹˜Ø[˜XÚ×Ù]HŽˆˆ›Ý™\šY]ÎžÛÝ™\šY]×ÜYÙ_HŸWKˆJBˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™Žˆ›ÝÜßK[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›Û˜XÚ×ÚÙ^WÚÙ^X›Ø\™
+š[™[™ÜÊN‚ˆ]ÛœÈH×Bˆ›Üˆ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊN‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—Bˆ]ÛœË˜\[™
+Âˆ^ŽˆÙ^WÛ˜[YHYˆ[ŠÙ^WÛ˜[YJHH[ÙHÙ^WÛ˜[YVÎŒWH
+È‹‹‹ˆ‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆœ›Û˜XÚ×ÚÙ^NžÝ\™Ù]Ý\Ù\—ÚYH‹ˆJBˆ›ÝÜÈHØ]ÛœÖÚ[™^š[™^
+È—H›Üˆ[™^[ˆ˜[™ÙJ[Š]ÛœÊKŠWBˆ›ÝÜË˜\[™
+ÞÈ^Žˆ¸¥à;î#È:/å9fçˆ‹˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×ÜÝ\ŒŸWJBˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™Žˆ›ÝÜßK[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›Û˜XÚ×Û[ÙWÚÙ^X›Ø\™
+
+N‚ˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™ŽˆÂˆÞÈ^Žˆ¼'äi9fç¹®æ¹cey.*ˆÙ^H‹˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×ÜÚ[™ÛNŒŸWKˆÞÈ^Žˆ¼'äiH9fç¹®æ¹¢`9§"yîäyk¦ˆÙ^H‹˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×Ø[ŒŸWKˆÞÈ^Žˆ¸¥à;î#È:/å9fçˆ‹˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×Ø˜XÚÎŒŸWKˆ_K[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›Û˜XÚ×Ø˜]ÚÚÙ^X›Ø\™
+˜]Ú\ÊN‚ˆ›ÝÜÈH×Bˆ›Üˆ˜]Ú[ˆ˜]Ú\Î‚ˆ˜]ÚÚYH˜]Ú™Ù]
+˜˜]ÚÚYŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]ÚÚYÝŠHÜˆ›Ý™K™[X]Ú
+ˆ–ÌNXKY—^ÎÌŸH‹˜]ÚÚY
+N‚ˆÛÛ[YBˆÛÝ\˜ÙHHº!ê¹bªˆYˆ˜]Ú™Ù]
+œ™\Ù]ÜÛÝ\˜ÙHŠHOH˜]]Èˆ[ÙH¹¢bùbª‚ˆ›ÝÜË˜\[™
+ÞÂˆ^Žˆ
+ˆˆžÙ›Ü›X]Ý[Y\Ý[\
+˜]Ú™Ù]
+	ØÜ™X]YØ]	ÊJ_{ïgÜÛÝ\˜Ù_{ïg‚ˆˆžÛ[J˜]Ú™Ù]
+	ÚÙ^WØÛÝ[	ÊJ_H9.*ˆÙ^H‚ˆ
+Kˆ˜Ø[˜XÚ×Ù]HŽˆˆœ›Û˜XÚ×Ø[Ü›Û\žØ˜]ÚÚYH‹ˆWJBˆ›ÝÜË˜\[™
+ÞÈ^Žˆ¸¥à;î#È:/å9fçˆ‹˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×ÜÝ\ŒŸWJBˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™Žˆ›ÝÜßK[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›Û˜XÚ×Ø[ØÛÛ™š\›X][Û—ÚÙ^X›Ø\™
+˜]ÚÚYÙ^WØÛÝ[
+N‚ˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™ŽˆÂˆÞÂˆ^Žˆˆ¸§!H9èkº+©9fç¹®æ¹aj:`êÚÙ^WØÛÝ[H9.*ˆÙ^H‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆœ›Û˜XÚ×Ø[ØÛÛ™š\›NžØ˜]ÚÚYH‹ˆWKˆÞÈ^Žˆ¸¥à;î#È:/å9fç¹âb9§+9b%ú(j‹˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×Ø[ŒŸWKˆ_K[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›Û˜XÚ×Ø˜XÚÝ\ÚÙ^X›Ø\™
+\™Ù]Ý\Ù\—ÚY˜XÚÝ\ÊN‚ˆ›ÝÜÈH×Bˆ›Üˆ˜XÚÝ\[ˆ˜XÚÝ\Î‚ˆ˜XÚÝ\ÚYH˜XÚÝ\™Ù]
+˜˜XÚÝ\ÚYŠBˆYˆ\Ú[œÝ[˜ÙJ˜XÚÝ\ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJ˜XÚÝ\ÚY[
+HÜˆ˜XÚÝ\ÚYH‚ˆÛÛ[YBˆÛÝ\˜ÙHHº!ê¹bªˆYˆ˜XÚÝ\™Ù]
+œ™\Ù]ÜÛÝ\˜ÙHŠHOH˜]]Èˆ[ÙH¹¢bùbª‚ˆÜ™X]YØ]H›Ü›X]Ý[Y\Ý[\
+˜XÚÝ\™Ù]
+˜Ü™X]YØ]ŠJBˆ›ÝÜË˜\[™
+ÞÂˆ^ŽˆˆˆÞØ˜XÚÝ\ÚY{ïgØÜ™X]YØ]{ïgÜÛÝ\˜Ù_H‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆœ›Û˜XÚ×Ü›Û\žÝ\™Ù]Ý\Ù\—ÚYNžØ˜XÚÝ\ÚYH‹ˆWJBˆ›ÝÜË˜\[™
+ÞÈ^Žˆ¸¥à;î#È:/å9fçº`"y¢êHÙ^H‹˜Ø[˜XÚ×Ù]HŽˆœ›Û˜XÚ×ÜÚ[™ÛNŒŸWJBˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™Žˆ›ÝÜßK[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›Û˜XÚ×ØÛÛ™š\›X][Û—ÚÙ^X›Ø\™
+\™Ù]Ý\Ù\—ÚY˜XÚÝ\ÚY
+N‚ˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™ŽˆÂˆÞÂˆ^Žˆˆ¸§!H9èkº+©9fç¹®æ¹b,9i!ù.ïHÞØ˜XÚÝ\ÚYH‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆœ›Û˜XÚ×ØÛÛ™š\›NžÝ\™Ù]Ý\Ù\—ÚYNžØ˜XÚÝ\ÚYH‹ˆWKˆÞÂˆ^Žˆ¸¥à;î#È:/å9fç¹i!ù.ïyb%ú(j‹ˆ˜Ø[˜XÚ×Ù]HŽˆˆœ›Û˜XÚ×ÚÙ^NžÝ\™Ù]Ý\Ù\—ÚYH‹ˆWKˆ_K[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›Ü›X]Ü›Û˜XÚ×Ø˜XÚÝ\
+Ù^WÛ˜[YK˜XÚÝ\
+N‚ˆÛ˜\ÚÝH˜XÚÝ\™Ù]
+œÛ˜\ÚÝŠHÜˆßBˆÛÝ\˜ÙHHº!ê¹bª:aãyïkˆˆYˆ˜XÚÝ\™Ù]
+œ™\Ù]ÜÛÝ\˜ÙHŠHOH˜]]Èˆ[ÙH¹¢bùbª:aãyïkˆ‚ˆ™]\›ˆ—ˆ‹š›Ú[ŠÂˆ¸¦¨;î#È9èkº+©9k£9¥m9fç¹®æ»ï'È‹ˆˆ‹ˆˆ’Ù^{ï&žÚÙ^WÛ˜[Y_H‹ˆˆ¹i!ù.ï{ï&ˆÞØ˜XÚÝ\™Ù]
+	Ø˜XÚÝ\ÚY	Ê_{ïgÜÛÝ\˜Ù_H‹ˆˆ¹i!ù.ïy¥íºeí;ï&žÙ›Ü›X]Ý[Y\Ý[\
+˜XÚÝ\™Ù]
+	ØÜ™X]YØ]	ÊJ_H‹ˆˆH9l#ù¥í¹å*:aãûï&žÛ[Û™^JÛ˜\ÚÝ™Ù]
+	Ý\ØYÙWÍZ	ÊJ_H‹ˆˆ¹«ãù¥éyå*:aãûï&žÛ[Û™^JÛ˜\ÚÝ™Ù]
+	Ý\ØYÙWÌY	ÊJ_H‹ˆˆ¹«ãùdj9å*:aãûï&žÛ[Û™^JÛ˜\ÚÝ™Ù]
+	Ý\ØYÙWÍÙ	ÊJ_H‹ˆˆH9l#ù¥í¹ê¥ùcèûï&žÙ›Ü›X]Ý[Y\Ý[\
+Û˜\ÚÝ™Ù]
+	ÝÚ[™Ý×ÍZÜÝ\	ÊJ_H‹ˆˆ¹«ãù¥éyê¥ùcèûï&žÙ›Ü›X]Ý[Y\Ý[\
+Û˜\ÚÝ™Ù]
+	ÝÚ[™Ý×ÌYÜÝ\	ÊJ_H‹ˆˆ¹«ãùdj9ê¥ùcèûï&žÙ›Ü›X]Ý[Y\Ý[\
+Û˜\ÚÝ™Ù]
+	ÝÚ[™Ý×ÍÙÜÝ\	ÊJ_H‹ˆˆ‹ˆ¹èkº+©9d#¹l!º)¡¹æå¹odùbcyaky.*º`'ùã¡úfd9b-¹keù«­{ï#9nm¹k¦¹d$yb-ù¥¬:+éHÙ^H9æ¡9ï$ùkf8à ˆ‹ˆJB‚‚™Yˆš[™ØÛÛ\]WØ˜XÚÝ\Ø˜]Ú
+š[™[™ÜË˜]ÚÚY
+N‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]ÚÚYÝŠHÜˆ›Ý™K™[X]Ú
+ˆ–ÌNXKY—^ÎÌŸH‹˜]ÚÚY
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y˜XÚÝ\˜]ÚQŠBˆ]HH]Y\žWÜ˜]WÛ[Z]Ø˜XÚÝ\Ø˜]Ú\Êš[™[™ÜÊHÜˆßBˆYˆ]K™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ˜XÚÝ\˜]ÚÛÚÝ\˜Z[YˆÙ]K™Ù]
+	Ù\œ›Ü‰Ê_HŠBˆ›Üˆ˜]Ú[ˆ]K™Ù]
+˜˜]Ú\ÈŠHÜˆ×N‚ˆYˆ˜]Ú™Ù]
+˜˜]ÚÚYŠHOH˜]ÚÚY‚ˆ™]\›ˆ˜]Úˆ˜Z\ÙH[[YQ\œ›ÜŠ˜XÚÝ\˜]Ú\È[˜ÛÛ\]HÜˆ›ÈÛ™Ù\ˆ]˜Z[X›HŠB‚‚™Yˆ›Ü›X]Ø[Ü›Û˜XÚ×ØÛÛ™š\›X][ÛŠ˜]Ú
+N‚ˆ˜XÚÝ\ÈH˜]Ú™Ù]
+˜˜XÚÝ\ÈŠHÜˆ×BˆÛÝ\˜ÙHHº!ê¹bª:aãyïkˆˆYˆ˜]Ú™Ù]
+œ™\Ù]ÜÛÝ\˜ÙHŠHOH˜]]Èˆ[ÙH¹¢bùbª:aãyïkˆ‚ˆ[™\ÈHÂˆ¸¦¨;î#È9èkº+©9fç¹®æ¹¢`9§"yîäyk¦ˆÙ^{ï'È‹ˆˆ‹ˆˆ¹âb9§+9¥íºeí;ï&žÙ›Ü›X]Ý[Y\Ý[\
+˜]Ú™Ù]
+	ØÜ™X]YØ]	ÊJ_H‹ˆˆ¹i!ù.ïy§iy®¤;ï&žÜÛÝ\˜Ù_H‹ˆˆ¹cëùfç¹®æ»ï&žÛ[Š˜XÚÝ\Ê_HÈÛ[J˜]Ú™Ù]
+	ÚÙ^WØÛÝ[	ÊJ_H9.*ˆÙ^H‹ˆˆ‹ˆBˆ[™\Ë™^[™
+ˆ¸ (ˆØ˜XÚÝ\™Ù]
+	ÚÙ^WÛ˜[YIÊHÜˆ	ËIßHˆ›Üˆ˜XÚÝ\[ˆ˜XÚÝ\ÖÎŒÌJBˆYˆ[Š˜XÚÝ\ÊHˆÌ‚ˆ[™\Ë˜\[™
+ˆ¸ (ˆ8 )¹cé¹§"HÛ[Š˜XÚÝ\ÊHHÌH9.*ˆÙ^HŠBˆ[™\Ë™^[™
+Âˆˆ‹ˆ¹l!¹ h¹i#y«ãù.*ˆÙ^H9æ¡H9l#ù¥í¸à y«ãù¥éxà y«ãùdj9å*:aãùcâ¹kîyn¥9ê¥ùcèù¥íºeí8à ˆ‹ˆ¹.#y/&¹/ë¹¥.H][ÝWÝ\ÙY;ï#9.gù.#y/&¹b(:fi9c¡¹cì¹å*:aãú+¬9oexà ˆ‹ˆ¹«ãù.*ˆÙ^H:`ïy/&¹k¦¹d$yb-ù¥¬™Y\È:fd:`'ùï$ùkf8à ˆ‹ˆJBˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊB‚‚™Yˆ›Ü›X]Ü™\Ù]Ø˜XÚÝ\ÜÛ˜\ÚÝ
+Ù^WÛ˜[YK˜XÚÝ\
+N‚ˆÛ˜\ÚÝH˜XÚÝ\™Ù]
+œÛ˜\ÚÝŠHÜˆßBˆ[™\ÈHÙˆ¼'å$HÚÙ^WÛ˜[Y_H—Bˆ\ÝÝ\ÙYØ]HÛ˜\ÚÝ™Ù]
+›\ÝÝ\ÙYØ]ŠBˆ[™\Ë˜\[™
+ˆˆ¸ (ˆ9§ 9d#¹/oùå*;ï&žÙ›Ü›X]Ý[Y\Ý[\
+\ÝÝ\ÙYØ]
+HYˆ\ÝÝ\ÙYØ][ÙH	ù¦ ¹¥è9/oùå*:+¬9oeIßH‚ˆ
+Bˆ\[™Û[Z]
+ˆ[™\Ëˆ¹«ãùdj:h§yn©ˆ‹ˆÛ˜\ÚÝ™Ù]
+œ˜]WÛ[Z]ÍÙŠKˆÛ˜\ÚÝ™Ù]
+\ØYÙWÍÙŠKˆ
+Bˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊB‚‚™Yˆ›Ü›X]Ü™\Ù]Ø˜XÚÝ\ÜÛ˜\ÚÝÊ™\Ý[ÊN‚ˆÛ˜\ÚÝÈHÂˆ›Ü›X]Ü™\Ù]Ø˜XÚÝ\ÜÛ˜\ÚÝ
+™\Ý[ÈšÙ^WÛ˜[YH—K™\Ý[È˜˜XÚÝ\—JBˆ›Üˆ™\Ý[[ˆ™\Ý[ÂˆYˆ\Ú[œÝ[˜ÙJ™\Ý[™Ù]
+˜˜XÚÝ\ŠKXÝ
+BˆBˆ™]\›ˆ——ˆ‹š›Ú[ŠÛ˜\ÚÝÊB‚‚™YˆÊY]Ù\˜[\ÏS›Û™K[Y[Ý]LL
+N‚ˆYˆ›ÝÒÑSŽ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ•SQÔSWÐ“ÕÕÒÑSˆ\È[\HŠBˆ]HH\›X‹œ\œÙK\›[˜ÛÙJ\˜[\ÈÜˆßJK™[˜ÛÙJ]‹NŠBˆ™\HH\›X‹œ™\]Y\Ý”™\]Y\Ý
+ˆžÐT_KÞÛY]ÙH‹]OY]JBˆÚ]\›X‹œ™\]Y\Ý\›Ü[Š™\K[Y[Ý]][Y[Ý]
+H\È™\Ü‚ˆ^[ØYHœÛÛ‹›ØYÊ™\Üœ™XY
+
+K™XÛÙJ]‹NŠJBˆYˆ›Ý^[ØY™Ù]
+›ÚÈŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ•[YÜ˜[HTH\œ›ÜŽˆÜ^[ØYHŠBˆ™]\›ˆ^[ØY™Ù]
+œ™\Ý[ŠB‚‚˜Û\ÜÈ›Ô™Y\™XÝ[™\Š\›X‹œ™\]Y\Ý’™Y\™XÝ[™\ŠN‚ˆYˆ™Y\™XÝÜ™\]Y\Ý
+Ù[‹™\KœÛÙK\ÙËXY\œË™]Ý\›
+N‚ˆ™]\›ˆ›Û™B‚‚˜Û\ÜÈ™\Ù]Y\˜XÚÝ\\œ›ÜŠ[[YQ\œ›ÜŠN‚ˆYˆ×Ú[š]×ÊÙ[‹˜XÚÝ\
+N‚ˆÝ\\Š
+K—×Ú[š]×Ê”™\Ù]˜Z[YY\ˆ˜XÚÝ\ŠBˆÙ[‹˜˜XÚÝ\H˜XÚÝ\‚‚™Yˆ™\Ù]Ø\WØÛÛ™šYÝ\™Y
+
+N‚ˆ™]\›ˆ›ÛÛ
+ÕPŒTWÐTÑWÕT“[™ÕPŒTWÐQRS—ÐTWÒÑVJB‚‚™Yˆ™\Ù]ÚÙ^WÜ˜]WÛ[Z]Ý\ØYÙJÙ^WÚY
+N‚ˆYˆ\Ú[œÝ[˜ÙJÙ^WÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJÙ^WÚY[
+HÜˆÙ^WÚYH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YTHÙ^HQŠBˆYˆ›Ý™\Ù]Ø\WØÛÛ™šYÝ\™Y
+
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÝXŒTH™\Ù]TH\È›ÝÛÛ™šYÝ\™YŠBˆ›ÙHHœÛÛ‹™[\ÊÈœ™\Ù]Ü˜]WÛ[Z]Ý\ØYÙHŽˆY_JK™[˜ÛÙJ]‹NŠBˆ™\]Y\ÝH\›X‹œ™\]Y\Ý”™\]Y\Ý
+ˆˆžÔÕPŒTWÐTÑWÕT“KØ\KÝŒKØYZ[‹Ø\KZÙ^\ËÞÚÙ^WÚYH‹ˆ]OX›ÙKˆXY\œÏ^ÂˆÛÛ[U\HŽˆ˜\XØ][Û‹ÚœÛÛˆ‹ˆXØÙ\Žˆ˜\XØ][Û‹ÚœÛÛˆ‹ˆžX\KZÙ^HŽˆÕPŒTWÐQRS—ÐTWÒÑVKˆKˆY]ÙH”U‹ˆ
+BˆÜ[™\ˆH\›X‹œ™\]Y\Ý˜Z[ÛÜ[™\Š›Ô™Y\™XÝ[™\Š
+JBˆÚ]Ü[™\‹›Ü[Š™\]Y\Ý[Y[Ý]TÕPŒTWÐQRS—ÕSQSÕU
+H\È™\ÜÛœÙN‚ˆ™\ÜÛœÙWØ›ÙHH™\ÜÛœÙKœ™XY
+WÌÍMÍÊBˆYˆ[Š™\ÜÛœÙWØ›ÙJHˆWÌÍMÍŽ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÝXŒTH™\ÜÛœÙH\ÈÛÈ\™ÙHŠBˆ™]\›ˆœÛÛ‹›ØYÊ™\ÜÛœÙWØ›ÙK™XÛÙJ]‹NŠJHYˆ™\ÜÛœÙWØ›ÙH[ÙH›Û™B‚‚™Yˆ˜XÚÝ\Ø[™Ü™\Ù]ÚÙ^JÙ^WÛ˜[YKXØÛÝ[ÚY™\Ù]ÜÛÝ\˜ÙK˜]ÚÚY
+N‚ˆÚ]Ô‘TÑUÓÔTUSÓ—ÓÐÒÎ‚ˆ˜XÚÝ\HÜ™X]WÜ˜]WÛ[Z]Ø˜XÚÝ\
+Ù^WÛ˜[YKXØÛÝ[ÚY™\Ù]ÜÛÝ\˜ÙK˜]ÚÚY
+HÜˆßBˆYˆ˜XÚÝ\™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ”˜]K[[Z]˜XÚÝ\˜Z[YˆØ˜XÚÝ\™Ù]
+	Ù\œ›Ü‰Ê_HŠBˆÙ^WÚYH˜XÚÝ\™Ù]
+šÙ^WÚYŠBˆ˜XÚÝ\ÚYH˜XÚÝ\™Ù]
+˜˜XÚÝ\ÚYŠBˆYˆ
+ˆ\Ú[œÝ[˜ÙJÙ^WÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJÙ^WÚY[
+HÜˆÙ^WÚYHˆÜˆ\Ú[œÝ[˜ÙJ˜XÚÝ\ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJ˜XÚÝ\ÚY[
+HÜˆ˜XÚÝ\ÚYHˆ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”˜]K[[Z]˜XÚÝ\Y›Ý™]\›ˆ˜[YQÈŠBˆžN‚ˆ™\Ù]ÚÙ^WÜ˜]WÛ[Z]Ý\ØYÙJÙ^WÚY
+Bˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆ˜Z\ÙH™\Ù]Y\˜XÚÝ\\œ›ÜŠ˜XÚÝ\
+Hœ›ÛH\œ›Ü‚ˆ™]\›ˆ˜XÚÝ\‚‚™Yˆ™\Ù]ÜÙ[XÝYÚÙ^\Êš[™[™ÜËÙ[XÝYÝ\Ù\—ÚYÊN‚ˆÙ[XÝYÝ\Ù\—ÚYÈHÙ]
+Ù[XÝYÝ\Ù\—ÚYÊBˆ˜]ÚÚYHÙXÜ™]ËÚÙ[—Ú^
+
+Bˆ™\Ý[ÈH×Bˆ›Üˆ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊN‚ˆYˆ\™Ù]Ý\Ù\—ÚY›Ý[ˆÙ[XÝYÝ\Ù\—ÚYÎ‚ˆÛÛ[YBˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—Bˆ™\Ù]ØÛÛ\]YH˜[ÙBˆ˜XÚÝ\ØÛÛ\]YH˜[ÙBˆžN‚ˆ˜XÚÝ\H˜XÚÝ\Ø[™Ü™\Ù]ÚÙ^JˆÙ^WÛ˜[YKš[™[™ÖÈ˜XØÛÝ[ÚY—K›X[X[‹˜]ÚÚYˆ
+Bˆ˜XÚÝ\ØÛÛ\]YHYBˆ™\Ù]ØÛÛ\]YHYBˆÚXÚÙYÙ]HH]Y\žWÚÙ^WÝ\ØYÙJÙ^WÛ˜[YKš[™[™ÖÈ˜XØÛÝ[ÚY—JHÜˆßBˆÚXÚÙYÚÙ^HHÚXÚÙYÙ]K™Ù]
+šÙ^HŠHÜˆßBˆYˆ›ÝÚXÚÙYÚÙ^N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”ÜÝXÚXÚÈY›Ý™]\›ˆTHÙ^H]HŠBˆ™\Ý[Ë˜\[™
+ÂˆšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKˆœÝ]\ÈŽˆœÝXØÙ\ÜÈ‹ˆ˜˜XÚÝ\Žˆ˜XÚÝ\ˆ™]Z[Žˆ
+ˆˆZØÚXÚÙYÚÙ^K™Ù]
+	Ý\ØYÙWÍZ	Ë	ÏÉÊ_HÈ‚ˆˆ¹¥éHØÚXÚÙYÚÙ^K™Ù]
+	Ý\ØYÙWÌY	Ë	ÏÉÊ_HÈ‚ˆˆ¹djØÚXÚÙYÚÙ^K™Ù]
+	Ý\ØYÙWÍÙ	Ë	ÏÉÊ_HÈ‚ˆˆ¹i!ù.ïHÞØ˜XÚÝ\ÉØ˜XÚÝ\ÚY	×_H‚ˆ
+KˆJBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆYˆ\Ú[œÝ[˜ÙJ\œ›Ü‹™\Ù]Y\˜XÚÝ\\œ›ÜŠN‚ˆ˜XÚÝ\ØÛÛ\]YHYBˆÙ×Ù˜Z[\™Jˆˆ˜˜]Ú™\Ù]\™Ù]^ÛX\ÚÙYÚY
+\™Ù]Ý\Ù\—ÚY
+_H™XÚXÚÏ^ÜÝŠ™\Ù]ØÛÛ\]Y
+K›ÝÙ\Š
+_H‹ˆ\œ›Ü‹ˆ
+Bˆ™\Ý[HÂˆšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKˆœÝ]\ÈŽˆØ\›š[™ÈˆYˆ™\Ù]ØÛÛ\]Y[ÙH™˜Z[Y‹ˆ™]Z[Žˆ
+ˆºaãyïk¹¢$9b§ù.%9mì¹§"yi!ù.ï{ï#9/a¹i#y§éyi,z-)H‚ˆYˆ™\Ù]ØÛÛ\]Y[ÙBˆ¹mì¹i!ù.ï{ï#9/aºaãyïk¹i,z-)HˆYˆ˜XÚÝ\ØÛÛ\]Y[ÙBˆ¹i!ù.ïyi,z-){ï#9§*¹¢iú(c:aãyïkˆ‚ˆ
+KˆBˆYˆ™\Ù]ØÛÛ\]Y‚ˆ™\Ý[È˜˜XÚÝ\—HH˜XÚÝ\ˆ™\Ý[Ë˜\[™
+™\Ý[
+Bˆ™]\›ˆ™\Ý[Â‚‚™Yˆ›Ü›X]Ø˜]ÚÜ™\Ù]Ü™\Ý[Ê™\Ý[ËÛÛ™šYÊN‚ˆÝXØÙ\Ü×ØÛÝ[HÝ[J™\Ý[ÈœÝ]\È—HOHœÝXØÙ\ÜÈˆ›Üˆ™\Ý[[ˆ™\Ý[ÊBˆØ\›š[™×ØÛÝ[HÝ[J™\Ý[ÈœÝ]\È—HOHØ\›š[™Èˆ›Üˆ™\Ý[[ˆ™\Ý[ÊBˆ˜Z[YØÛÝ[HÝ[J™\Ý[ÈœÝ]\È—HOH™˜Z[Yˆ›Üˆ™\Ý[[ˆ™\Ý[ÊBˆ[™\ÈHÂˆ¸§!H9¢nzaãúaãyïk¹k£9¢$‹ˆˆ‹ˆˆ¹ .ú+¨{ï&žÛ[Š™\Ý[Ê_H‹ˆˆ¹¢$9b§ûï&žÜÝXØÙ\Ü×ØÛÝ[H‹ˆˆºg 9i#y§é{ï&žÝØ\›š[™×ØÛÝ[H‹ˆˆ¹i,z-){ï&žÙ˜Z[YØÛÝ[H‹ˆˆ‹ˆBˆXÛÛœÈHÈœÝXØÙ\ÜÈŽˆ¸§!H‹Ø\›š[™ÈŽˆ¸¦¨;î#È‹™˜Z[YŽˆ¸§cŸBˆ\Ü^YYÜ™\Ý[ÈHÛÜY
+ˆ™\Ý[ËˆÙ^O[[X™H™\Ý[ˆ
+È™˜Z[YŽˆØ\›š[™ÈŽˆKœÝXØÙ\ÜÈŽˆŸVÜ™\Ý[ÈœÝ]\È—WK™\Ý[ÈšÙ^WÛ˜[YH—K˜Ø\ÙY›Û
+
+JKˆ
+VÎŒÌBˆ›Üˆ™\Ý[[ˆ\Ü^YYÜ™\Ý[Î‚ˆ[™\Ë˜\[™
+ˆžÚXÛÛœÖÜ™\Ý[ÉÜÝ]\É×W_HÜ™\Ý[ÉÚÙ^WÛ˜[YI×_{ï&žÜ™\Ý[ÉÙ]Z[	×_HŠBˆYˆ[Š™\Ý[ÊHˆ[Š\Ü^YYÜ™\Ý[ÊN‚ˆ[™\Ë˜\[™
+ˆ¸ )¹cé¹§"HÛ[Š™\Ý[ÊHH[Š\Ü^YYÜ™\Ý[Ê_H9.*¹îäù§§9§*¹leyo ;ï#:+íùceyâë9§éz+è¹èkº+©8à ˆŠBˆ[™\Ë™^[™
+Èˆ‹ˆ¼'å!9i#y§éy¥íºeí;ï&žÙ›Ü›X]Ü™Yœ™\ÚÝ[Y\Ý[\
+ÛÛ™šYÊ_H—JBˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊB‚‚™YˆÜ[—ÜÜ[ÚœÛÛŠÜ[˜\šXX›\ÏS›Û™K[Ý×ÝÜš]OQ˜[ÙJN‚ˆÛYHÔÔSÐ’S‹‹V‹‹K\Ù]SÓ—ÑT”“Ô—ÔÕÔLH‹‹]V—BˆYˆ[Ý×ÝÜš]N‚ˆÛY˜\[™
+‹K\]ZY]ŠBˆ›Üˆ˜[YK˜[YH[ˆÛÜY
+
+˜\šXX›\ÈÜˆßJKš][\Ê
+JN‚ˆYˆ›ÝÔSÕT’PP“WÔ‘K™[X]Ú
+˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÜ[˜\šXX›H˜[YHŠBˆÛY˜\[™
+ˆ‹K\Ù]^Û˜[Y_O^Ý˜[Y_HŠBˆÈÜ[Ù\È›Ý[\œÛ]H‰Û˜[YIÈ˜\šXX›\È[ˆ^\ÜÙYÚ]KXÛÛ[X[™‚ˆÈ™XY[™ÈHš^Y]Y\žHœ›ÛHÝ[ˆÙY\È˜[Y\È[ˆÜ[˜\šXX›\ÈÚ[BˆÈ[œÝ\š[™È[\œÛ][Ûˆ\[œÈ™Y›Ü™HÜÝÜ™TÔS™XÙZ]™\ÈHÝ][Y[‚ˆÛY™^[™
+È‹KYš[H‹‹H—JBˆ[ˆHÂˆ’ÓQHŽˆ‹Û›Û™^\Ý[‹ˆ“S‘ÈŽˆÈ‹ˆ“×ÐSŽˆÈ‹ˆ”ÐTSQHŽˆœÝXŒ˜\K]ËX›Ý‹ˆ”ÐÓQS•SÓÑS‘ÈŽˆ•UŽ‹ˆ”ÐÓÓ“‘PÕÕSQSÕUŽˆH‹ˆ”ÑUPTÑHŽˆÑUPTÑKˆ”ÒÔÕŽˆÒÔÕˆ”ÓÔSÓ”ÈŽˆ
+ˆ‹XÈÝ][Y[Ý[Y[Ý]LLXÈØÚ×Ý[Y[Ý]LŒ‚ˆYˆ[Ý×ÝÜš]Bˆ[ÙH‹XÈY˜][Ý˜[œØXÝ[Û—Ü™XYÛÛ›O[ÛˆXÈÝ][Y[Ý[Y[Ý]LLXÈØÚ×Ý[Y[Ý]LŒ‚ˆ
+Kˆ”ÔTÔÑ’SHŽˆ‹Ù]‹Û[‹ˆ”ÔTÔÕÓÔ‘ŽˆÔTÔÕÓÔ‘ˆ”ÔÔ•ŽˆÔÔ•ˆ”ÔÔÓSÑHŽˆÔÔÓSÑKˆ”ÕTÑTˆŽˆÕTÑT‹ˆBˆÝ]HÝXœ›ØÙ\ÜË˜ÚXÚ×ÛÝ]]
+ˆÛYˆ[œ]J”ÑUY˜][Ý˜[œØXÝ[Û—Ü™XYÛÛ›O[Ù™Ž×ˆˆ
+ÈÜ[
+HYˆ[Ý×ÝÜš]H[ÙHÜ[ˆ[Y[‹ˆ[˜ÛÙ[™ÏH]‹N‹ˆÝ\œ\ÝXœ›ØÙ\ÜË”ÕÕUˆ[Y[Ý]LL‹ˆ
+KœÝš\
+
+BˆYˆ›ÝÝ]‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆœÛÛ‹›ØYÊÝ]
+B‚‚™Yˆ[—ÜÜ[ÚœÛÛŠÜ[˜\šXX›\ÏS›Û™JN‚ˆ™]\›ˆÜ[—ÜÜ[ÚœÛÛŠÜ[˜\šXX›\Ë[Ý×ÝÜš]OQ˜[ÙJB‚‚™Yˆ[—ÜÜ[ÝÜš]WÚœÛÛŠÜ[˜\šXX›\ÏS›Û™JN‚ˆ™]\›ˆÜ[—ÜÜ[ÚœÛÛŠÜ[˜\šXX›\Ë[Ý×ÝÜš]OUYJB‚‚™YˆXÊŠN‚ˆYˆˆ\È›Û™N‚ˆ™]\›ˆXÚ[X[
+ŒŠBˆžN‚ˆ™]\›ˆXÚ[X[
+ÝŠŠJBˆ^Ù\[˜[YÜ\˜][ÛŽ‚ˆ™]\›ˆXÚ[X[
+ŒŠB‚‚™Yˆ[Û™^JŠN‚ˆHXÊŠBˆÈHˆžÙ‹Œ™ŸH‹œœÝš\
+ŒŠKœœÝš\
+‹ˆŠBˆ™]\›ˆÈYˆÈ[ÙHŒ‚‚‚™Yˆ[JŠN‚ˆ™]\›ˆÝŠ[
+ˆÜˆ
+JB‚‚™Yˆ›Ü›X]ÝÚÙ[œÊŠN‚ˆ˜[YHHX^
+XÊŠKXÚ[X[
+ŒŠJBˆYˆ˜[YHHXÚ[X[
+ŒLŠN‚ˆØØ[YH˜[YHÈXÚ[X[
+ŒLŠBˆÝY™š^Hˆ‚ˆXÚ[X[ÈH‚ˆ[Yˆ˜[YHHXÚ[X[
+ŒLŠN‚ˆØØ[YH˜[YHÈXÚ[X[
+ŒLŠBˆÝY™š^H“H‚ˆXÚ[X[ÈH‚ˆ[ÙN‚ˆØØ[YH˜[YHÈXÚ[X[
+ŒLŠBˆÝY™š^HšÈ‚ˆXÚ[X[ÈHHYˆ˜[YHHXÚ[X[
+ŒLŠH[ÙH‚ˆYˆØØ[YXÚ[X[
+ŒŒHŠN‚ˆXÚ[X[ÈHÂˆ^HˆžÜØØ[Y‹žÙXÚ[X[ßYŸH‹œœÝš\
+ŒŠKœœÝš\
+‹ˆŠBˆ™]\›ˆˆžÝ^Üˆ	Ì	ß^ÜÝY™š^H‚‚‚™Yˆ›ÙÜ™\Ü×Ø˜\Š\ÙYÝ[ÚYLLŠN‚ˆ\ÙYHX^
+XÊ\ÙY
+KXÚ[X[
+ŒŠJBˆÝ[HXÊÝ[
+BˆYˆÝ[H‚ˆ™]\›ˆˆ‚ˆ˜][ÈHZ[Š\ÙYÈÝ[XÚ[X[
+ŒHŠJBˆš[YHZ[ŠÚYX^
+[
+˜][È
+ˆÚY
+ÈXÚ[X[
+ŒHŠJJJBˆ™]\›ˆˆ–ÞÉø¥¢	È
+ˆš[Y^Éø¥¤IÈ
+ˆ
+ÚYHš[Y
+_WHÛ[Û™^J˜][È
+ˆL
+_IH‚‚‚™Yˆ›Ü›X]Ý[Y\Ý[\
+˜[YJN‚ˆYˆ›Ý˜[YN‚ˆ™]\›ˆ‹H‚ˆ^HÝŠ˜[YJBˆžN‚ˆ[Y\Ý[\H]][YK™œ›ÛZ\ÛÙ›Ü›X]
+^œ™\XÙJ–ˆ‹ŠÌŒŠJBˆYˆ[Y\Ý[\š[™›È\È›Ý›Û™N‚ˆ[Y\Ý[\H[Y\Ý[\˜\Ý[Y^›Û™J›Û™R[™›Ê\ÚXKÔÚ[™ÚZHŠJBˆ™]\›ˆ[Y\Ý[\œÝ™[YJ‰VKI[KIY	R‰SN‰TÈŠBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆ^‚‚™Yˆ›Ü›X]Ù]WÜ˜[™ÙJÝ\[™
+N‚ˆYˆ›ÝÝ\Üˆ›Ý[™‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆˆžÙ›Ü›X]Ý[Y\Ý[\
+Ý\
+VÎŒL_H;ïgˆÙ›Ü›X]Ý[Y\Ý[\
+[™
+VÎŒL_H‚‚‚™Yˆ›Ü›X]Ü™Yœ™\ÚÝ[Y\Ý[\
+ÛÛ™šYÊN‚ˆ[Y^›Û™WÛ˜[YHHÛÛ™šYË™Ù]
+[Y^›Û™HŠHÜˆ\ÚXKÔÚ[™ÚZH‚ˆžN‚ˆ[Y^›Û™HH›Û™R[™›ÊÝŠ[Y^›Û™WÛ˜[YJJBˆ^Ù\
+Ù^Q\œ›Ü‹\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ[Y^›Û™HH›Û™R[™›Ê\ÚXKÔÚ[™ÚZHŠBˆ™]\›ˆ]][YK››ÝÊ[Y^›Û™JKœÝ™[YJ‰VKI[KIY	R‰SN‰TÈŠB‚‚™Yˆ›Ü›X]ÜÝ]\Ê˜[YJN‚ˆÝ]\ÈHÝŠ˜[YHÜˆ‹HŠBˆ™]\›ˆÂˆ˜XÝ]™HŽˆ¹«hùn.‹ˆ™\ØX›YŽˆ¹é yå*‹ˆ™^\™YŽˆ¹mìº/áù§'È‹ˆK™Ù]
+Ý]\Ë›ÝÙ\Š
+KÝ]\ÊB‚‚™YˆØXÚWÜ\˜Ù[YÙWÝ^
+˜[Y\ÊN‚ˆ˜[Y\ÈH˜[Y\ÈÜˆßBˆ[œ]ÝÚÙ[œÈHX^
+XÊ˜[Y\Ë™Ù]
+š[œ]ÝÚÙ[œÈŠJKXÚ[X[
+ŒŠJBˆØXÚWØÜ™X][ÛˆHX^
+XÊ˜[Y\Ë™Ù]
+˜ØXÚWØÜ™X][Û—ÝÚÙ[œÈŠJKXÚ[X[
+ŒŠJBˆØXÚWÜ™XYHX^
+XÊ˜[Y\Ë™Ù]
+˜ØXÚWÜ™XYÝÚÙ[œÈŠJKXÚ[X[
+ŒŠJBˆÝ[Ú[œ]H[œ]ÝÚÙ[œÈ
+ÈØXÚWØÜ™X][Ûˆ
+ÈØXÚWÜ™XYˆYˆÝ[Ú[œ]H‚ˆ™]\›ˆ¹¦ ¹¥è9¥l9£kˆ‚ˆ™XYÜ\˜Ù[HØXÚWÜ™XYÈÝ[Ú[œ]
+ˆLˆÜ™X][Û—Ü\˜Ù[HØXÚWØÜ™X][ÛˆÈÝ[Ú[œ]
+ˆLˆ™]\›ˆˆº+îùcåˆÛ[Û™^J™XYÜ\˜Ù[
+_I{ïg9a¦yaiHÛ[Û™^JÜ™X][Û—Ü\˜Ù[
+_IH‚‚‚™Yˆ\[™Û[Z]
+[™\ËX™[[Z]Ý˜[YK\ÙYÝ˜[YJN‚ˆ[Z]HXÊ[Z]Ý˜[YJBˆ\ÙYHXÊ\ÙYÝ˜[YJBˆYˆ[Z]H‚ˆ[™\Ë˜\[™
+ˆ¸ (ˆÛX™[{ï&¹.#zfd;ï"9mì¹å*Û[Û™^J\ÙY
+_{ï"HŠBˆ™]\›‚ˆ™[XZ[š[™ÈHX^
+[Z]H\ÙYXÚ[X[
+ŒŠJBˆÝ[[X\žHHˆ¸ (ˆÛX™[{ï&¹mì¹å*Û[Û™^J\ÙY
+_HÈ:fd:h§HÛ[Û™^J[Z]
+_HÈ9bjy/fHÛ[Û™^J™[XZ[š[™Ê_H‚ˆYˆ\ÙYˆ[Z]‚ˆÝ[[X\žH
+ÏHˆˆÈ:-¡yaîˆÛ[Û™^J\ÙYH[Z]
+_H‚ˆ[™\Ë™^[™
+ÜÝ[[X\žKˆˆÜ›ÙÜ™\Ü×Ø˜\Š\ÙY[Z]
+_H—JB‚‚™Yˆ\œÙWÝ\Ý™X[WÝ[Y\Ý[\
+˜[YJN‚ˆYˆ˜[YH\È›Û™HÜˆ\Ú[œÝ[˜ÙJ˜[YK›ÛÛ
+N‚ˆ™]\›ˆ›Û™BˆžN‚ˆYˆ\Ú[œÝ[˜ÙJ˜[YK
+[›Ø]XÚ[X[
+JHÜˆ™K™[X]Ú
+ˆ—
+ÊÎ——
+ÊOÈ‹ÝŠ˜[YJJN‚ˆ\ØÚH›Ø]
+˜[YJBˆYˆ\ØÚˆLÌÌÌ‚ˆ\ØÚÏHLˆ™]\›ˆ]][YK™œ›Û][Y\Ý[\
+\ØÚ[Y^›Û™K]ÊBˆ[Y\Ý[\H]][YK™œ›ÛZ\ÛÙ›Ü›X]
+ÝŠ˜[YJKœ™\XÙJ–ˆ‹ŠÌŒŠJBˆ™]\›ˆ[Y\Ý[\œ™\XÙJš[™›Ï][Y^›Û™K]ÊHYˆ[Y\Ý[\š[™›È\È›Û™H[ÙH[Y\Ý[\ˆ^Ù\
+Ý™\™›ÝÑ\œ›Ü‹ÔÑ\œ›Ü‹\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ›Û™B‚‚™Yˆ™\Ù]Ü™[XZ[š[™×Ý^
+˜[YK›ÝÏS›Û™JN‚ˆ™\Ù]Ø]H\œÙWÝ\Ý™X[WÝ[Y\Ý[\
+˜[YJBˆYˆ™\Ù]Ø]\È›Û™N‚ˆ™]\›ˆ›Û™BˆÝ\œ™[H]][YK››ÝÊ[Y^›Û™K]ÊHYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆYˆÝ\œ™[š[™›È\È›Û™N‚ˆÝ\œ™[HÝ\œ™[œ™\XÙJš[™›Ï][Y^›Û™K]ÊBˆÙXÛÛ™ÈH[
+
+™\Ù]Ø]HÝ\œ™[
+KÝ[ÜÙXÛÛ™Ê
+JBˆYˆÙXÛÛ™ÈH‚ˆ™]\›ˆ¹ëbyo¡yoêùáiù¦í9¥¬‚ˆ^\Ë™[XZ[™\ˆH]›[Ù
+ÙXÛÛ™Ë
+BˆÝ\œË™[XZ[™\ˆH]›[Ù
+™[XZ[™\‹ÍŒ
+BˆZ[]\ÈH™[XZ[™\ˆËÈŒˆYˆ^\Î‚ˆ™]\›ˆˆžÙ^\ßYˆ
+È
+ˆˆÚÝ\œßZˆYˆÝ\œÈ[ÙHˆŠBˆYˆÝ\œÎ‚ˆ™]\›ˆˆžÚÝ\œßZˆ
+È
+ˆˆÛZ[]\ß[HˆYˆZ[]\È[ÙHˆŠBˆ™]\›ˆˆžÛX^
+KZ[]\Ê_[H‚‚‚™Yˆ›Ü›X]ÚÙ^WÙ^\žJ˜[YK›ÝÏS›Û™JN‚ˆYˆ˜[YH\È›Û™HÜˆ
+\Ú[œÝ[˜ÙJ˜[YKÝŠH[™›Ý˜[YKœÝš\
+
+JN‚ˆ™]\›ˆ¹¬.9.#z/áù§'È‚ˆ^\™\×Ø]H\œÙWÝ\Ý™X[WÝ[Y\Ý[\
+˜[YJBˆYˆ^\™\×Ø]\È›Û™N‚ˆ™]\›ˆ¹¥l9£k¹.#ycëùå*‚ˆÝ\œ™[H]][YK››ÝÊ[Y^›Û™K]ÊHYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆYˆÝ\œ™[š[™›È\È›Û™N‚ˆÝ\œ™[HÝ\œ™[œ™\XÙJš[™›Ï][Y^›Û™K]ÊBˆ[Y\Ý[\H^\™\×Ø]˜\Ý[Y^›Û™J›Û™R[™›Ê\ÚXKÔÚ[™ÚZHŠJKœÝ™[YJ‰VKI[KIY	R‰SN‰TÈŠBˆÙXÛÛ™ÈH[
+
+^\™\×Ø]HÝ\œ™[
+KÝ[ÜÙXÛÛ™Ê
+JBˆYˆÙXÛÛ™ÈH‚ˆ™]\›ˆˆžÝ[Y\Ý[\{ïg9mìº/áù§'È‚ˆ^\Ë™[XZ[™\ˆH]›[Ù
+ÙXÛÛ™Ë
+BˆÝ\œË™[XZ[™\ˆH]›[Ù
+™[XZ[™\‹ÍŒ
+BˆZ[]\ÈH™[XZ[™\ˆËÈŒˆYˆ^\Î‚ˆ™[XZ[š[™ÈHˆžÙ^\ßYˆ
+È
+ˆˆÚÝ\œßZˆYˆÝ\œÈ[ÙHˆŠBˆ[YˆÝ\œÎ‚ˆ™[XZ[š[™ÈHˆžÚÝ\œßZˆ
+È
+ˆˆÛZ[]\ß[HˆYˆZ[]\È[ÙHˆŠBˆ[ÙN‚ˆ™[XZ[š[™ÈHˆžÛX^
+KZ[]\Ê_[H‚ˆ™]\›ˆˆžÝ[Y\Ý[\{ïg9bjy/f{ï&žÜ™[XZ[š[™ßH‚‚‚™Yˆ\[™ØXØÛÝ[Ü™\Ù]
+[™\Ë™\Ù]Ø]›ÝÏS›Û™JN‚ˆ™[XZ[š[™ÈH™\Ù]Ü™[XZ[š[™×Ý^
+™\Ù]Ø]›ÝÊBˆYˆ™[XZ[š[™Î‚ˆ[Y\Ý[\H\œÙWÝ\Ý™X[WÝ[Y\Ý[\
+™\Ù]Ø]
+K˜\Ý[Y^›Û™J›Û™R[™›Ê\ÚXKÔÚ[™ÚZHŠJBˆ[™\Ë˜\[™
+ˆˆ:aãyïk¹¥íºeí;ï&žÝ[Y\Ý[\œÝ™[YJ	ÉVKI[KIY	R‰SN‰TÉÊ_{ïg9bjy/f{ï&žÜ™[XZ[š[™ßHŠB‚‚™Yˆ\[™Û[Ù[ÜÙXÝ[ÛŠ[™\Ë]K[Ù[ÊN‚ˆ[™\Ë™^[™
+Èˆ‹]WJBˆYˆ›Ý[Ù[Î‚ˆ[™\Ë˜\[™
+¸ (ˆ9¦ ¹¥è9/oùå*:+¬9oeHŠBˆ™]\›‚ˆ›Üˆ[™^[Ù[[ˆ[[Y\˜]J[Ù[ÊN‚ˆYˆ[™^‚ˆ[™\Ë˜\[™
+ˆŠBˆ[™\Ë™^[™
+Âˆˆ¸ (ˆÛ[Ù[™Ù]
+	Û[Ù[	ÊHÜˆ	ËIß{ï&žÛ[J[Ù[™Ù]
+	Ü™\]Y\ÝÉÊJ_H9«({ïg:-.yå*Û[Û™^J[Ù[™Ù]
+	ØXÝX[ØÛÜÝ	ÊJ_H‹ˆˆˆÚÙ[œûï&º/¤ùaiHÙ›Ü›X]ÝÚÙ[œÊ[Ù[™Ù]
+	Ú[œ]ÝÚÙ[œÉÊJ_HÈ:/¤ùaîˆÙ›Ü›X]ÝÚÙ[œÊ[Ù[™Ù]
+	ÛÝ]]ÝÚÙ[œÉÊJ_H‹ˆˆˆ9ï$ùkf9ch9«å;ï&žØØXÚWÜ\˜Ù[YÙWÝ^
+[Ù[
+_H‹ˆJB‚‚™Yˆ]Y\žWÚÙ^WÝ\ØYÙJÙ^WÛ˜[YKXØÛÝ[ÚYS›Û™JN‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÙ^WÛ˜[YKÝŠHÜˆ›ÝÑVWÓSQWÔ‘K™[X]Ú
+Ù^WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÙ^H˜[YH[ˆš[™[™ÈÛÛ™šYÈŠBˆYˆXØÛÝ[ÚY\È›Ý›Û™H[™
+\Ú[œÝ[˜ÙJXØÛÝ[ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÚY[
+HÜˆXØÛÝ[ÚYH
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YXØÛÝ[Q[ˆš[™[™ÈÛÛ™šYÈŠBˆYˆXØÛÝ[ÚY\È›Û™N‚ˆÜ[H”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\K\ØYÙJ‰ÚÙ^WÛ˜[YIÊNŽ^È‚ˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[Y_JBˆÜ[H”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\K\ØYÙWÝÚ]ØXØÛÝ[
+‰ÚÙ^WÛ˜[YIË‰ØXØÛÝ[ÚY	ÎŽ˜šYÚ[
+NŽ^È‚ˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YK˜XØÛÝ[ÚYŽˆÝŠXØÛÝ[ÚY
+_JB‚‚™Yˆ]Y\žWÚÙ^WÚ\Ú\ÝÜžJÙ^WÛ˜[YKYÙOLYÙWÜÚ^™ORTÒTÕÔ–WÔQÑWÔÒV‘JN‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÙ^WÛ˜[YKÝŠHÜˆ›ÝÑVWÓSQWÔ‘K™[X]Ú
+Ù^WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÙ^H˜[YHŠBˆYˆ\Ú[œÝ[˜ÙJYÙK›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJYÙK[
+HÜˆ›ÝHYÙHHL‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YT\ÝÜžHYÙHŠBˆYˆ
+ˆ\Ú[œÝ[˜ÙJYÙWÜÚ^™K›ÛÛ
+BˆÜˆ›Ý\Ú[œÝ[˜ÙJYÙWÜÚ^™K[
+BˆÜˆ›ÝHHYÙWÜÚ^™HHŒˆ
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YT\ÝÜžHYÙHÚ^™HŠBˆÜ[H
+ˆ”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\KšÙ^WÚ\Ú\ÝÜžJ‚ˆŽ‰ÚÙ^WÛ˜[YIË‰ÛÙ™œÙ]	ÎŽš[YÙ\‹‰Û[Z]	ÎŽš[YÙ\ŠNŽ^È‚ˆ
+Bˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[ÂˆšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKˆ›Ù™œÙ]ŽˆÝŠYÙH
+ˆYÙWÜÚ^™JKˆ›[Z]ŽˆÝŠYÙWÜÚ^™JKˆJB‚‚™Yˆ]Y\žWÚÙ^WÛÝ™\šY]ÊÙ^WÛ˜[YJN‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÙ^WÛ˜[YKÝŠHÜˆ›ÝÑVWÓSQWÔ‘K™[X]Ú
+Ù^WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÙ^H˜[YHŠBˆÜ[H”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\KšÙ^WÛÝ™\šY]Ê‰ÚÙ^WÛ˜[YIÊNŽ^È‚ˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[Y_JB‚‚™Yˆ]Y\žWØXØÛÝ[Ù\Ý[X]JXØÛÝ[ÚY
+N‚ˆYˆ\Ú[œÝ[˜ÙJXØÛÝ[ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÚY[
+HÜˆXØÛÝ[ÚYH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YXØÛÝ[Q[ˆš[™[™ÈÛÛ™šYÈŠBˆÜ[H”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\K˜XØÛÝ[Ù\Ý[X]J‰ØXØÛÝ[ÚY	ÎŽ˜šYÚ[
+NŽ^È‚ˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[È˜XØÛÝ[ÚYŽˆÝŠXØÛÝ[ÚY
+_JB‚‚™Yˆ]Y\žWØXØÛÝ[ÝÙYZÛWÜ™\Ù]
+XØÛÝ[ÚY
+N‚ˆYˆ\Ú[œÝ[˜ÙJXØÛÝ[ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÚY[
+HÜˆXØÛÝ[ÚYH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YXØÛÝ[Q[ˆš[™[™ÈÛÛ™šYÈŠBˆÜ[H”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\K˜XØÛÝ[ÝÙYZÛWÜ™\Ù]
+‰ØXØÛÝ[ÚY	ÎŽ˜šYÚ[
+NŽ^È‚ˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[È˜XØÛÝ[ÚYŽˆÝŠXØÛÝ[ÚY
+_JB‚‚™YˆÜ™X]WÜ˜]WÛ[Z]Ø˜XÚÝ\
+Ù^WÛ˜[YKXØÛÝ[ÚY™\Ù]ÜÛÝ\˜ÙK˜]ÚÚY
+N‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÙ^WÛ˜[YKÝŠHÜˆ›ÝÑVWÓSQWÔ‘K™[X]Ú
+Ù^WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÙ^H˜[YHŠBˆYˆXØÛÝ[ÚY\È›Ý›Û™H[™
+ˆ\Ú[œÝ[˜ÙJXØÛÝ[ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÚY[
+HÜˆXØÛÝ[ÚYHˆ
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YXØÛÝ[QŠBˆYˆ™\Ù]ÜÛÝ\˜ÙH›Ý[ˆÈ›X[X[‹˜]]ÈŸN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y™\Ù]ÛÝ\˜ÙHŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]ÚÚYÝŠHÜˆ›Ý™K™[X]Ú
+ˆ–ÌNXKY—^ÎÌŸH‹˜]ÚÚY
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y˜XÚÝ\˜]ÚQŠBˆÜ[H
+ˆ”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\K˜˜XÚÝ\Ü˜]WÛ[Z]Ê‚ˆŽ‰ÚÙ^WÛ˜[YIË•SQŠ‰ØXØÛÝ[ÚY	Ë	ÉÊNŽ˜šYÚ[‚ˆŽ‰Ü™\Ù]ÜÛÝ\˜ÙIË‰Ø˜]ÚÚY	ÊNŽ^È‚ˆ
+Bˆ™]\›ˆ[—ÜÜ[ÝÜš]WÚœÛÛŠÜ[ÂˆšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKˆ˜XØÛÝ[ÚYŽˆˆˆYˆXØÛÝ[ÚY\È›Û™H[ÙHÝŠXØÛÝ[ÚY
+Kˆœ™\Ù]ÜÛÝ\˜ÙHŽˆ™\Ù]ÜÛÝ\˜ÙKˆ˜˜]ÚÚYŽˆ˜]ÚÚYˆJB‚‚™Yˆ]Y\žWÜ˜]WÛ[Z]Ø˜XÚÝ\Ø˜]Ú\Êš[™[™ÜÊN‚ˆÙ^WÛ˜[Y\ÈHØš[™[™ÖÈšÙ^WÛ˜[YH—H›ÜˆÝ\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊWBˆYˆ›ÝÙ^WÛ˜[Y\Î‚ˆ™]\›ˆÈ˜˜]Ú\ÈŽˆ×_BˆÜ[H
+ˆ”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\Kœ˜]WÛ[Z]Ø˜XÚÝ\Ø˜]Ú\Ê‚ˆŽ‰ÚÙ^WÛ˜[Y\ÉÎŽšœÛÛ˜ŠNŽ^È‚ˆ
+Bˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[ÈšÙ^WÛ˜[Y\ÈŽˆœÛÛ‹™[\ÊÙ^WÛ˜[Y\Ë[œÝ\™WØ\ØÚZOQ˜[ÙJ_JB‚‚™Yˆ]Y\žWÜ˜]WÛ[Z]Ø˜XÚÝ\ÊÙ^WÛ˜[YJN‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÙ^WÛ˜[YKÝŠHÜˆ›ÝÑVWÓSQWÔ‘K™[X]Ú
+Ù^WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÙ^H˜[YHŠBˆÜ[H”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\Kœ˜]WÛ[Z]Ø˜XÚÝ\Ê‰ÚÙ^WÛ˜[YIÊNŽ^È‚ˆ™]\›ˆ[—ÜÜ[ÚœÛÛŠÜ[ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[Y_JB‚‚™Yˆ™\ÝÜ™WÜ˜]WÛ[Z]Ø˜XÚÝ\
+˜XÚÝ\ÚYÙ^WÛ˜[YJN‚ˆYˆ\Ú[œÝ[˜ÙJ˜XÚÝ\ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJ˜XÚÝ\ÚY[
+HÜˆ˜XÚÝ\ÚYH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y˜XÚÝ\QŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÙ^WÛ˜[YKÝŠHÜˆ›ÝÑVWÓSQWÔ‘K™[X]Ú
+Ù^WÛ˜[YJN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÙ^H˜[YHŠBˆÜ[H
+ˆ”ÑSPÕÝXŒ˜\WÝ×Ø›ÝØ\Kœ™\ÝÜ™WÜ˜]WÛ[Z]Ø˜XÚÝ\
+‚ˆŽ‰Ø˜XÚÝ\ÚY	ÎŽ˜šYÚ[‰ÚÙ^WÛ˜[YIÊNŽ^È‚ˆ
+Bˆ™]\›ˆ[—ÜÜ[ÝÜš]WÚœÛÛŠÜ[È˜˜XÚÝ\ÚYŽˆÝŠ˜XÚÝ\ÚY
+KšÙ^WÛ˜[YHŽˆÙ^WÛ˜[Y_JB‚‚™Yˆš[™Ü˜]WÛ[Z]Ø˜XÚÝ\
+Ù^WÛ˜[YK˜XÚÝ\ÚY
+N‚ˆ]HH]Y\žWÜ˜]WÛ[Z]Ø˜XÚÝ\ÊÙ^WÛ˜[YJHÜˆßBˆYˆ]K™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ˜XÚÝ\ÛÚÝ\˜Z[YˆÙ]K™Ù]
+	Ù\œ›Ü‰Ê_HŠBˆ›Üˆ˜XÚÝ\[ˆ]K™Ù]
+˜˜XÚÝ\ÈŠHÜˆ×N‚ˆYˆ˜XÚÝ\™Ù]
+˜˜XÚÝ\ÚYŠHOH˜XÚÝ\ÚY‚ˆ™]\›ˆ]K™Ù]
+šÙ^WÚYŠK˜XÚÝ\ˆ˜Z\ÙH[[YQ\œ›ÜŠ˜XÚÝ\Ù\È›Ý™[Û™ÈÈ\ÈÛÛ™šYÝ\™YÙ^HŠB‚‚™Yˆ›Û˜XÚ×ÚÙ^WÜ˜]WÛ[Z]ÊÙ^WÛ˜[YKXØÛÝ[ÚY˜XÚÝ\ÚY
+N‚ˆÚ]Ô‘TÑUÓÔTUSÓ—ÓÐÒÎ‚ˆÙ^WÚY˜XÚÝ\Hš[™Ü˜]WÛ[Z]Ø˜XÚÝ\
+Ù^WÛ˜[YK˜XÚÝ\ÚY
+Bˆ™]\›ˆÜ›Û˜XÚ×ÚÙ^WÜ˜]WÛ[Z]×Ý[›ØÚÙY
+ˆÙ^WÛ˜[YKXØÛÝ[ÚYÙ^WÚY˜XÚÝ\ÚY˜XÚÝ\ˆ
+B‚‚™YˆÜ›Û˜XÚ×ÚÙ^WÜ˜]WÛ[Z]×Ý[›ØÚÙY
+Ù^WÛ˜[YKXØÛÝ[ÚYÙ^WÚY˜XÚÝ\ÚY˜XÚÝ\
+N‚ˆYˆ\Ú[œÝ[˜ÙJÙ^WÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJÙ^WÚY[
+HÜˆÙ^WÚYH‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ˜XÚÝ\ÛÚÝ\Y›Ý™]\›ˆH˜[YÙ^HQŠBˆÈHÙ™šXÚX[™\Ù][˜[Y]\ÈÝXŒTIÜÈ\™Ù]Y™Y\È˜]K[[Z]ØXÚK‚ˆÈ™\ÝÜš[™ÈY\Ø\™ÈXZÙ\ÈH™^™\]Y\Ý™[ØY[™\ÝÜ™Y˜[Y\Ë‚ˆ™\Ù]ÚÙ^WÜ˜]WÛ[Z]Ý\ØYÙJÙ^WÚY
+Bˆ™\ÝÜ™YH™\ÝÜ™WÜ˜]WÛ[Z]Ø˜XÚÝ\
+˜XÚÝ\ÚYÙ^WÛ˜[YJHÜˆßBˆYˆ™\ÝÜ™Y™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ˜XÚÝ\™\ÝÜ™H˜Z[YˆÜ™\ÝÜ™Y™Ù]
+	Ù\œ›Ü‰Ê_HŠBˆÚXÚÙYH]Y\žWÚÙ^WÝ\ØYÙJÙ^WÛ˜[YKXØÛÝ[ÚY
+HÜˆßBˆÚXÚÙYÚÙ^HHÚXÚÙY™Ù]
+šÙ^HŠHÜˆßBˆYˆ›ÝÚXÚÙYÚÙ^N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”›Û˜XÚÈÛÛ\]Y]ÜÝXÚXÚÈ˜Z[YŠBˆ™]\›ˆÈ˜˜XÚÝ\Žˆ˜XÚÝ\œ™\ÝÜ™YŽˆ™\ÝÜ™YšÙ^HŽˆÚXÚÙYÚÙ^_B‚‚™Yˆ›Û˜XÚ×Ø[ÚÙ^WÜ˜]WÛ[Z]Êš[™[™ÜË˜]ÚÚY
+N‚ˆÚ]Ô‘TÑUÓÔTUSÓ—ÓÐÒÎ‚ˆ˜]ÚHš[™ØÛÛ\]WØ˜XÚÝ\Ø˜]Ú
+š[™[™ÜË˜]ÚÚY
+Bˆš[™[™Ü×ØžWÛ˜[YHHÂˆš[™[™ÖÈšÙ^WÛ˜[YH—Nˆš[™[™Âˆ›ÜˆÝ\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊBˆBˆ™\\™YH×Bˆ›Üˆ˜XÚÝ\[ˆ˜]Ú™Ù]
+˜˜XÚÝ\ÈŠHÜˆ×N‚ˆÙ^WÛ˜[YHH˜XÚÝ\™Ù]
+šÙ^WÛ˜[YHŠBˆš[™[™ÈHš[™[™Ü×ØžWÛ˜[YK™Ù]
+Ù^WÛ˜[YJBˆ˜XÚÝ\ÚYH˜XÚÝ\™Ù]
+˜˜XÚÝ\ÚYŠBˆYˆ›Ýš[™[™Î‚ˆ˜Z\ÙH[[YQ\œ›ÜŠÛÛ™šYÝ\™YÙ^H\ÈZ\ÜÚ[™ÈŠBˆÙ^WÚYÝ\œ™[Ø˜XÚÝ\Hš[™Ü˜]WÛ[Z]Ø˜XÚÝ\
+Ù^WÛ˜[YK˜XÚÝ\ÚY
+Bˆ™\\™Y˜\[™
+
+Ù^WÛ˜[YKš[™[™Ë˜XÚÝ\ÚYÙ^WÚYÝ\œ™[Ø˜XÚÝ\
+JBˆ™\Ý[ÈH×Bˆ›ÜˆÙ^WÛ˜[YKš[™[™Ë˜XÚÝ\ÚYÙ^WÚYÝ\œ™[Ø˜XÚÝ\[ˆ™\\™Y‚ˆžN‚ˆÜ›Û˜XÚ×ÚÙ^WÜ˜]WÛ[Z]×Ý[›ØÚÙY
+ˆÙ^WÛ˜[YKš[™[™ÖÈ˜XØÛÝ[ÚY—KÙ^WÚY˜XÚÝ\ÚYÝ\œ™[Ø˜XÚÝ\ˆ
+Bˆ™\Ý[Ë˜\[™
+ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKœÝ]\ÈŽˆœÝXØÙ\ÜÈŸJBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆœ›Û˜XÚÈ[Ù^O^ÚÙ^WÛ˜[Y_H‹\œ›ÜŠBˆ™\Ý[Ë˜\[™
+ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YHÜˆ‹H‹œÝ]\ÈŽˆ™˜Z[YŸJBˆ™]\›ˆ˜]Ú™\Ý[Â‚‚™Yˆ›Ü›X]Ø[Ü›Û˜XÚ×Ü™\Ý[Ê˜]Ú™\Ý[ÊN‚ˆÝXØÙ\Ü×ØÛÝ[HÝ[J™\Ý[™Ù]
+œÝ]\ÈŠHOHœÝXØÙ\ÜÈˆ›Üˆ™\Ý[[ˆ™\Ý[ÊBˆ˜Z[YØÛÝ[H[Š™\Ý[ÊHHÝXØÙ\Ü×ØÛÝ[ˆ[™\ÈHÂˆ¸§!H9aj9df9fç¹®æ¹k£9¢$ˆYˆ˜Z[YØÛÝ[OH[ÙH¸¦¨;î#È9aj9df9fç¹®æ¹k£9¢$;ï#:`ê9b!ˆÙ^H9i,z-)H‹ˆˆ‹ˆˆ¹âb9§+9¥íºeí;ï&žÙ›Ü›X]Ý[Y\Ý[\
+˜]Ú™Ù]
+	ØÜ™X]YØ]	ÊJ_H‹ˆˆ¹¢$9b§ûï&žÜÝXØÙ\Ü×ØÛÝ[H‹ˆˆ¹i,z-){ï&žÙ˜Z[YØÛÝ[H‹ˆBˆ›Üˆ™\Ý[[ˆ™\Ý[Î‚ˆYˆ™\Ý[™Ù]
+œÝ]\ÈŠHOHœÝXØÙ\ÜÈŽ‚ˆ[™\Ë˜\[™
+ˆ¸§cÜ™\Ý[™Ù]
+	ÚÙ^WÛ˜[YIÊ_HŠBˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊB‚‚™YˆÛÛXÝÚÙ^WÛÝ™\šY]Êš[™[™ÜÊN‚ˆÝ™\šY]ÈH×Bˆ›Üˆ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊN‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—BˆžN‚ˆ]HH]Y\žWÚÙ^WÛÝ™\šY]ÊÙ^WÛ˜[YJHÜˆßBˆÙ^HH]K™Ù]
+šÙ^HŠHÜˆßBˆYˆ›ÝÙ^N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ“Ý™\šY]È]Y\žHY›Ý™]\›ˆTHÙ^H]HŠBˆÝ™\šY]Ë˜\[™
+ÂˆšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKˆ›\ÝÝ\ÙYØ]ŽˆÙ^K™Ù]
+›\ÝÝ\ÙYØ]ŠKˆœ˜]WÛ[Z]ÍÙŽˆÙ^K™Ù]
+œ˜]WÛ[Z]ÍÙŠKˆ\ØYÙWÍÙŽˆÙ^K™Ù]
+\ØYÙWÍÙŠKˆÙ^WÚ\ØÛÝ[Žˆ
+]K™Ù]
+š\ØÛÝ[ÈŠHÜˆßJK™Ù]
+Ù^HŠKˆžY\Ý\™^WÚ\ØÛÝ[Žˆ
+]K™Ù]
+š\ØÛÝ[ÈŠHÜˆßJK™Ù]
+žY\Ý\™^HŠKˆJBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆ›Ý™\šY]È\™Ù]^ÛX\ÚÙYÚY
+\™Ù]Ý\Ù\—ÚY
+_H‹\œ›ÜŠBˆÝ™\šY]Ë˜\[™
+ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YK™\œ›ÜˆŽˆY_JBˆ™]\›ˆÝ™\šY]Â‚‚™YˆÛÛXÝØXØÛÝ[ÛÝ™\šY]Êš[™[™ÜÊN‚ˆXØÛÝ[Øš[™[™ÜÈHßBˆ›ÜˆÝ\™Ù]Ý\Ù\—ÚYš[™[™È[ˆÛÜY
+ˆš[™[™ÜËš][\Ê
+KÙ^O[[X™H][Nˆ
+][VÌWVÈšÙ^WÛ˜[YH—K˜Ø\ÙY›Û
+
+K][VÌJBˆ
+N‚ˆXØÛÝ[ÚYHš[™[™ÖÈ˜XØÛÝ[ÚY—BˆYˆXØÛÝ[ÚY\È›Û™N‚ˆÛÛ[YBˆÙ^WÛ˜[Y\ÈHXØÛÝ[Øš[™[™ÜËœÙ]Y˜][
+XØÛÝ[ÚY×JBˆYˆš[™[™ÖÈšÙ^WÛ˜[YH—H›Ý[ˆÙ^WÛ˜[Y\Î‚ˆÙ^WÛ˜[Y\Ë˜\[™
+š[™[™ÖÈšÙ^WÛ˜[YH—JB‚ˆÝ™\šY]ÈH×Bˆ›ÜˆXØÛÝ[ÚYÙ^WÛ˜[Y\È[ˆXØÛÝ[Øš[™[™ÜËš][\Ê
+N‚ˆžN‚ˆ]HH]Y\žWØXØÛÝ[Ù\Ý[X]JXØÛÝ[ÚY
+HÜˆßBˆYˆ]K™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠXØÛÝ[\Ý[X]H]Y\žHY›Ý™]\›ˆXØÛÝ[]HŠBˆÝ™\šY]Ë˜\[™
+Âˆ˜XØÛÝ[ÚYŽˆXØÛÝ[ÚYˆ˜XØÛÝ[Û˜[YHŽˆ]K™Ù]
+›˜[YHŠKˆšÙ^WÛ˜[Y\ÈŽˆÙ^WÛ˜[Y\Ëˆ\ÙYÍÙÜ\˜Ù[Žˆ]K™Ù]
+\ÙYÍÙÜ\˜Ù[ŠKˆ˜ÛÛœÝ[YYØ[[Ý[Žˆ]K™Ù]
+˜ÛÛœÝ[YYØ[[Ý[ŠKˆœÛ˜\ÚÝÝ\]YØ]Žˆ]K™Ù]
+œÛ˜\ÚÝÝ\]YØ]ŠKˆœ™\Ù]ÍÙØ]Žˆ]K™Ù]
+Ú[™Ý×Ù[™ŠKˆJBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆ˜XØÛÝ[Ý™\šY]ÈXØÛÝ[^ÛX\ÚÙYÚY
+XØÛÝ[ÚY
+_H‹\œ›ÜŠBˆÝ™\šY]Ë˜\[™
+È˜XØÛÝ[ÚYŽˆXØÛÝ[ÚYšÙ^WÛ˜[Y\ÈŽˆÙ^WÛ˜[Y\Ë™\œ›ÜˆŽˆY_JBˆ™]\›ˆÝ™\šY]Â‚‚™YˆX\Ú×ØXØÛÝ[Û˜[YJ˜[YJN‚ˆ˜[YHHÝŠ˜[YHÜˆˆŠKœÝš\
+
+BˆYˆˆ›Ý[ˆ˜[YN‚ˆ™]\›ˆ˜[YHÜˆ¹§*¹doyd#z-)¹cíÈ‚ˆØØ[ÛXZ[ˆH˜[YKœœÜ]
+‹JBˆYˆ›ÝØØ[Üˆ›ÝÛXZ[Ž‚ˆ™]\›ˆ˜[YBˆ™]\›ˆˆžÛØØ[ÎŒ×_JŠŠÙÛXZ[ŸH‚‚‚™YˆXØÛÝ[Ù\Ý[X]YÝÝ[
+ÛÛœÝ[YYØ[[Ý[\ÙYÜ\˜Ù[
+N‚ˆYˆÛÛœÝ[YYØ[[Ý[\È›Û™HÜˆ\ÙYÜ\˜Ù[\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ\˜Ù[HXÊ\ÙYÜ\˜Ù[
+BˆYˆ\˜Ù[H‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆX^
+XÊÛÛœÝ[YYØ[[Ý[
+KXÚ[X[
+ŒŠJH
+ˆXÚ[X[
+ŒLŠHÈ\˜Ù[‚‚™Yˆ\[™ØXØÛÝ[ÛÝ™\šY]Ê[™\ËXØÛÝ[Ë›ÝÏS›Û™JN‚ˆ[™\Ë™^[™
+Èˆ‹¼'ä¬9îäyk¦º-)¹cíúaäzh§zh¡9/,—JBˆYˆ›ÝXØÛÝ[Î‚ˆ[™\Ë˜\[™
+¸ (ˆ9¦ ¹¥è:acyïk¹.¡ˆXØÛÝ[ÚY9æ¡9îäyk¦º-)¹cíøà ˆŠBˆ™]\›‚‚ˆÝ[ØÛÛœÝ[YYHXÚ[X[
+ŒŠBˆÝ[Ù\Ý[X]YHXÚ[X[
+ŒŠBˆÛÛœÝ[YYØÛÝ[Hˆ\Ý[X]YØÛÝ[Hˆ›ÜˆXØÛÝ[[ˆXØÛÝ[Î‚ˆ[™\Ë™^[™
+Èˆ‹ˆ¼'äiÛX\Ú×ØXØÛÝ[Û˜[YJXØÛÝ[™Ù]
+	ØXØÛÝ[Û˜[YIÊJ_H—JBˆ[™\Ë˜\[™
+ˆ¸ (ˆ9îäyk¦ˆÙ^{ï&žÉøà IËš›Ú[ŠXØÛÝ[™Ù]
+	ÚÙ^WÛ˜[Y\ÉÊHÜˆ×JHÜˆ	ËIßHŠBˆYˆXØÛÝ[™Ù]
+™\œ›ÜˆŠN‚ˆ[™\Ë™^[™
+Âˆ¸ (ˆ:-)¹cíù/oùå*;ï&¹¥l9£k¹.#ycëùå*‹ˆ¸ (ˆ9mì¹­¢: %úaäzh§{ï&¹¥l9£k¹.#ycëùå*‹ˆ¸ (ˆ:h¡9/,9 .úaäzh§{ï&¹¥l9£k¹.#ycëùå*‹ˆJBˆÛÛ[YB‚ˆ\ÙYÜ\˜Ù[HXØÛÝ[™Ù]
+\ÙYÍÙÜ\˜Ù[ŠBˆÛÛœÝ[YYØ[[Ý[HXØÛÝ[™Ù]
+˜ÛÛœÝ[YYØ[[Ý[ŠBˆYˆ\ÙYÜ\˜Ù[\È›Û™N‚ˆ[™\Ë˜\[™
+¸ (ˆ:-)¹cíù/oùå*;ï&¹¦ ¹¥è9¥l9£kˆŠBˆ[ÙN‚ˆ\˜Ù[HX^
+XÊ\ÙYÜ\˜Ù[
+KXÚ[X[
+ŒŠJBˆ[™\Ë™^[™
+Âˆˆ¸ (ˆ:-)¹cíù/oùå*;ï&žÛ[Û™^J\˜Ù[
+_IH‹ˆˆˆÜ›ÙÜ™\Ü×Ø˜\Š\˜Ù[L
+_H‹ˆJBˆ\[™ØXØÛÝ[Ü™\Ù]
+[™\ËXØÛÝ[™Ù]
+œ™\Ù]ÍÙØ]ŠK›ÝÊBˆYˆÛÛœÝ[YYØ[[Ý[\È›Û™N‚ˆ[™\Ë˜\[™
+¸ (ˆ9mì¹­¢: %úaäzh§{ï&¹¦ ¹¥è9¥l9£kˆŠBˆ[ÙN‚ˆÛÛœÝ[YYHX^
+XÊÛÛœÝ[YYØ[[Ý[
+KXÚ[X[
+ŒŠJBˆÝ[ØÛÛœÝ[YY
+ÏHÛÛœÝ[YYˆÛÛœÝ[YYØÛÝ[
+ÏHBˆ[™\Ë˜\[™
+ˆ¸ (ˆ9mì¹­¢: %úaäzh§{ï&‰Û[Û™^JÛÛœÝ[YY
+_HŠBˆ\Ý[X]YHXØÛÝ[Ù\Ý[X]YÝÝ[
+ÛÛœÝ[YYØ[[Ý[\ÙYÜ\˜Ù[
+BˆYˆ\Ý[X]Y\È›Û™N‚ˆ[™\Ë˜\[™
+¸ (ˆ:h¡9/,9 .úaäzh§{ï&¹¦ ¹¥è9¥l9£kˆŠBˆ[ÙN‚ˆÝ[Ù\Ý[X]Y
+ÏH\Ý[X]Yˆ\Ý[X]YØÛÝ[
+ÏHBˆ[™\Ë˜\[™
+ˆ¸ (ˆ:h¡9/,9 .úaäzh§{ï&¹î©ˆ	Û[Û™^J\Ý[X]Y
+_HŠB‚ˆ[™\Ë™^[™
+Èˆ‹¼'äéˆ9aj:`ê:-)¹cíù¬aù .È—JBˆ[™\Ë˜\[™
+ˆˆ¸ (ˆ9mì¹­¢: %úaäzh§{ï&‰Û[Û™^JÝ[ØÛÛœÝ[YY
+_H‚ˆYˆÛÛœÝ[YYØÛÝ[OH[ŠXØÛÝ[ÊH[ÙH¸ (ˆ9mì¹­¢: %úaäzh§{ï&¹¥l9£k¹.#yk£9¥m‚ˆ
+Bˆ[™\Ë˜\[™
+ˆˆ¸ (ˆ:h¡9/,9 .úaäzh§{ï&¹î©ˆ	Û[Û™^JÝ[Ù\Ý[X]Y
+_H‚ˆYˆ\Ý[X]YØÛÝ[OH[ŠXØÛÝ[ÊH[ÙH¸ (ˆ:h¡9/,9 .úaäzh§{ï&¹¥l9£k¹.#yk£9¥m‚ˆ
+B‚‚™Yˆ›Ü›X]ÚÙ^WÛÝ™\šY]ÊÝ™\šY]ËYÙOLYÙWÜÚ^™OSÕ‘T•’QU×ÔQÑWÔÒV‘KXØÛÝ[ÏS›Û™K›ÝÏS›Û™JN‚ˆYˆ\Ú[œÝ[˜ÙJYÙK›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJYÙK[
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÝ™\šY]ÈYÙHŠBˆYˆ\Ú[œÝ[˜ÙJYÙWÜÚ^™K›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJYÙWÜÚ^™K[
+HÜˆYÙWÜÚ^™HH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÝ™\šY]ÈYÙHÚ^™HŠBˆÝ[ÜYÙ\ÈHX^
+K
+[ŠÝ™\šY]ÊH
+ÈYÙWÜÚ^™HHJHËÈYÙWÜÚ^™JBˆYÙHHZ[ŠX^
+YÙK
+KÝ[ÜYÙ\ÈHJBˆYÙWÚ][\ÈHÝ™\šY]ÖÜYÙH
+ˆYÙWÜÚ^™NŠYÙH
+ÈJH
+ˆYÙWÜÚ^™WBˆ[™\ÈHÈ¼'äâˆÙ^H9 .ú)â—BˆYˆ›ÝYÙWÚ][\Î‚ˆ[™\Ë™^[™
+Èˆ‹¹¦ ¹¥è9mì¹îäyk¦ˆÙ^xà ˆ—JBˆ›Üˆ][H[ˆYÙWÚ][\Î‚ˆ[™\Ë™^[™
+Èˆ‹ˆ¼'å$HÚ][VÉÚÙ^WÛ˜[YI×_H—JBˆYˆ][K™Ù]
+™\œ›ÜˆŠN‚ˆ[™\Ë™^[™
+Âˆ¸ (ˆ9§ 9d#¹/oùå*;ï&¹¥l9£k¹.#ycëùå*‹ˆ¸ (ˆ9«ãùdj:h§yn©»ï&¹¥l9£k¹.#ycëùå*‹ˆ¸ (ˆ9c®úaãHT;ï&¹¥l9£k¹.#ycëùå*‹ˆJBˆÛÛ[YBˆ\ÝÝ\ÙYØ]H][K™Ù]
+›\ÝÝ\ÙYØ]ŠBˆ[™\Ë˜\[™
+ˆˆ¸ (ˆ9§ 9d#¹/oùå*;ï&žÙ›Ü›X]Ý[Y\Ý[\
+\ÝÝ\ÙYØ]
+HYˆ\ÝÝ\ÙYØ][ÙH	ù¦ ¹¥è9/oùå*:+¬9oeIßH‚ˆ
+Bˆ\[™Û[Z]
+[™\Ë¹«ãùdj:h§yn©ˆ‹][K™Ù]
+œ˜]WÛ[Z]ÍÙŠK][K™Ù]
+\ØYÙWÍÙŠJBˆ[™\Ë˜\[™
+ˆˆ¸ (ˆ9c®úaãHT;ï&¹.â¹¥éHÛ[J][K™Ù]
+	ÝÙ^WÚ\ØÛÝ[	ÊJ_{ïg‚ˆˆ¹¦*9¥éHÛ[J][K™Ù]
+	ÞY\Ý\™^WÚ\ØÛÝ[	ÊJ_H‚ˆ
+Bˆ\[™ØXØÛÝ[ÛÝ™\šY]Ê[™\ËXØÛÝ[ÈÜˆ×K›ÝÊBˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊKYÙKÝ[ÜYÙ\Â‚‚™Yˆ›Ü›X]ÚÙ^WÚ\Ú\ÝÜžJÙ^WÛ˜[YK]KYÙOLYÙWÜÚ^™ORTÒTÕÔ–WÔQÑWÔÒV‘JN‚ˆYˆ]K™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ’T\ÝÜžH]Y\žH˜Z[YˆÙ]K™Ù]
+	Ù\œ›Ü‰Ê_HŠBˆÝ[H]K™Ù]
+Ý[ŠBˆYˆ\Ú[œÝ[˜ÙJÝ[›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJÝ[[
+HÜˆÝ[‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ’T\ÝÜžH]Y\žHY›Ý™]\›ˆH˜[YÝ[ŠBˆÝ[ÜYÙ\ÈHX^
+K
+Ý[
+ÈYÙWÜÚ^™HHJHËÈYÙWÜÚ^™JBˆYÙHHZ[ŠX^
+YÙK
+KÝ[ÜYÙ\ÈHJBˆ[™\ÈHÂˆˆ¼'ã$ÚÙ^WÛ˜[Y_{ïg:/äHÈ9¥éyc®úaãHT‹ˆˆ‹ˆˆ¹îçú+¨z# ùfí;ï&žÙ›Ü›X]Ý[Y\Ý[\
+]K™Ù]
+	ÝÚ[™Ý×ÜÝ\	ÊJ_H:!ìùodùbcH‹ˆˆ¹c®úaãHT;ï&žÝÝ[H9.*ˆ‹ˆBˆ\ÈH]K™Ù]
+š\ÈŠHÜˆ×BˆYˆ›Ý\Î‚ˆ[™\Ë™^[™
+Èˆ‹¹¦ ¹¥èT:+¬9oexà ˆ—JBˆ›Üˆ[™^][H[ˆ[[Y\˜]J\ËÝ\\YÙH
+ˆYÙWÜÚ^™H
+ÈJN‚ˆ[™\Ë™^[™
+Âˆˆ‹ˆˆžÚ[™^KˆÚ][K™Ù]
+	Ú\ØY™\ÜÉÊHÜˆ	ËIßH‹ˆˆˆ8 (ˆ:i¥¹«({ï&žÙ›Ü›X]Ý[Y\Ý[\
+][K™Ù]
+	Ùš\œÝÜÙY[‰ÊJ_H‹ˆˆˆ8 (ˆ9§ :/ä{ï&žÙ›Ü›X]Ý[Y\Ý[\
+][K™Ù]
+	Û\ÝÜÙY[‰ÊJ_H‹ˆˆˆ8 (ˆ:+íù¬`»ï&žÛ[J][K™Ù]
+	Ü™\]Y\ÝÉÊJ_H9«(H‹ˆJBˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊKYÙKÝ[ÜYÙ\Â‚‚™YˆØYØ[\ÜÝ]J
+N‚ˆžN‚ˆÚ]Ü[ŠST•ÔÕUWÔUœˆ‹[˜ÛÙ[™ÏH]‹NŠH\ÈŽ‚ˆ˜[YHHœÛÛ‹›ØY
+ŠBˆ™]\›ˆ˜[YHYˆ\Ú[œÝ[˜ÙJ˜[YKXÝ
+H[ÙHßBˆ^Ù\š[S›Ý›Ý[™\œ›ÜŽ‚ˆ™]\›ˆßBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ×Ù˜Z[\™J˜[\Ý]HØY‹JBˆ™]\›ˆßB‚‚™YˆØ]™WØ[\ÜÝ]JÝ]JN‚ˆ\HST•ÔÕUWÔU
+È‹\‚ˆÜË›XZÙY\œÊÜËœ]™\›˜[YJST•ÔÕUWÔU
+HÜˆ‹ˆ‹^\ÝÛÚÏUYJBˆ™HÜË›Ü[Š\ÜË“×ÕÔ“Ó“HÜË“×ÐÔ‘PUÜË“×Õ•SËÍŒ
+BˆÚ]ÜË™™Ü[Š™È‹[˜ÛÙ[™ÏH]‹NŠH\ÈŽ‚ˆœÛÛ‹™[\
+Ý]K‹[œÝ\™WØ\ØÚZOQ˜[ÙK[™[LŠBˆ‹™›\Ú
+
+BˆÜË™œÞ[˜Ê‹™š[[›Ê
+JBˆÜË˜Ú[Ù
+\ÍŒ
+BˆÜËœ™\XÙJ\ST•ÔÕUWÔU
+BˆÜË˜Ú[Ù
+ST•ÔÕUWÔUÍŒ
+B‚‚™YˆØYØ]]×Ü™\Ù]ÜÝ]J
+N‚ˆžN‚ˆÚ]Ü[ŠUU×Ô‘TÑUÔÕUWÔUœˆ‹[˜ÛÙ[™ÏH]‹NŠH\ÈŽ‚ˆ˜[YHHœÛÛ‹›ØY
+ŠBˆ™]\›ˆ˜[YHYˆ\Ú[œÝ[˜ÙJ˜[YKXÝ
+H[ÙHßBˆ^Ù\š[S›Ý›Ý[™\œ›ÜŽ‚ˆ™]\›ˆßBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ×Ù˜Z[\™J˜]]È™\Ù]Ý]HØY‹JBˆ™]\›ˆßB‚‚™YˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JN‚ˆ\HUU×Ô‘TÑUÔÕUWÔU
+È‹\‚ˆÜË›XZÙY\œÊÜËœ]™\›˜[YJUU×Ô‘TÑUÔÕUWÔU
+HÜˆ‹ˆ‹^\ÝÛÚÏUYJBˆ™HÜË›Ü[Š\ÜË“×ÕÔ“Ó“HÜË“×ÐÔ‘PUÜË“×Õ•SËÍŒ
+BˆÚ]ÜË™™Ü[Š™È‹[˜ÛÙ[™ÏH]‹NŠH\ÈŽ‚ˆœÛÛ‹™[\
+Ý]K‹[œÝ\™WØ\ØÚZOQ˜[ÙK[™[LŠBˆ‹™›\Ú
+
+BˆÜË™œÞ[˜Ê‹™š[[›Ê
+JBˆÜË˜Ú[Ù
+\ÍŒ
+BˆÜËœ™\XÙJ\UU×Ô‘TÑUÔÕUWÔU
+BˆÜË˜Ú[Ù
+UU×Ô‘TÑUÔÕUWÔUÍŒ
+B‚‚™YˆØ[›ÛšXØ[Ü™\Ù]Ý[Y\Ý[\
+˜[YJN‚ˆ\œÙYH\œÙWÝ\Ý™X[WÝ[Y\Ý[\
+˜[YJBˆYˆ\œÙY\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ\œÙY˜\Ý[Y^›Û™J[Y^›Û™K]ÊKš\ÛÙ›Ü›X]
+
+Kœ™\XÙJŠÌŒ‹–ˆŠB‚‚™YˆÛÛ™šYÝ\™YØXØÛÝ[ÚÙ^\Êš[™[™ÜÊN‚ˆ™\Ý[HßBˆ›ÜˆÝ\Ù\—ÚYš[™[™È[ˆ™\Ù]ØØ[™Y]\Êš[™[™ÜÊN‚ˆXØÛÝ[ÚYHš[™[™ÖÈ˜XØÛÝ[ÚY—BˆYˆXØÛÝ[ÚY\È›Ý›Û™N‚ˆ™\Ý[œÙ]Y˜][
+XØÛÝ[ÚY×JK˜\[™
+š[™[™ÖÈšÙ^WÛ˜[YH—JBˆ™]\›ˆ™\Ý[‚‚™Yˆ›ÝYžWØYZ[œÊYZ[œË^
+N‚ˆ[]™\™YHˆ›ÜˆYZ[—Ý\Ù\—ÚY[ˆÛÜY
+YZ[œÊN‚ˆžN‚ˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆYZ[—Ý\Ù\—ÚY^Žˆ^JBˆ[]™\™Y
+ÏHBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆ››ÝYžHYZ[^ÛX\ÚÙYÚY
+YZ[—Ý\Ù\—ÚY
+_H‹\œ›ÜŠBˆ™]\›ˆ[]™\™Y‚‚™Yˆ]]×Ü™\Ù]Ø\›Ý˜[ÚÙ^X›Ø\™
+XØÛÝ[ÚYÚÙ[ŠN‚ˆ™]\›ˆœÛÛ‹™[\ÊÈš[›[™WÚÙ^X›Ø\™ŽˆÖÂˆÈ^Žˆ¸§!H9d#9¡#úaãyïkˆ‹˜Ø[˜XÚ×Ù]HŽˆˆ˜]]×Ø\›Ý™NžØXØÛÝ[ÚYNžÝÚÙ[ŸHŸKˆÈ^Žˆ¸§c9.#zaãyïkˆ‹˜Ø[˜XÚ×Ù]HŽˆˆ˜]]×Ü™Z™XÝžØXØÛÝ[ÚYNžÝÚÙ[ŸHŸKˆW_K[œÝ\™WØ\ØÚZOQ˜[ÙJB‚‚™Yˆ›ÝYžWØ]]×Ü™\Ù]Ø\›Ý˜[
+YZ[œËXØÛÝ[ÚY™\Ù]Ø]Ù^WÛ˜[Y\ËÚÙ[ŠN‚ˆ[™\ÈHÂˆ¸¦¨;î#È9¨à9­bùb,9."¹®.:-)¹cíÈÈ9¥éyê¥ùcèù¦í9¥¬‹ˆˆº-)¹cíÈQ;ï&žØXØÛÝ[ÚYH‹ˆˆ¹¥¬9æ¡È9¥ézaãyïk¹¥íºeí;ï&žÙ›Ü›X]Ý[Y\Ý[\
+™\Ù]Ø]
+_H‹ˆ¹­¢ycâˆÙ^{ï&ˆˆ
+È¸à H‹š›Ú[ŠÙ^WÛ˜[Y\ÊKˆˆ‹ˆº+íùg*È9b!ºd§ùa¡z`"y¢ê{ï&ù¥è9.®¹¤ãy/g9l!º!ê¹bª9i!ù.ïynmºaãyïk¸à ˆ‹ˆBˆ[]™\™YHˆ™\WÛX\šÝ\H]]×Ü™\Ù]Ø\›Ý˜[ÚÙ^X›Ø\™
+XØÛÝ[ÚYÚÙ[ŠBˆ›ÜˆYZ[—Ý\Ù\—ÚY[ˆÛÜY
+YZ[œÊN‚ˆžN‚ˆÊœÙ[™Y\ÜØYÙH‹Âˆ˜Ú]ÚYŽˆYZ[—Ý\Ù\—ÚYˆ^Žˆ—ˆ‹š›Ú[Š[™\ÊKˆœ™\WÛX\šÝ\Žˆ™\WÛX\šÝ\ˆJBˆ[]™\™Y
+ÏHBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆ˜]]È™\Ù]\›Ý˜[YZ[^ÛX\ÚÙYÚY
+YZ[—Ý\Ù\—ÚY
+_H‹\œ›ÜŠBˆ™]\›ˆ[]™\™Y‚‚™Yˆ^XÝ]WØ]]×Ü™\Ù]Ø\›Ý˜[
+Ý]KXØÛÝ[ÚYXØÛÝ[ÜÝ]KYZ[œËÛÛ™šYÝ\™YÚÙ^WÛ˜[Y\ÊN‚ˆ\›Ý˜[HXØÛÝ[ÜÝ]K™Ù]
+˜\›Ý˜[ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ\›Ý˜[XÝ
+HÜˆ\›Ý˜[™Ù]
+œÝ]\ÈŠHOH˜\›Ý™YŽ‚ˆ™]\›ˆ×Bˆ[™[™×ÚÙ^\ÈH\›Ý˜[™Ù]
+šÙ^\ÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ[™[™×ÚÙ^\Ë\Ý
+N‚ˆ[™[™×ÚÙ^\ÈH×Bˆ\›Ý˜[ÈšÙ^\È—HHÚÙ^WÛ˜[YH›ÜˆÙ^WÛ˜[YH[ˆ[™[™×ÚÙ^\ÈYˆÙ^WÛ˜[YH[ˆÛÛ™šYÝ\™YÚÙ^WÛ˜[Y\×Bˆ˜]ÚÚYH\›Ý˜[™Ù]
+˜˜]ÚÚYŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]ÚÚYÝŠHÜˆ›Ý™K™[X]Ú
+ˆ–ÌNXKY—^ÎÌŸH‹˜]ÚÚY
+N‚ˆ˜]ÚÚYHÙXÜ™]ËÚÙ[—Ú^
+
+Bˆ\›Ý˜[È˜˜]ÚÚY—HH˜]ÚÚYˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ™\Ý[ÈH×Bˆ›ÜˆÙ^WÛ˜[YH[ˆ\Ý
+\›Ý˜[ÈšÙ^\È—JN‚ˆžN‚ˆ\›Ý˜[ÈšÙ^\È—Kœ™[[Ý™JÙ^WÛ˜[YJBˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ˜XÚÝ\H˜XÚÝ\Ø[™Ü™\Ù]ÚÙ^JÙ^WÛ˜[YKXØÛÝ[ÚY˜]]È‹˜]ÚÚY
+Bˆ™\Ý[Ë˜\[™
+ÂˆšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKˆœÝ]\ÈŽˆœÝXØÙ\ÜÈ‹ˆ˜˜XÚÝ\ÚYŽˆ˜XÚÝ\È˜˜XÚÝ\ÚY—Kˆ˜˜XÚÝ\Žˆ˜XÚÝ\ˆJBˆ›ÝYžWØYZ[œÊˆYZ[œËˆ—ˆ‹š›Ú[ŠÂˆ¸§!H9."¹®.:-)¹cíùdj9ê¥ùcèù¦í9¥¬;ï#Ù^H9mìº!ê¹bª:aãyïkˆ‹ˆˆº-)¹cíÈQ;ï&žØXØÛÝ[ÚYH‹ˆˆ’Ù^{ï&žÚÙ^WÛ˜[Y_H‹ˆˆ¹¥¬9æ¡È9¥ézaãyïk¹¥íºeí;ï&žÙ›Ü›X]Ý[Y\Ý[\
+\›Ý˜[™Ù]
+	Ü™\Ù]Ø]	ÊJ_H‹ˆˆ¹fç¹®æ¹i!ù.ï{ï&ˆÞØ˜XÚÝ\ÉØ˜XÚÝ\ÚY	×_H‹ˆˆ‹ˆ›Ü›X]Ü™\Ù]Ø˜XÚÝ\ÜÛ˜\ÚÝ
+Ù^WÛ˜[YK˜XÚÝ\
+KˆJKˆ
+Bˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆYˆÙ^WÛ˜[YH[ˆÛÛ™šYÝ\™YÚÙ^WÛ˜[Y\È[™Ù^WÛ˜[YH›Ý[ˆ\›Ý˜[ÈšÙ^\È—N‚ˆ\›Ý˜[ÈšÙ^\È—K˜\[™
+Ù^WÛ˜[YJBˆžN‚ˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ^Ù\^Ù\[Ûˆ\ÈÝ]WÙ\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆˆ˜]]È™\Ù]Ý]H™\ÝÜ™HXØÛÝ[^ÛX\ÚÙYÚY
+XØÛÝ[ÚY
+_HÙ^O^ÚÙ^WÛ˜[Y_H‹ˆÝ]WÙ\œ›Ü‹ˆ
+BˆÙ×Ù˜Z[\™Jˆ˜]]È™\Ù]XØÛÝ[^ÛX\ÚÙYÚY
+XØÛÝ[ÚY
+_HÙ^O^ÚÙ^WÛ˜[Y_H‹\œ›ÜŠBˆ™\Ý[Ë˜\[™
+ÈšÙ^WÛ˜[YHŽˆÙ^WÛ˜[YKœÝ]\ÈŽˆ™˜Z[YŸJBˆ›ÝYžWØYZ[œÊˆYZ[œËˆ—ˆ‹š›Ú[ŠÂˆ¸§c9."¹®.:-)¹cíùdj9ê¥ùcèù¦í9¥¬;ï#9/aˆÙ^H:!ê¹bª:aãyïk¹i,z-)H‹ˆˆº-)¹cíÈQ;ï&žØXØÛÝ[ÚYH‹ˆˆ’Ù^{ï&žÚÙ^WÛ˜[Y_H‹ˆˆ¹¥¬9æ¡È9¥ézaãyïk¹¥íºeí;ï&žÙ›Ü›X]Ý[Y\Ý[\
+\›Ý˜[™Ù]
+	Ü™\Ù]Ø]	ÊJ_H‹ˆ›Ý9l!¹g*9."ù«(y¨à9§éy¥íºaãz+å{ï#9.gùcëù.éy/oùå*9¢bùbª:aãyïk¹b§ú ïxà ˆ‹ˆJKˆ
+BˆYˆ›Ý\›Ý˜[ÈšÙ^\È—N‚ˆXØÛÝ[ÜÝ]KœÜ
+˜\›Ý˜[‹›Û™JBˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ™]\›ˆ™\Ý[Â‚‚™YˆXÚYWØ]]×Ü™\Ù]Ø\›Ý˜[
+XØÛÝ[ÚYÚÙ[‹\›Ý™JN‚ˆYˆ\Ú[œÝ[˜ÙJXØÛÝ[ÚY›ÛÛ
+HÜˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÚY[
+HÜˆXØÛÝ[ÚYH‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YXØÛÝ[QŠBˆYˆ›Ý™K™[X]Ú
+ˆ–ÌNXKY—^ÎH‹ÚÙ[ˆÜˆˆŠN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y\›Ý˜[ÚÙ[ˆŠBˆÚ]ÐUU×Ô‘TÑUÓÐÒÎ‚ˆÙ™ÈHØYØÛÛ™šYÊ
+Bˆš[™[™ÜÈHÛÛ™šY×Øš[™[™ÜÊÙ™ÊBˆYZ[œÈHÛÛ™šY×ØYZ[œÊÙ™ÊBˆXØÛÝ[ÚÙ^\ÈHÛÛ™šYÝ\™YØXØÛÝ[ÚÙ^\Êš[™[™ÜÊBˆÝ]HHØYØ]]×Ü™\Ù]ÜÝ]J
+BˆXØÛÝ[ÜÝ]HH
+Ý]K™Ù]
+˜XØÛÝ[ÈŠHÜˆßJK™Ù]
+ÝŠXØÛÝ[ÚY
+JBˆ\›Ý˜[HXØÛÝ[ÜÝ]K™Ù]
+˜\›Ý˜[ŠHYˆ\Ú[œÝ[˜ÙJXØÛÝ[ÜÝ]KXÝ
+H[ÙH›Û™BˆYˆ
+ˆ›Ý\Ú[œÝ[˜ÙJ\›Ý˜[XÝ
+BˆÜˆ\›Ý˜[™Ù]
+ÚÙ[ˆŠHOHÚÙ[‚ˆÜˆ\›Ý˜[™Ù]
+œÝ]\ÈŠHOHœ[™[™È‚ˆ
+N‚ˆ™]\›ˆÈœÝ]\ÈŽˆ™^\™YŸBˆYˆ›Ý\›Ý™N‚ˆXØÛÝ[ÜÝ]KœÜ
+˜\›Ý˜[‹›Û™JBˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ›ÝYžWØYZ[œÊYZ[œËˆ¸¦å9ë¨yä!¹df9mì¹¢ä¹îçz-)¹cíÈØXØÛÝ[ÚYH9æ¡9§+9«(HÙ^H:!ê¹bª:aãyïk¸à ˆŠBˆ™]\›ˆÈœÝ]\ÈŽˆœ™Z™XÝYŸBˆ\›Ý˜[ÈœÝ]\È—HH˜\›Ý™Y‚ˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ›ÝYžWØYZ[œÊYZ[œËˆ¸§!H9ë¨yä!¹df9mì¹¢nyaáº-)¹cíÈØXØÛÝ[ÚYH9æ¡9§+9«(HÙ^H:!ê¹bª:aãyïk»ï#9«hùg*9¢iú(c8à ˆŠBˆ™\Ý[ÈH^XÝ]WØ]]×Ü™\Ù]Ø\›Ý˜[
+ˆÝ]KˆXØÛÝ[ÚYˆXØÛÝ[ÜÝ]KˆYZ[œËˆXØÛÝ[ÚÙ^\Ë™Ù]
+XØÛÝ[ÚY×JKˆ
+Bˆ™]\›ˆÈœÝ]\ÈŽˆ˜\›Ý™Y‹œ™\Ý[ÈŽˆ™\Ý[ßB‚‚™YˆÚXÚ×ØXØÛÝ[ÝÙYZÛWÜ™\Ù]Ê›ÝÏS›Û™JN‚ˆYˆ›Ý™\Ù]Ø\WØÛÛ™šYÝ\™Y
+
+N‚ˆ™]\›‚ˆ›ÝÈH[YK[YJ
+HYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆžN‚ˆÚ]ÐUU×Ô‘TÑUÓÐÒÎ‚ˆÙ™ÈHØYØÛÛ™šYÊ
+Bˆš[™[™ÜÈHÛÛ™šY×Øš[™[™ÜÊÙ™ÊBˆYZ[œÈHÛÛ™šY×ØYZ[œÊÙ™ÊBˆXØÛÝ[ÚÙ^\ÈHÛÛ™šYÝ\™YØXØÛÝ[ÚÙ^\Êš[™[™ÜÊBˆÝ]HHØYØ]]×Ü™\Ù]ÜÝ]J
+BˆXØÛÝ[ÜÝ]\ÈHÝ]K™Ù]
+˜XØÛÝ[ÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÜÝ]\ËXÝ
+N‚ˆXØÛÝ[ÜÝ]\ÈHßBˆÝ]VÈ˜XØÛÝ[È—HHXØÛÝ[ÜÝ]\Â‚ˆÛÛ™šYÝ\™YØXØÛÝ[ÚYÈHÜÝŠXØÛÝ[ÚY
+H›ÜˆXØÛÝ[ÚY[ˆXØÛÝ[ÚÙ^\ßBˆÚ[™ÙYH˜[ÙBˆ›ÜˆÝ[WØXØÛÝ[ÚY[ˆÙ]
+XØÛÝ[ÜÝ]\ÊHHÛÛ™šYÝ\™YØXØÛÝ[ÚYÎ‚ˆ[XØÛÝ[ÜÝ]\ÖÜÝ[WØXØÛÝ[ÚYBˆÚ[™ÙYHYB‚ˆ›ÜˆXØÛÝ[ÚYÙ^WÛ˜[Y\È[ˆXØÛÝ[ÚÙ^\Ëš][\Ê
+N‚ˆXØÛÝ[ÜÝ]WÚÙ^HHÝŠXØÛÝ[ÚY
+BˆžN‚ˆXØÛÝ[ÜÝ]HHXØÛÝ[ÜÝ]\Ë™Ù]
+XØÛÝ[ÜÝ]WÚÙ^JBˆYˆ\Ú[œÝ[˜ÙJXØÛÝ[ÜÝ]KXÝ
+N‚ˆYÛYØXÞWÜ[™[™×ÚÙ^\ÈHœ[™[™×ÚÙ^\Èˆ[ˆXØÛÝ[ÜÝ]BˆYØXÞWÜ[™[™×ÚÙ^\ÈHXØÛÝ[ÜÝ]KœÜ
+œ[™[™×ÚÙ^\È‹×JBˆYˆYØXÞWÜ[™[™×ÚÙ^\È[™›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÜÝ]K™Ù]
+˜\›Ý˜[ŠKXÝ
+N‚ˆXØÛÝ[ÜÝ]VÈ˜\›Ý˜[—HHÂˆÚÙ[ˆŽˆÙXÜ™]ËÚÙ[—Ú^
+
+Kˆ˜˜]ÚÚYŽˆÙXÜ™]ËÚÙ[—Ú^
+
+Kˆœ™\Ù]Ø]ŽˆXØÛÝ[ÜÝ]K™Ù]
+›ØœÙ\™YÜ™\Ù]Ø]ŠKˆ™XY[™WØ]Žˆ›Û™KˆœÝ]\ÈŽˆœ[™[™È‹ˆšÙ^\ÈŽˆÚÙ^H›ÜˆÙ^H[ˆYØXÞWÜ[™[™×ÚÙ^\ÈYˆÙ^H[ˆÙ^WÛ˜[Y\×KˆBˆYˆYÛYØXÞWÜ[™[™×ÚÙ^\Î‚ˆÚ[™ÙYHYB‚ˆ\›Ý˜[HXØÛÝ[ÜÝ]K™Ù]
+˜\›Ý˜[ŠBˆYˆ\Ú[œÝ[˜ÙJ\›Ý˜[XÝ
+N‚ˆ\›Ý˜[ÈšÙ^\È—HHÂˆÙ^H›ÜˆÙ^H[ˆ\›Ý˜[™Ù]
+šÙ^\È‹×JHYˆÙ^H[ˆÙ^WÛ˜[Y\ÂˆBˆYˆ›Ý\›Ý˜[ÈšÙ^\È—N‚ˆXØÛÝ[ÜÝ]KœÜ
+˜\›Ý˜[‹›Û™JBˆÚ[™ÙYHYBˆ[Yˆ\›Ý˜[™Ù]
+™XY[™WØ]ŠH\È›Û™N‚ˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ[]™\™YH›ÝYžWØ]]×Ü™\Ù]Ø\›Ý˜[
+ˆYZ[œËˆXØÛÝ[ÚYˆ\›Ý˜[™Ù]
+œ™\Ù]Ø]ŠKˆ\›Ý˜[ÈšÙ^\È—Kˆ\›Ý˜[™Ù]
+ÚÙ[ˆŠKˆ
+BˆYˆ[]™\™Y‚ˆ\›Ý˜[È™XY[™WØ]—HH›ÝÈ
+ÈUU×Ô‘TÑUÐT“ÕSÔÑPÓÓ‘ÂˆÚ[™ÙYHYBˆ[Yˆ
+ˆ\›Ý˜[™Ù]
+œÝ]\ÈŠHOHœ[™[™È‚ˆ[™›ÝÈH\›Ý˜[™Ù]
+™XY[™WØ]ŠBˆ
+N‚ˆ\›Ý˜[ÈœÝ]\È—HH˜\›Ý™Y‚ˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ›ÝYžWØYZ[œÊˆYZ[œËˆˆ¸£ì{î#ÈÈ9b!ºd§ùa¡y¥è9.®¹¤ãy/g;ï#:-)¹cíÈØXØÛÝ[ÚYH9æ¡Ù^H9l!º!ê¹bª:aãyïk¸à ˆ‹ˆ
+Bˆ^XÝ]WØ]]×Ü™\Ù]Ø\›Ý˜[
+ˆÝ]KXØÛÝ[ÚYXØÛÝ[ÜÝ]KYZ[œËÙ^WÛ˜[Y\Ëˆ
+Bˆ[Yˆ\›Ý˜[™Ù]
+œÝ]\ÈŠHOH˜\›Ý™YŽ‚ˆ^XÝ]WØ]]×Ü™\Ù]Ø\›Ý˜[
+ˆÝ]KXØÛÝ[ÚYXØÛÝ[ÜÝ]KYZ[œËÙ^WÛ˜[Y\Ëˆ
+B‚ˆÛ˜\ÚÝH]Y\žWØXØÛÝ[ÝÙYZÛWÜ™\Ù]
+XØÛÝ[ÚY
+HÜˆßBˆYˆÛ˜\ÚÝ™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠXØÛÝ[ÙYZÛH™\Ù]]Y\žHY›Ý™]\›ˆXØÛÝ[]HŠBˆÝ\œ™[Ü™\Ù]Ø]HØ[›ÛšXØ[Ü™\Ù]Ý[Y\Ý[\
+Û˜\ÚÝ™Ù]
+œ™\Ù]ÍÙØ]ŠJBˆYˆÝ\œ™[Ü™\Ù]Ø]\È›Û™N‚ˆÛÛ[YB‚ˆXØÛÝ[ÜÝ]HHXØÛÝ[ÜÝ]\Ë™Ù]
+XØÛÝ[ÜÝ]WÚÙ^JBˆYˆ›Ý\Ú[œÝ[˜ÙJXØÛÝ[ÜÝ]KXÝ
+N‚ˆXØÛÝ[ÜÝ]\ÖØXØÛÝ[ÜÝ]WÚÙ^WHHÈ›ØœÙ\™YÜ™\Ù]Ø]ŽˆÝ\œ™[Ü™\Ù]Ø]BˆÚ[™ÙYHYBˆÛÛ[YB‚ˆØœÙ\™YÜ™\Ù]Ø]HØ[›ÛšXØ[Ü™\Ù]Ý[Y\Ý[\
+XØÛÝ[ÜÝ]K™Ù]
+›ØœÙ\™YÜ™\Ù]Ø]ŠJB‚ˆYˆØœÙ\™YÜ™\Ù]Ø]\È›Û™N‚ˆXØÛÝ[ÜÝ]VÈ›ØœÙ\™YÜ™\Ù]Ø]—HHÝ\œ™[Ü™\Ù]Ø]ˆXØÛÝ[ÜÝ]KœÜ
+˜\›Ý˜[‹›Û™JBˆÚ[™ÙYHYBˆÛÛ[YB‚ˆÝ\œ™[ÙH\œÙWÝ\Ý™X[WÝ[Y\Ý[\
+Ý\œ™[Ü™\Ù]Ø]
+BˆØœÙ\™YÙH\œÙWÝ\Ý™X[WÝ[Y\Ý[\
+ØœÙ\™YÜ™\Ù]Ø]
+Bˆ™\Ù]ØY˜[˜ÙWÜÙXÛÛ™ÈH
+Ý\œ™[ÙHØœÙ\™YÙ
+KÝ[ÜÙXÛÛ™Ê
+BˆYˆ™\Ù]ØY˜[˜ÙWÜÙXÛÛ™ÈHUU×Ô‘TÑUÓRS—ÐQSÑWÔÑPÓÓ‘Î‚ˆXØÛÝ[ÜÝ]VÈ›ØœÙ\™YÜ™\Ù]Ø]—HHÝ\œ™[Ü™\Ù]Ø]ˆXØÛÝ[ÜÝ]VÈ˜\›Ý˜[—HHÂˆÚÙ[ˆŽˆÙXÜ™]ËÚÙ[—Ú^
+
+Kˆ˜˜]ÚÚYŽˆÙXÜ™]ËÚÙ[—Ú^
+
+Kˆœ™\Ù]Ø]ŽˆÝ\œ™[Ü™\Ù]Ø]ˆ™XY[™WØ]Žˆ›Û™KˆœÝ]\ÈŽˆœ[™[™È‹ˆšÙ^\ÈŽˆ\Ý
+Ù^WÛ˜[Y\ÊKˆBˆÚ[™ÙYHYBˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ[]™\™YH›ÝYžWØ]]×Ü™\Ù]Ø\›Ý˜[
+ˆYZ[œËXØÛÝ[ÚYÝ\œ™[Ü™\Ù]Ø]Ù^WÛ˜[Y\ËˆXØÛÝ[ÜÝ]VÈ˜\›Ý˜[—VÈÚÙ[ˆ—Kˆ
+BˆYˆ[]™\™Y‚ˆXØÛÝ[ÜÝ]VÈ˜\›Ý˜[—VÈ™XY[™WØ]—HH
+ˆ›ÝÈ
+ÈUU×Ô‘TÑUÐT“ÕSÔÑPÓÓ‘Âˆ
+BˆÛÛ[YBˆYˆ™\Ù]ØY˜[˜ÙWÜÙXÛÛ™Èˆ‚ˆXØÛÝ[ÜÝ]VÈ›ØœÙ\™YÜ™\Ù]Ø]—HHÝ\œ™[Ü™\Ù]Ø]ˆÚ[™ÙYHYBˆÛÛ[YBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆ˜]]È™\Ù]ÚXÚÈXØÛÝ[^ÛX\ÚÙYÚY
+XØÛÝ[ÚY
+_H‹\œ›ÜŠBˆYˆÚ[™ÙY‚ˆØ]™WØ]]×Ü™\Ù]ÜÝ]JÝ]JBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™J˜]]È™\Ù]ØØ[ˆ‹\œ›ÜŠB‚‚™YˆÚXÚ×ÝÙYZÛWØ[\Ê
+N‚ˆžN‚ˆÙ™ÈHØYØÛÛ™šYÊ
+Bˆš[™[™ÜÈHÛÛ™šY×Øš[™[™ÜÊÙ™ÊBˆÝ]HHØYØ[\ÜÝ]J
+BˆÚ[™ÙYH˜[ÙBˆ›Üˆ\Ù\—ÚYš[™[™È[ˆš[™[™ÜËš][\Ê
+N‚ˆžN‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—Bˆ]HH]Y\žWÚÙ^WÝ\ØYÙJÙ^WÛ˜[YKš[™[™ÖÈ˜XØÛÝ[ÚY—JHÜˆßBˆÙ^HH]K™Ù]
+šÙ^HŠHÜˆßBˆ[Z]HXÊÙ^K™Ù]
+œ˜]WÛ[Z]ÍÙŠJBˆ\ÙYHXÊÙ^K™Ù]
+\ØYÙWÍÙŠJBˆYˆ[Z]H‚ˆÛÛ[YBˆ™[XZ[š[™ÈH[Z]H\ÙYˆ˜][ÈH™[XZ[š[™ÈÈ[Z]ˆÚ[™ÝÈHÝŠÙ^K™Ù]
+Ú[™Ý×ÍÙÜÝ\ŠHÜˆ[šÛ›ÝÛˆŠBˆÝ]WÚÙ^HHˆžÝ\Ù\—ÚYNžÚÙ^WÛ˜[Y_NžÝÚ[™ÝßH‚ˆYˆ˜][ÈHXÚ[X[
+ŒŒŒŠH[™Ý]WÚÙ^H›Ý[ˆÝ]N‚ˆ^H
+ˆˆ¸¦¨;î#È9dj:fd:h§y£ä:a¤—ˆ‚ˆˆ’Ù^{ï&žÚÙ^WÛ˜[Y_Wˆ‚ˆˆ¹dj:fd:h§{ï&žÛ[Û™^J[Z]
+_Wˆ‚ˆˆ¹mì¹å*;ï&žÛ[Û™^J\ÙY
+_Wˆ‚ˆˆ¹bjy/f{ï&žÛ[Û™^JX^
+™[XZ[š[™ËXÚ[X[
+	Ì	ÊJJ_{ï"Û[Û™^JX^
+˜][ËXÚ[X[
+	Ì	ÊJH
+ˆL
+_I{ï"H‚ˆ
+BˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆ\Ù\—ÚY^Žˆ^JBˆÝ]VÜÝ]WÚÙ^WHHÈ˜[\YØ]Žˆ[YK[YJ
+_BˆÚ[™ÙYHYBˆš[
+ˆÙYZÛH[\Ù[\Ù\^ÛX\ÚÙYÚY
+\Ù\—ÚY
+_H™[XZ[š[™Ï^Ü˜][Î‹ŸH‹›\ÚUYJBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ×Ù˜Z[\™JˆÙYZÛH[\ÚXÚÈ\Ù\^ÛX\ÚÙYÚY
+\Ù\—ÚY
+_H‹JBˆYˆÚ[™ÙY‚ˆØ]™WØ[\ÜÝ]JÝ]JBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ×Ù˜Z[\™JÙYZÛH[\ØØ[ˆ‹JB‚‚™Yˆ[\ÛÛÜ
+
+N‚ˆ[YKœÛY\
+L
+BˆÚ[HYN‚ˆÚXÚ×ÝÙYZÛWØ[\Ê
+Bˆ[YKœÛY\
+X^
+ST•ÐÒPÒ×ÒS•T•SŒ
+JB‚‚™Yˆ]]×Ü™\Ù]ÛÛÜ
+
+N‚ˆ[YKœÛY\
+L
+BˆÚ[HYN‚ˆÚXÚ×ØXØÛÝ[ÝÙYZÛWÜ™\Ù]Ê
+Bˆ[YKœÛY\
+X^
+UU×Ô‘TÑUÐÒPÒ×ÒS•T•SŒ
+JB‚‚™Yˆ›Ü›X]Ý\ØYÙJÙ^WÛ˜[YK]K›ÝÏS›Û™JN‚ˆYˆ]K™Ù]
+™\œ›ÜˆŠHOH™\XØ]WÚÙ^WÛ˜[YHŽ‚ˆ™]\›ˆ
+ˆˆ¸¦¨;î#È9¨à9­bùb,9i&¹.*¹d#9d#HÙ^{ï&žÚÙ^WÛ˜[Y_W—ˆ‚ˆ¹..º`oùacy¦/¹é.ºe&z+ëùå*9¢-ùæ¡9¥l9£k»ï#:+íùab9g*ÝXŒTH9.+yl!ˆÙ^H9d#yéì9/ë¹¥.y..¹e+ù. 9d#yéì8à ˆ‚ˆ
+BˆÈH]K™Ù]
+šÙ^HŠBˆYˆ›ÝÎ‚ˆ™]\›ˆˆ¹§*¹¢o¹b,9îäyk¦¹æ¡Ù^{ï&žÚÙ^WÛ˜[Y_H‚ˆÙ]™[—Ù^\ÈH]K™Ù]
+œÙ]™[—Ù^\ÈŠHÜˆßBˆÙ^HH]K™Ù]
+Ù^HŠHÜˆßBˆ[Ù[×ÝÙ^HH]K™Ù]
+›[Ù[×ÝÙ^HŠHÜˆ×Bˆ[Ù[×ÍÙH]K™Ù]
+›[Ù[×ÍÙŠHÜˆ×Bˆ\Ý™X[WØXØÛÝ[H]K™Ù]
+\Ý™X[WØXØÛÝ[ŠHÜˆßBˆ[™\ÈHÂˆˆ¼'å$HÙ^{ï&žÚË™Ù]
+	Û˜[YIÊ_H‹ˆˆ¼'äáH9b,9§'ù¥íºeí;ï&žÙ›Ü›X]ÚÙ^WÙ^\žJË™Ù]
+	Ù^\™\×Ø]	ÊK›ÝÊ_H‹ˆˆ¹â­¹  {ï&žÙ›Ü›X]ÜÝ]\ÊË™Ù]
+	ÜÝ]\ÉÊJ_H‹ˆˆ‹ˆ¸£ìH:fd:h§H‹ˆBˆ\[™Û[Z]
+[™\ËH9l#ù¥íˆ‹Ë™Ù]
+œ˜]WÛ[Z]ÍZŠKË™Ù]
+\ØYÙWÍZŠJBˆYˆXÊË™Ù]
+œ˜]WÛ[Z]ÍZŠJHˆ‚ˆ\[™ØXØÛÝ[Ü™\Ù]
+[™\Ë\Ý™X[WØXØÛÝ[™Ù]
+œ™\Ù]ÍZØ]ŠK›ÝÊBˆ\[™Û[Z]
+[™\Ë¹«ãù¥éH‹Ë™Ù]
+œ˜]WÛ[Z]ÌYŠKË™Ù]
+\ØYÙWÌYŠJBˆ\[™Û[Z]
+[™\Ë¹«ãùdj‹Ë™Ù]
+œ˜]WÛ[Z]ÍÙŠKË™Ù]
+\ØYÙWÍÙŠJBˆYˆXÊË™Ù]
+œ˜]WÛ[Z]ÍÙŠJHˆ‚ˆ\[™ØXØÛÝ[Ü™\Ù]
+[™\Ë\Ý™X[WØXØÛÝ[™Ù]
+œ™\Ù]ÍÙØ]ŠK›ÝÊBˆYˆ\Ý™X[WØXØÛÝ[™Ù]
+™\œ›ÜˆŠHOH››ÝÙ›Ý[™Ž‚ˆ[™\Ë˜\[™
+ˆˆ8¦¨;î#È9§*¹¢o¹b,:acyïk¹æ¡9."¹®.:-)¹cíÈQ;ï&žÝ\Ý™X[WØXØÛÝ[™Ù]
+	ÚY	Ê_HŠBˆ[™\Ë™^[™
+Âˆˆ‹ˆ¼'äáH9.â¹¥éyå*:aãÈ‹ˆˆ¸ (ˆ:+íù¬`»ï&žÛ[JÙ^K™Ù]
+	Ü™\]Y\ÝÉÊJ_H‹ˆˆ¸ (ˆÚÙ[œûï&º/¤ùaiHÙ›Ü›X]ÝÚÙ[œÊÙ^K™Ù]
+	Ú[œ]ÝÚÙ[œÉÊJ_HÈ:/¤ùaîˆÙ›Ü›X]ÝÚÙ[œÊÙ^K™Ù]
+	ÛÝ]]ÝÚÙ[œÉÊJ_H‹ˆˆ¸ (ˆ9ï$ùkf9ch9«å;ï&žØØXÚWÜ\˜Ù[YÙWÝ^
+Ù^J_H‹ˆˆ¸ (ˆ:-.yå*;ï&žÛ[Û™^JÙ^K™Ù]
+	ØXÝX[ØÛÜÝ	ÊJ_H‹ˆJBˆ\[™Û[Ù[ÜÙXÝ[ÛŠ[™\Ë¼'é%ˆ9.â¹¥éyª(yg¢ÈÜH‹[Ù[×ÝÙ^JBˆ[™\Ë™^[™
+Âˆˆ‹ˆ¸¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ x¥ H‹ˆˆ‹ˆ¼'äâˆùi*yå*:aãÈ‹ˆJBˆÙ]™[—Ù^\×Ü˜[™ÙHH›Ü›X]Ù]WÜ˜[™ÙJÙ]™[—Ù^\Ë™Ù]
+Ú[™Ý×ÜÝ\ŠKÙ]™[—Ù^\Ë™Ù]
+Ú[™Ý×Ù[™ŠJBˆYˆÙ]™[—Ù^\×Ü˜[™ÙN‚ˆ[™\Ë˜\[™
+ˆ¹îçú+¨z# ùfí;ï&žÜÙ]™[—Ù^\×Ü˜[™Ù_HŠBˆ[™\Ë™^[™
+Âˆˆ¸ (ˆ:+íù¬`»ï&žÛ[JÙ]™[—Ù^\Ë™Ù]
+	Ü™\]Y\ÝÉÊJ_H‹ˆˆ¸ (ˆÚÙ[œûï&º/¤ùaiHÙ›Ü›X]ÝÚÙ[œÊÙ]™[—Ù^\Ë™Ù]
+	Ú[œ]ÝÚÙ[œÉÊJ_HÈ:/¤ùaîˆÙ›Ü›X]ÝÚÙ[œÊÙ]™[—Ù^\Ë™Ù]
+	ÛÝ]]ÝÚÙ[œÉÊJ_H‹ˆˆ¸ (ˆ9ï$ùkf9ch9«å;ï&žØØXÚWÜ\˜Ù[YÙWÝ^
+Ù]™[—Ù^\Ê_H‹ˆˆ¸ (ˆ:-.yå*;ï&žÛ[Û™^JÙ]™[—Ù^\Ë™Ù]
+	ØXÝX[ØÛÜÝ	ÊJ_H‹ˆJBˆYˆË™Ù]
+›\ÝÝ\ÙYØ]ŠN‚ˆ[™\Ë˜\[™
+ˆ¸ (ˆ9§ :/äy/oùå*;ï&žÙ›Ü›X]Ý[Y\Ý[\
+Ë™Ù]
+	Û\ÝÝ\ÙYØ]	ÊJ_HŠBˆ\[™Û[Ù[ÜÙXÝ[ÛŠ[™\Ë¼'é%ˆùi*yª(yg¢ÈÜH‹[Ù[×ÍÙ
+Bˆ™]\›ˆ—ˆ‹š›Ú[Š[™\ÊB‚‚™Yˆ\×Üš]˜]WÝ\Ù\—ØÚ]
+Ú]\Ù\ŠN‚ˆÚ]ÚYHÚ]™Ù]
+šYŠBˆ\Ù\—ÚYH\Ù\‹™Ù]
+šYŠBˆ™]\›ˆÚ]™Ù]
+\HŠHOHœš]˜]Hˆ[™Ú]ÚY\È›Ý›Û™H[™ÝŠÚ]ÚY
+HOHÝŠ\Ù\—ÚY
+B‚‚™Yˆ[Ý×ØÚXÚÊ\Ù\—ÚY›ÝÏS›Û™KÛÛÛÝÛS›Û™JN‚ˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+HYˆ›ÝÈ\È›Û™H[ÙH›ÝÂˆÛÛÛÝÛˆHÒPÒ×ÐÓÓÓÕÓˆYˆÛÛÛÝÛˆ\È›Û™H[ÙHÛÛÛÝÛ‚ˆÚ]ÔUWÓSRUÓÐÒÎ‚ˆ\ÝHÓTÕÐÒPÒ×Ð–WÕTÑT‹™Ù]
+\Ù\—ÚY
+BˆYˆ\Ý\È›Ý›Û™H[™›ÝÈH\ÝÛÛÛÝÛŽ‚ˆ™]\›ˆ˜[ÙKX^
+K[
+ÛÛÛÝÛˆH
+›ÝÈH\Ý
+H
+ÈŽNNJJBˆÓTÕÐÒPÒ×Ð–WÕTÑT–Ý\Ù\—ÚYHH›ÝÂˆYˆ[ŠÓTÕÐÒPÒ×Ð–WÕTÑTŠHˆMŽ‚ˆÝ]Ù™ˆH›ÝÈHX^
+X^
+ÒPÒ×ÐÓÓÓÕÓ‹QRS—ÐÒPÒ×ÐÓÓÓÕÓŠH
+ˆ‹Œ
+BˆÝ[HHÚÙ^H›ÜˆÙ^K˜[YH[ˆÓTÕÐÒPÒ×Ð–WÕTÑT‹š][\Ê
+HYˆ˜[YHÝ]Ù™—Bˆ›ÜˆÙ^H[ˆÝ[N‚ˆÓTÕÐÒPÒ×Ð–WÕTÑT‹œÜ
+Ù^K›Û™JBˆ™]\›ˆYK‚‚™Yˆ[™WÛY\ÜØYÙJ\ÙÊN‚ˆÚ]H\ÙË™Ù]
+˜Ú]‹ßJBˆ\Ù\ˆH\ÙË™Ù]
+™œ›ÛH‹ßJBˆ^Ú[ˆH
+\ÙË™Ù]
+^ŠHÜˆˆŠKœÝš\
+
+BˆÚ]ÚYHÚ]™Ù]
+šYŠBˆ\Ù\—ÚYHÝŠ\Ù\‹™Ù]
+šYŠJBˆYˆ›ÝÚ]ÚYÜˆ›Ý^Ú[Ž‚ˆ™]\›‚ˆÛYH^Ú[‹œÜ]
+
+VÌKœÜ]
+‹JVÌK›ÝÙ\Š
+BˆYˆÛY›Ý[ˆ
+‹ÜÝ\‹‹ØÚXÚÈŠN‚ˆ™]\›‚ˆYˆ›Ý\×Üš]˜]WÝ\Ù\—ØÚ]
+Ú]\Ù\ŠN‚ˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]ÚY^Žˆ¹..¹/çy¢©9å*:aãù/èy kûï#:+íùéàz b¹§.¹fj9.®¹§éz+è¸à ˆŸJBˆ™]\›‚ˆYˆÛYOH‹ÜÝ\Ž‚ˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]ÚY^Žˆ¹cäz` HØÚXÚÈ9§éz+è¹/h9îäyk¦¹æ¡ÝXŒTHÙ^H9å*:aãøà ˆŸJBˆ™]\›‚ˆÙ™ÈHØYØÛÛ™šYÊ
+Bˆš[™[™ÜÈHÛÛ™šY×Øš[™[™ÜÊÙ™ÊBˆYˆ\Ù\—ÚY[ˆÛÛ™šY×ØYZ[œÊÙ™ÊN‚ˆYˆ›Ýš[™[™ÜÎ‚ˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]ÚY^Žˆ¹odùbcy¬¨y§"zacyïk¹.îù/eyå*9¢-ùîäyk¦¸à ˆŸJBˆ™]\›‚ˆÊœÙ[™Y\ÜØYÙH‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ^Žˆº+íú`"y¢êz) y§éyç"ùæ¡Ù^{ï&ˆ‹ˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆ[ÝÙY™]žWØY\ˆH[Ý×ØÚXÚÊ\Ù\—ÚY
+BˆYˆ›Ý[ÝÙY‚ˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]ÚY^Žˆˆ¹§éz+èº/áù.£ºh¤yî`{ï#:+íÈÜ™]žWØY\ŸH9éä¹d#¹a£z+åxà ˆŸJBˆ™]\›‚ˆš[™[™ÈHš[™[™ÜË™Ù]
+\Ù\—ÚY
+BˆYˆ›Ýš[™[™Î‚ˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]ÚY^Žˆ¹/h9æ¡[YÜ˜[HQ:/æ9¬¨y§"yîäyk¦ˆÙ^xà ˆŸJBˆ™]\›‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—BˆH[YKœ\™—ØÛÝ[\Š
+BˆžN‚ˆ]HH]Y\žWÚÙ^WÝ\ØYÙJÙ^WÛ˜[YKš[™[™ÖÈ˜XØÛÝ[ÚY—JBˆHH[YKœ\™—ØÛÝ[\Š
+Bˆ™\HH›Ü›X]Ý\ØYÙJÙ^WÛ˜[YK]HÜˆßJBˆˆH[YKœ\™—ØÛÝ[\Š
+BˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]ÚY^Žˆ™\_JBˆÈH[YKœ\™—ØÛÝ[\Š
+Bˆš[
+ˆ˜ÚXÚÈÛÛ\]Y\Ù\^ÛX\ÚÙYÚY
+\Ù\—ÚY
+_H]Y\žO^ÝK]‹ŒÙŸ\È›Ü›X]^Ý‹]N‹ŒÙŸ\ÈÙ[™^ÝË]Ž‹ŒÙŸ\ÈÝ[^ÝË]‹ŒÙŸ\È‹›\ÚUYJBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙ×Ù˜Z[\™Jˆ˜ÚXÚÈ\Ù\^ÛX\ÚÙYÚY
+\Ù\—ÚY
+_H‹JBˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]ÚY^Žˆ¹§éz+è¹i,z-){ï#:+íùê#yd#¹a£z+åxà ˆŸJB‚‚™Yˆ[™WØØ[˜XÚ×Ü]Y\žJØ[˜XÚÊN‚ˆØ[˜XÚ×ÚYHØ[˜XÚË™Ù]
+šYŠBˆØ[˜XÚ×Ù]HHØ[˜XÚË™Ù]
+™]HŠHÜˆˆ‚ˆY\ÜØYÙHHØ[˜XÚË™Ù]
+›Y\ÜØYÙHŠHÜˆßBˆÚ]HY\ÜØYÙK™Ù]
+˜Ú]ŠHÜˆßBˆ\Ù\ˆHØ[˜XÚË™Ù]
+™œ›ÛHŠHÜˆßBˆ\Ù\—ÚYHÝŠ\Ù\‹™Ù]
+šYŠJBˆXÝ[Û‹Ù\\˜]Ü‹\™Ù]Ý\Ù\—ÚYHØ[˜XÚ×Ù]Kœ\][ÛŠŽˆŠBˆYˆ›ÝØ[˜XÚ×ÚYÜˆ›ÝÙ\\˜]ÜˆÜˆXÝ[Ûˆ›Ý[ˆÂˆ\ØYÙH‹›Ý™\šY]È‹›Ý™\šY]×Ø˜XÚÈ‹š\Ù]Z[‹ˆ˜˜]ÚÜÝ\‹˜˜]ÚÝÙÙÛH‹˜˜]ÚØ[‹˜˜]ÚØÛX\ˆ‹ˆ˜˜]ÚÜ™]šY]È‹˜˜]ÚØ˜XÚÈ‹˜˜]ÚØÛÛ™š\›H‹˜˜]ÚØØ[˜Ù[‹ˆœ™\Ù]Ü›Û\‹œ™\Ù]ØÛÛ™š\›H‹œ™\Ù]ØØ[˜Ù[‹ˆ˜]]×Ø\›Ý™H‹˜]]×Ü™Z™XÝ‹ˆœ›Û˜XÚ×ÜÝ\‹œ›Û˜XÚ×ÜÚ[™ÛH‹œ›Û˜XÚ×ÚÙ^H‹œ›Û˜XÚ×Ü›Û\‹ˆœ›Û˜XÚ×ØÛÛ™š\›H‹œ›Û˜XÚ×Ø[‹œ›Û˜XÚ×Ø[Ü›Û\‹ˆœ›Û˜XÚ×Ø[ØÛÛ™š\›H‹œ›Û˜XÚ×Ø˜XÚÈ‹ˆN‚ˆ™]\›‚ˆYˆ›Ý\×Üš]˜]WÝ\Ù\—ØÚ]
+Ú]\Ù\ŠN‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹..¹/çy¢©9å*:aãù/èy kûï#:+íùéàz b¹§.¹fj9.®¹§éz+è¸à ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆžN‚ˆÙ™ÈHØYØÛÛ™šYÊ
+Bˆš[™[™ÜÈHÛÛ™šY×Øš[™[™ÜÊÙ™ÊBˆYˆ\Ù\—ÚY›Ý[ˆÛÛ™šY×ØYZ[œÊÙ™ÊN‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹/h9¬¨y§"yë¨yä!¹df9§`úfd8à ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆYˆXÝ[Ûˆ[ˆÈ˜]]×Ø\›Ý™H‹˜]]×Ü™Z™XÝŸN‚ˆXØÛÝ[ÚYÝ^ÚÙ[—ÜÙ\\˜]Ü‹ÚÙ[ˆH\™Ù]Ý\Ù\—ÚYœ\][ÛŠŽˆŠBˆYˆ›ÝÚÙ[—ÜÙ\\˜]ÜˆÜˆ›ÝXØÛÝ[ÚYÝ^š\ÙYÚ]
+
+N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹k¨y¢ny/èy kù¥è9¥b9¢%¹mìº/áù§'øà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹«hùg*9i!9ä!¹§+9«(ya¬ùk¦¸ )ˆ‹ˆJBˆXÚ\Ú[ÛˆHXÚYWØ]]×Ü™\Ù]Ø\›Ý˜[
+ˆ[
+XØÛÝ[ÚYÝ^
+KÚÙ[‹XÝ[ÛˆOH˜]]×Ø\›Ý™H‹ˆ
+BˆÝ]\ÈHXÚ\Ú[Û‹™Ù]
+œÝ]\ÈŠBˆYˆÝ]\ÈOH™^\™YŽ‚ˆXÚ\Ú[Û—Ý^H¸¦¨;î#È9§+9«(z!ê¹bª:aãyïk¹k¨y¢nymìº(ªùam¹.å¹ë¨yä!¹df9i!9ä!¹¢%¹mì¹îãùi,y¥b8à ˆ‚ˆ[YˆÝ]\ÈOHœ™Z™XÝYŽ‚ˆXÚ\Ú[Û—Ý^Hˆ¸¦å9mì¹¢ä¹îçz-)¹cíÈØXØÛÝ[ÚYÝ^H9æ¡9§+9«(HÙ^H:!ê¹bª:aãyïk¸à ˆ‚ˆ[ÙN‚ˆ™\Ý[ÈHXÚ\Ú[Û‹™Ù]
+œ™\Ý[ÈŠHÜˆ×BˆÝXØÙ\Ü×ØÛÝ[HÝ[J™\Ý[™Ù]
+œÝ]\ÈŠHOHœÝXØÙ\ÜÈˆ›Üˆ™\Ý[[ˆ™\Ý[ÊBˆ˜Z[YØÛÝ[HÝ[J™\Ý[™Ù]
+œÝ]\ÈŠHOH™˜Z[Yˆ›Üˆ™\Ý[[ˆ™\Ý[ÊBˆXÚ\Ú[Û—Ý^H
+ˆˆ¸§!H9mì¹¢nyaáº-)¹cíÈØXØÛÝ[ÚYÝ^H9æ¡9§+9«(HÙ^H:!ê¹bª:aãyïk¸à —ˆ‚ˆˆ¹¢$9b§ûï&žÜÝXØÙ\Ü×ØÛÝ[{ï&ùi,z-)yo¡zaãz+å{ï&žÙ˜Z[YØÛÝ[H‚ˆ
+BˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]™Ù]
+šYŠKˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙK™Ù]
+›Y\ÜØYÙWÚYŠKˆ^ŽˆXÚ\Ú[Û—Ý^ˆJBˆ™]\›‚ˆYˆXÝ[Û‹œÝ\ÝÚ]
+œ›Û˜XÚ×ÈŠN‚ˆÚ]ÚYHÚ]™Ù]
+šYŠBˆY\ÜØYÙWÚYHY\ÜØYÙK™Ù]
+›Y\ÜØYÙWÚYŠBˆYˆY\ÜØYÙWÚY\È›Û™N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº+éy¤ãy/g9mì¹i,y¥b;ï#:+íúaãy¥¬9cäz` HØÚXÚøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOHœ›Û˜XÚ×Ø˜XÚÈˆ[™›Ý™\Ù]Ø\WØÛÛ™šYÝ\™Y
+
+N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹fç¹®æ¹b§ú ïyl&¹§*ºacyïk¸à ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOHœ›Û˜XÚ×Ø˜XÚÈŽ‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆº+íú`"y¢êz) y§éyç"ùæ¡Ù^{ï&ˆ‹ˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOHœ›Û˜XÚ×ÜÝ\Ž‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ¸¡ª{î#ÈÙ^H9/oùå*:aãùfç¹®æ——º+íú`"y¢êyfç¹®æ¹¥®yo#ûï&ˆ‹ˆœ™\WÛX\šÝ\Žˆ›Û˜XÚ×Û[ÙWÚÙ^X›Ø\™
+
+KˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOHœ›Û˜XÚ×ÜÚ[™ÛHŽ‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ¸¡ª{î#È:+íú`"y¢êzg :) yfç¹®æ¹æ¡Ù^{ï&ˆ‹ˆœ™\WÛX\šÝ\Žˆ›Û˜XÚ×ÚÙ^WÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOHœ›Û˜XÚ×Ø[Ž‚ˆ]HH]Y\žWÜ˜]WÛ[Z]Ø˜XÚÝ\Ø˜]Ú\Êš[™[™ÜÊHÜˆßBˆYˆ]K™Ù]
+™\œ›ÜˆŠN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ˜XÚÝ\˜]ÚÛÚÝ\˜Z[YˆÙ]K™Ù]
+	Ù\œ›Ü‰Ê_HŠBˆ˜]Ú\ÈH]K™Ù]
+˜˜]Ú\ÈŠHÜˆ×BˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ
+ˆ¼'äéˆ:`"y¢êyaj9df9fç¹®æ¹âb9§+—ˆ‚ˆ¹cê¹¦/¹é.¹c!yd*ùodùbcyaj:`ê9îäyk¦ˆÙ^H9æ¡9k£9¥m9i!ù.ïyâb9§+8à ˆ‚ˆYˆ˜]Ú\È[ÙBˆ¼'äéˆ9¦ ¹¥è9cëùå*9æ¡9aj9df9fç¹®æ¹âb9§+8à ——ˆ‚ˆ¹¥éùi!ù.ïyd£9§*º)¡¹æå¹aj:`ê9îäyk¦ˆÙ^H9æ¡9¢ny«(y.ãycëùceHÙ^H9fç¹®æ¸à ˆ‚ˆ
+Kˆœ™\WÛX\šÝ\Žˆ›Û˜XÚ×Ø˜]ÚÚÙ^X›Ø\™
+˜]Ú\ÊKˆJBˆ™]\›‚ˆYˆXÝ[Ûˆ[ˆÈœ›Û˜XÚ×Ø[Ü›Û\‹œ›Û˜XÚ×Ø[ØÛÛ™š\›HŸN‚ˆ˜]ÚÚYH\™Ù]Ý\Ù\—ÚYˆ˜]ÚHš[™ØÛÛ\]WØ˜XÚÝ\Ø˜]Ú
+š[™[™ÜË˜]ÚÚY
+BˆÙ^WØÛÝ[H[Š˜]Ú™Ù]
+˜˜XÚÝ\ÈŠHÜˆ×JBˆYˆXÝ[ÛˆOHœ›Û˜XÚ×Ø[Ü›Û\Ž‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ›Ü›X]Ø[Ü›Û˜XÚ×ØÛÛ™š\›X][ÛŠ˜]Ú
+Kˆœ™\WÛX\šÝ\Žˆ›Û˜XÚ×Ø[ØÛÛ™š\›X][Û—ÚÙ^X›Ø\™
+ˆ˜]ÚÚYÙ^WØÛÝ[ˆ
+KˆJBˆ™]\›‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆˆ¹«hùg*9fç¹®æ¹aj:`êÚÙ^WØÛÝ[H9.*ˆÙ^x )ˆ‹ˆJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆˆ¸£ìÈ9«hùg*9fç¹®æ¹aj:`êÚÙ^WØÛÝ[H9.*ˆÙ^{ï#:+íùê#y`&x )ˆ‹ˆJBˆ˜]Ú™\Ý[ÈH›Û˜XÚ×Ø[ÚÙ^WÜ˜]WÛ[Z]Êš[™[™ÜË˜]ÚÚY
+BˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ›Ü›X]Ø[Ü›Û˜XÚ×Ü™\Ý[Ê˜]Ú™\Ý[ÊKˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆ›Û˜XÚ×Ý\Ù\—ÚY˜XÚÝ\ÜÙ\\˜]Ü‹˜XÚÝ\ÚYÝ^H\™Ù]Ý\Ù\—ÚYœ\][ÛŠŽˆŠBˆYˆXÝ[ÛˆOHœ›Û˜XÚ×ÚÙ^HŽ‚ˆ›Û˜XÚ×Ý\Ù\—ÚYH\™Ù]Ý\Ù\—ÚYˆYˆ
+ˆ›Ý›Û˜XÚ×Ý\Ù\—ÚYš\ÙYÚ]
+
+BˆÜˆ
+XÝ[ÛˆOHœ›Û˜XÚ×ÚÙ^Hˆ[™
+ˆ›Ý˜XÚÝ\ÜÙ\\˜]ÜˆÜˆ›Ý˜XÚÝ\ÚYÝ^š\ÙYÚ]
+
+Bˆ
+JBˆ
+N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹fç¹®æ¹/èy kù¥è9¥b;ï#:+íúaãy¥¬9o 9iâøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆš[™[™ÈHš[™[™ÜË™Ù]
+›Û˜XÚ×Ý\Ù\—ÚY
+BˆYˆ›Ýš[™[™Î‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº+éHÙ^H9îäyk¦¹mì¹.#ykf9g*8à ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—BˆYˆXÝ[ÛˆOHœ›Û˜XÚ×ÚÙ^HŽ‚ˆ]HH]Y\žWÜ˜]WÛ[Z]Ø˜XÚÝ\ÊÙ^WÛ˜[YJHÜˆßBˆ˜XÚÝ\ÈH]K™Ù]
+˜˜XÚÝ\ÈŠHÜˆ×BˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆ^H
+ˆˆ¸¡ª{î#ÈÚÙ^WÛ˜[Y_H9§ :/äyæ¡9fç¹®æ¹i!ù.ï{ï&ˆ‚ˆYˆ˜XÚÝ\È[ÙBˆˆ¸¡ª{î#ÈÚÙ^WÛ˜[Y_H9¦ ¹¥è9cëùfç¹®æ¹i!ù.ïxà ˆ‚ˆ
+BˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ^ˆœ™\WÛX\šÝ\Žˆ›Û˜XÚ×Ø˜XÚÝ\ÚÙ^X›Ø\™
+›Û˜XÚ×Ý\Ù\—ÚY˜XÚÝ\ÊKˆJBˆ™]\›‚ˆ˜XÚÝ\ÚYH[
+˜XÚÝ\ÚYÝ^
+BˆYˆXÝ[ÛˆOHœ›Û˜XÚ×Ü›Û\Ž‚ˆÚÙ^WÚY˜XÚÝ\Hš[™Ü˜]WÛ[Z]Ø˜XÚÝ\
+Ù^WÛ˜[YK˜XÚÝ\ÚY
+BˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ›Ü›X]Ü›Û˜XÚ×Ø˜XÚÝ\
+Ù^WÛ˜[YK˜XÚÝ\
+Kˆœ™\WÛX\šÝ\Žˆ›Û˜XÚ×ØÛÛ™š\›X][Û—ÚÙ^X›Ø\™
+›Û˜XÚ×Ý\Ù\—ÚY˜XÚÝ\ÚY
+KˆJBˆ™]\›‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆˆ¹«hùg*9fç¹®æˆÚÙ^WÛ˜[Y_x )ˆ‹ˆJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆˆ¸£ìÈ9«hùg*9fç¹®æˆÚÙ^WÛ˜[Y_H9b,9i!ù.ïHÞØ˜XÚÝ\ÚY{ï#:+íùê#y`&x )ˆ‹ˆJBˆ™\Ý[H›Û˜XÚ×ÚÙ^WÜ˜]WÛ[Z]ÊˆÙ^WÛ˜[YKš[™[™ÖÈ˜XØÛÝ[ÚY—K˜XÚÝ\ÚYˆ
+BˆÚXÚÙYÚÙ^HH™\Ý[ÈšÙ^H—BˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ—ˆ‹š›Ú[ŠÂˆ¸§!HÙ^H9/oùå*:aãùmì¹k£9¥m9fç¹®æˆ‹ˆˆ’Ù^{ï&žÚÙ^WÛ˜[Y_H‹ˆˆ¹i!ù.ï{ï&ˆÞØ˜XÚÝ\ÚYH‹ˆˆH9l#ù¥í»ï&žÛ[Û™^JÚXÚÙYÚÙ^K™Ù]
+	Ý\ØYÙWÍZ	ÊJ_H‹ˆˆ¹«ãù¥é{ï&žÛ[Û™^JÚXÚÙYÚÙ^K™Ù]
+	Ý\ØYÙWÌY	ÊJ_H‹ˆˆ¹«ãùdj;ï&žÛ[Û™^JÚXÚÙYÚÙ^K™Ù]
+	Ý\ØYÙWÍÙ	ÊJ_H‹ˆ”ÝXŒTH9ï$ùkf9mì¹k¦¹d$yi,y¥b8à ˆ‹ˆJKˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOH›Ý™\šY]×Ø˜XÚÈŽ‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]™Ù]
+šYŠKˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙK™Ù]
+›Y\ÜØYÙWÚYŠKˆ^Žˆº+íú`"y¢êz) y§éyç"ùæ¡Ù^{ï&ˆ‹ˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOHš\Ù]Z[Ž‚ˆ\ÈH\™Ù]Ý\Ù\—ÚYœÜ]
+ŽˆŠBˆYˆ[Š\ÊHOHÈÜˆ[žJ›Ý\š\ÙYÚ]
+
+H›Üˆ\[ˆ\ÊN‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ’T9§éz+è¹/èy kù¥è9¥b;ï#:+íúaãy¥¬9cäz` HØÚXÚøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆ\Ý\Ù\—ÚY\ÜYÙWÝ^Ý™\šY]×ÜYÙWÝ^H\Âˆš[™[™ÈHš[™[™ÜË™Ù]
+\Ý\Ù\—ÚY
+BˆYˆ›Ýš[™[™Î‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº+éHÙ^H9îäyk¦¹mì¹.#ykf9g*8à ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆ[ÝÙY™]žWØY\ˆH[Ý×ØÚXÚÊ\Ù\—ÚYÛÛÛÝÛPQRS—ÐÒPÒ×ÐÓÓÓÕÓŠBˆYˆ›Ý[ÝÙY‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆˆ¹§éz+èº/áù.£ºh¤yî`{ï#:+íÈÜ™]žWØY\ŸH9éä¹d#¹a£z+åxà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆ™\]Y\ÝYÚ\ÜYÙHH[
+\ÜYÙWÝ^
+BˆÝ™\šY]×ÜYÙHH[
+Ý™\šY]×ÜYÙWÝ^
+Bˆ]HH]Y\žWÚÙ^WÚ\Ú\ÝÜžJš[™[™ÖÈšÙ^WÛ˜[YH—K™\]Y\ÝYÚ\ÜYÙJHÜˆßBˆ™\K\ÜYÙKÝ[ÜYÙ\ÈH›Ü›X]ÚÙ^WÚ\Ú\ÝÜžJˆš[™[™ÖÈšÙ^WÛ˜[YH—K]K™\]Y\ÝYÚ\ÜYÙBˆ
+BˆYˆ\ÜYÙHOH™\]Y\ÝYÚ\ÜYÙN‚ˆ]HH]Y\žWÚÙ^WÚ\Ú\ÝÜžJš[™[™ÖÈšÙ^WÛ˜[YH—K\ÜYÙJHÜˆßBˆ™\K\ÜYÙKÝ[ÜYÙ\ÈH›Ü›X]ÚÙ^WÚ\Ú\ÝÜžJˆš[™[™ÖÈšÙ^WÛ˜[YH—K]K\ÜYÙBˆ
+Bˆ™\H
+ÏHˆ——¼'å!9b-ù¥¬9¥íºeí;ï&žÙ›Ü›X]Ü™Yœ™\ÚÝ[Y\Ý[\
+Ù™Ê_H‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]™Ù]
+šYŠKˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙK™Ù]
+›Y\ÜØYÙWÚYŠKˆ^Žˆ™\Kˆœ™\WÛX\šÝ\Žˆ\Ú\ÝÜžWÚÙ^X›Ø\™
+ˆ\Ý\Ù\—ÚY\ÜYÙKÝ[ÜYÙ\ËÝ™\šY]×ÜYÙBˆ
+KˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOH›Ý™\šY]ÈŽ‚ˆYˆ›Ý\™Ù]Ý\Ù\—ÚYš\ÙYÚ]
+
+N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹ .ú)â:hmyè y¥è9¥b;ï#:+íúaãy¥¬9cäz` HØÚXÚøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆ[ÝÙY™]žWØY\ˆH[Ý×ØÚXÚÊ\Ù\—ÚYÛÛÛÝÛPQRS—ÐÒPÒ×ÐÓÓÓÕÓŠBˆYˆ›Ý[ÝÙY‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆˆ¹§éz+èº/áù.£ºh¤yî`{ï#:+íÈÜ™]žWØY\ŸH9éä¹d#¹a£z+åxà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÝ™\šY]ÈHÛÛXÝÚÙ^WÛÝ™\šY]Êš[™[™ÜÊBˆXØÛÝ[ÈHÛÛXÝØXØÛÝ[ÛÝ™\šY]Êš[™[™ÜÊBˆ™\KYÙKÝ[ÜYÙ\ÈH›Ü›X]ÚÙ^WÛÝ™\šY]ÊˆÝ™\šY]Ë[
+\™Ù]Ý\Ù\—ÚY
+KXØÛÝ[ÏXXØÛÝ[Âˆ
+Bˆ™\H
+ÏHˆ——¼'å!9b-ù¥¬9¥íºeí;ï&žÙ›Ü›X]Ü™Yœ™\ÚÝ[Y\Ý[\
+Ù™Ê_H‚ˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]™Ù]
+šYŠKˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙK™Ù]
+›Y\ÜØYÙWÚYŠKˆ^Žˆ™\Kˆœ™\WÛX\šÝ\ŽˆÝ™\šY]×ÚÙ^X›Ø\™
+š[™[™ÜËYÙKÝ[ÜYÙ\ÊKˆJBˆ™]\›‚ˆYˆXÝ[Ûˆ[ˆÈœ™\Ù]Ü›Û\‹œ™\Ù]ØÛÛ™š\›H‹œ™\Ù]ØØ[˜Ù[ŸN‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆºaãyïk¹aiycèùmì¹¦í9¥¬;ï#:+íúaãy¥¬9cäz` HØÚXÚøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆYˆXÝ[Û‹œÝ\ÝÚ]
+˜˜]ÚÈŠN‚ˆÚ]ÚYHÚ]™Ù]
+šYŠBˆY\ÜØYÙWÚYHY\ÜØYÙK™Ù]
+›Y\ÜØYÙWÚYŠBˆYˆY\ÜØYÙWÚY\È›Û™N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº+éy¤ãy/g9mì¹i,y¥b;ï#:+íúaãy¥¬9cäz` HØÚXÚøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOH˜˜]ÚØØ[˜Ù[ˆ[™›Ý™\Ù]Ø\WØÛÛ™šYÝ\™Y
+
+N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆºaãyïk¹b§ú ïyl&¹§*ºacyïk¸à ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆØ[™Y]\ÈH™\Ù]ØØ[™Y]\Êš[™[™ÜÊBˆ˜[YÝ\Ù\—ÚYÈHØØ[™Y]WÝ\Ù\—ÚY›ÜˆØ[™Y]WÝ\Ù\—ÚYØš[™[™È[ˆØ[™Y]\ßBˆYˆXÝ[ÛˆOH˜˜]ÚÜÝ\Ž‚ˆYˆ›ÝØ[™Y]\Î‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹odùbcy¬¨y§"ycëúaãyïk¹æ¡Ù^xà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÙ[XÝYÝ\Ù\—ÚYÈHÝ\Ø˜]ÚÜ™\Ù]ÜÙ\ÜÚ[ÛŠ\Ù\—ÚYÚ]ÚYY\ÜØYÙWÚY
+BˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ˜]ÚÜ™\Ù]ÜÙ[XÝ[Û—Ý^
+[ŠØ[™Y]\ÊJKˆœ™\WÛX\šÝ\Žˆ˜]ÚÜ™\Ù]ÚÙ^X›Ø\™
+š[™[™ÜËÙ[XÝYÝ\Ù\—ÚYÊKˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOH˜˜]ÚØØ[˜Ù[Ž‚ˆš[š\ÚØ˜]ÚÜ™\Ù]ÜÙ\ÜÚ[ÛŠ\Ù\—ÚYÚ]ÚYY\ÜØYÙWÚY
+BˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚY^Žˆ¹mì¹cå¹­¢ŸJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆº+íú`"y¢êz) y§éyç"ùæ¡Ù^{ï&ˆ‹ˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOH˜˜]ÚØÛÛ™š\›HŽ‚ˆÙ[XÝYÝ\Ù\—ÚYÈHš[š\ÚØ˜]ÚÜ™\Ù]ÜÙ\ÜÚ[ÛŠˆ\Ù\—ÚYÚ]ÚYY\ÜØYÙWÚY˜[YÝ\Ù\—ÚYËˆ
+BˆYˆÙ[XÝYÝ\Ù\—ÚYÈ\È›Û™N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº`"y¢êymìº/áù§'ûï#:+íúaãy¥¬9o 9iâøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆYˆ›ÝÙ[XÝYÝ\Ù\—ÚYÎ‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆ¹¢`:`"HÙ^H9mì¹.#ykf9g*;ï#:+íúaãy¥¬9o 9iâøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÙ[XÝYØÛÝ[H[ŠÙ[XÝYÝ\Ù\—ÚYÊBˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆˆ¹«hùg*:aãyïkˆÜÙ[XÝYØÛÝ[H9.*ˆÙ^x )ˆ‹ˆJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆˆ¸£ìÈ9«hùg*:aãyïk¹nm¹i#y§éHÜÙ[XÝYØÛÝ[H9.*ˆÙ^{ï#:+íùê#y`&x )ˆ‹ˆJBˆ™\Ý[ÈH™\Ù]ÜÙ[XÝYÚÙ^\Êš[™[™ÜËÙ[XÝYÝ\Ù\—ÚYÊBˆ™\Ù]Ø˜XÚÝ\Ý^H›Ü›X]Ü™\Ù]Ø˜XÚÝ\ÜÛ˜\ÚÝÊ™\Ý[ÊBˆYˆ™\Ù]Ø˜XÚÝ\Ý^‚ˆ›ÝYžWØYZ[œÊÛÛ™šY×ØYZ[œÊÙ™ÊK™\Ù]Ø˜XÚÝ\Ý^
+BˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ›Ü›X]Ø˜]ÚÜ™\Ù]Ü™\Ý[Ê™\Ý[ËÙ™ÊKˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜÊKˆJBˆ™]\›‚ˆÜ\˜][ÛˆHÂˆ˜˜]ÚÝÙÙÛHŽˆÙÙÛH‹ˆ˜˜]ÚØ[Žˆ˜[‹ˆ˜˜]ÚØÛX\ˆŽˆ˜ÛX\ˆ‹ˆ˜˜]ÚÜ™]šY]ÈŽˆšÙY\‹ˆ˜˜]ÚØ˜XÚÈŽˆšÙY\‹ˆVØXÝ[Û—BˆÙ[XÝYÝ\Ù\—ÚYÈHÚ[™ÙWØ˜]ÚÜ™\Ù]ÜÙ[XÝ[ÛŠˆ\Ù\—ÚYˆÚ]ÚYˆY\ÜØYÙWÚYˆ˜[YÝ\Ù\—ÚYËˆÜ\˜][Û‹ˆ\™Ù]Ý\Ù\—ÚYYˆÜ\˜][ÛˆOHÙÙÛHˆ[ÙH›Û™Kˆ
+BˆYˆÙ[XÝYÝ\Ù\—ÚYÈ\È›Û™N‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº`"y¢êymìº/áù§'ù¢%ˆÙ^H9mì¹cæ9¦í;ï#:+íúaãy¥¬9o 9iâøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆYˆXÝ[ÛˆOH˜˜]ÚÜ™]šY]ÈŽ‚ˆYˆ›ÝÙ[XÝYÝ\Ù\—ÚYÎ‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº+íú!ìùl$z`"y¢êy. 9.*ˆÙ^xà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ˜]ÚÜ™\Ù]Ü™]šY]×Ý^
+š[™[™ÜËÙ[XÝYÝ\Ù\—ÚYÊKˆœ™\WÛX\šÝ\Žˆ˜]ÚÜ™\Ù]ØÛÛ™š\›X][Û—ÚÙ^X›Ø\™
+[ŠÙ[XÝYÝ\Ù\—ÚYÊJKˆJBˆ™]\›‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆˆ¹mìº`"y¢êHÛ[ŠÙ[XÝYÝ\Ù\—ÚYÊ_H9.*ˆÙ^H‹ˆJBˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]ÚYˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙWÚYˆ^Žˆ˜]ÚÜ™\Ù]ÜÙ[XÝ[Û—Ý^
+[ŠÙ[XÝYÝ\Ù\—ÚYÊK[ŠØ[™Y]\ÊJKˆœ™\WÛX\šÝ\Žˆ˜]ÚÜ™\Ù]ÚÙ^X›Ø\™
+š[™[™ÜËÙ[XÝYÝ\Ù\—ÚYÊKˆJBˆ™]\›‚ˆš[™[™ÈHš[™[™ÜË™Ù]
+\™Ù]Ý\Ù\—ÚY
+BˆYˆ›Ýš[™[™Î‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆº+éyîäyk¦¹mì¹.#ykf9g*;ï#:+íúaãy¥¬9cäz` HØÚXÚøà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÙ^WÛ˜[YHHš[™[™ÖÈšÙ^WÛ˜[YH—Bˆ[ÝÙY™]žWØY\ˆH[Ý×ØÚXÚÊ\Ù\—ÚYÛÛÛÝÛPQRS—ÐÒPÒ×ÐÓÓÓÕÓŠBˆYˆ›Ý[ÝÙY‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹Âˆ˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYˆ^Žˆˆ¹§éz+èº/áù.£ºh¤yî`{ï#:+íÈÜ™]žWØY\ŸH9éä¹d#¹a£z+åxà ˆ‹ˆœÚÝ×Ø[\ŽˆYH‹ˆJBˆ™]\›‚ˆÊ˜[œÝÙ\Ø[˜XÚÔ]Y\žH‹È˜Ø[˜XÚ×Ü]Y\žWÚYŽˆØ[˜XÚ×ÚYJBˆ]HH]Y\žWÚÙ^WÝ\ØYÙJÙ^WÛ˜[YKš[™[™ÖÈ˜XØÛÝ[ÚY—JBˆ™\HH›Ü›X]Ý\ØYÙJÙ^WÛ˜[YK]HÜˆßJBˆ™\H
+ÏHˆ——¼'å!9b-ù¥¬9¥íºeí;ï&žÙ›Ü›X]Ü™Yœ™\ÚÝ[Y\Ý[\
+Ù™Ê_H‚ˆÊ™Y]Y\ÜØYÙU^‹Âˆ˜Ú]ÚYŽˆÚ]™Ù]
+šYŠKˆ›Y\ÜØYÙWÚYŽˆY\ÜØYÙK™Ù]
+›Y\ÜØYÙWÚYŠKˆ^Žˆ™\Kˆœ™\WÛX\šÝ\ŽˆYZ[—ÚÙ^X›Ø\™
+š[™[™ÜË\™Ù]Ý\Ù\—ÚY
+KˆJBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™Jˆ˜YZ[ˆØXÝ[ÛŸH\Ù\^ÛX\ÚÙYÚY
+\Ù\—ÚY
+_H‹\œ›ÜŠBˆYˆXÝ[ÛˆOH˜˜]ÚØÛÛ™š\›HŽ‚ˆ\œ›Ü—Ý^H¹¢nzaãúaãyïk¹¢iú(c9o ¹n.;ï#:+íúaãy¥¬9cäz` HØÚXÚÈ9§éz+è¹odùbcyå*:aãøà ˆ‚ˆ[YˆXÝ[Û‹œÝ\ÝÚ]
+˜˜]ÚÈŠN‚ˆ\œ›Ü—Ý^H¹¢nzaãúaãyïk¹¤ãy/g9i,z-){ï#:+íúaãy¥¬9cäz` HØÚXÚøà ˆ‚ˆ[YˆXÝ[Û‹œÝ\ÝÚ]
+œ›Û˜XÚ×ÈŠN‚ˆ\œ›Ü—Ý^H¹fç¹®æ¹¤ãy/g9i,z-){ï&ùi!ù.ïy.ãy/çyåf{ï#:+íúaãy¥¬9cäz` HØÚXÚÈ9d#ºaãz+åxà ˆ‚ˆ[YˆXÝ[Û‹œÝ\ÝÚ]
+›Ý™\šY]ÈŠHÜˆXÝ[ÛˆOHš\Ù]Z[Ž‚ˆ\œ›Ü—Ý^H¹ .ú)â9§éz+è¹i,z-){ï#:+íùê#yd#¹a£z+åxà ˆ‚ˆ[ÙN‚ˆ\œ›Ü—Ý^H¹§éz+è¹i,z-){ï#:+íùê#yd#¹a£z+åxà ˆ‚ˆÊœÙ[™Y\ÜØYÙH‹È˜Ú]ÚYŽˆÚ]™Ù]
+šYŠK^Žˆ\œ›Ü—Ý^JB‚‚™Yˆ[™WÝ\]J\]JN‚ˆY\ÜØYÙHH\]K™Ù]
+›Y\ÜØYÙHŠBˆYˆ\Ú[œÝ[˜ÙJY\ÜØYÙKXÝ
+N‚ˆ[™WÛY\ÜØYÙJY\ÜØYÙJBˆ™]\›‚ˆØ[˜XÚÈH\]K™Ù]
+˜Ø[˜XÚ×Ü]Y\žHŠBˆYˆ\Ú[œÝ[˜ÙJØ[˜XÚËXÝ
+N‚ˆ[™WØØ[˜XÚ×Ü]Y\žJØ[˜XÚÊB‚‚˜Û\ÜÈ\]Q\Ü]Ú\Ž‚ˆYˆ×Ú[š]×ÊÙ[‹ÛÜšÙ\œËX^Ü[™[™ÊN‚ˆÙ[‹™^XÝ]ÜˆH™XYÛÛ^XÝ]ÜŠX^ÝÛÜšÙ\œÏ]ÛÜšÙ\œË™XYÛ˜[YWÜ™Yš^H[YÜ˜[K]\]HŠBˆÙ[‹œÛÝÈH™XY[™Ë›Ý[™YÙ[X\Ü™JX^Ü[™[™ÊBˆÙ[‹œÙY[—ÛØÚÈH™XY[™Ë“ØÚÊ
+BˆÙ[‹œÙY[—Ý\]\ÈHßB‚ˆYˆÝX›Z]
+Ù[‹\]WÚY\]JN‚ˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+BˆÚ]Ù[‹œÙY[—ÛØÚÎ‚ˆÝ]Ù™ˆH›ÝÈHˆÝ[HHÚÙ^H›ÜˆÙ^K˜[YH[ˆÙ[‹œÙY[—Ý\]\Ëš][\Ê
+HYˆ˜[YHÝ]Ù™—Bˆ›ÜˆÙ^H[ˆÝ[N‚ˆÙ[‹œÙY[—Ý\]\ËœÜ
+Ù^K›Û™JBˆYˆ\]WÚY[ˆÙ[‹œÙY[—Ý\]\Î‚ˆ™]\›ˆ™\XØ]H‚ˆYˆ[ŠÙ[‹œÙY[—Ý\]\ÊHHMŽ‚ˆÛ\ÝHZ[ŠÙ[‹œÙY[—Ý\]\ËÙ^O\Ù[‹œÙY[—Ý\]\Ë™Ù]
+BˆÙ[‹œÙY[—Ý\]\ËœÜ
+Û\Ý›Û™JBˆYˆ›ÝÙ[‹œÛÝË˜XÜ]Z\™J›ØÚÚ[™ÏQ˜[ÙJN‚ˆ™]\›ˆ˜\ÞH‚ˆÙ[‹œÙY[—Ý\]\ÖÝ\]WÚYHH›ÝÂˆžN‚ˆ]\™HHÙ[‹™^XÝ]Ü‹œÝX›Z]
+[™WÝ\]K\]JBˆ^Ù\^Ù\[ÛŽ‚ˆÚ]Ù[‹œÙY[—ÛØÚÎ‚ˆÙ[‹œÙY[—Ý\]\ËœÜ
+\]WÚY›Û™JBˆÙ[‹œÛÝËœ™[X\ÙJ
+Bˆ˜Z\ÙBˆ]\™K˜YÙÛ™WØØ[˜XÚÊÙ[‹—ØÛÛ\]Y
+Bˆ™]\›ˆ˜XØÙ\Y‚‚ˆYˆØÛÛ\]Y
+Ù[‹]\™JN‚ˆÙ[‹œÛÝËœ™[X\ÙJ
+BˆYˆ]\™K˜Ø[˜Ù[Y
+
+N‚ˆ™]\›‚ˆ\œ›ÜˆH]\™K™^Ù\[ÛŠ
+BˆYˆ\œ›Üˆ\È›Ý›Û™N‚ˆÙ×Ù˜Z[\™JÙXšÛÚÈ\]H‹\œ›ÜŠB‚ˆYˆÚ]ÝÛŠÙ[ŠN‚ˆÙ[‹™^XÝ]Ü‹œÚ]ÝÛŠØZ]UYKØ[˜Ù[Ù]\™\ÏUYJB‚‚˜Û\ÜÈ[™\Š˜\ÙR™\]Y\Ý[™\ŠN‚ˆÙ\™\—Ý™\œÚ[ÛˆH”ÝXŒ\UÐ›ÝÌKŒˆ‚‚ˆYˆÙ]\
+Ù[ŠN‚ˆÝ\\Š
+KœÙ]\
+
+BˆÙ[‹˜ÛÛ›™XÝ[Û‹œÙ][Y[Ý]
+L
+B‚ˆYˆ™\ÜÛ™
+Ù[‹Ý]\Ë›ÙOXˆˆŠN‚ˆÙ[‹œÙ[™Ü™\ÜÛœÙJÝ]\ÊBˆÙ[‹œÙ[™ÚXY\ŠÛÛ[U\H‹^ÜZ[ŽÈÚ\œÙ]]]‹NŠBˆÙ[‹œÙ[™ÚXY\ŠÛÛ[S[™Ý‹ÝŠ[Š›ÙJJJBˆÙ[‹œÙ[™ÚXY\ŠØXÚKPÛÛ›Û‹››Ë\ÝÜ™HŠBˆÙ[‹™[™ÚXY\œÊ
+BˆYˆ›ÙN‚ˆÙ[‹Ùš[KÜš]J›ÙJB‚ˆYˆ×ÑÑU
+Ù[ŠN‚ˆYˆÙ[‹œ]OH‹ÚX[Ž‚ˆÙ[‹œ™\ÜÛ™
+Œˆ›ÚÈŠBˆ[ÙN‚ˆÙ[‹œ™\ÜÛ™
+
+B‚ˆYˆÙ×ÛY\ÜØYÙJÙ[‹›]
+˜\™ÜÊN‚ˆ™]\›‚‚‚™Yˆ\Ü]ÚÝ\]WØ˜]Ú
+\]\Ë\Ü]Ú\‹Ù™œÙ]S›Û™JN‚ˆ›Üˆ\]H[ˆ\]\Î‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ\]KXÝ
+HÜˆ\J\]K™Ù]
+\]WÚYŠJH\È›Ý[‚ˆÛÛ[YBˆ\]WÚYH\]VÈ\]WÚY—Bˆ™^ÛÙ™œÙ]HX^
+Ù™œÙ]Üˆ\]WÚY
+ÈJBˆYˆ›Ý\Ú[œÝ[˜ÙJ\]K™Ù]
+›Y\ÜØYÙHŠKXÝ
+H[™›Ý\Ú[œÝ[˜ÙJ\]K™Ù]
+˜Ø[˜XÚ×Ü]Y\žHŠKXÝ
+N‚ˆÙ™œÙ]H™^ÛÙ™œÙ]ˆÛÛ[YBˆ™\Ý[H\Ü]Ú\‹œÝX›Z]
+\]WÚY\]JBˆYˆ™\Ý[OH˜\ÞHŽ‚ˆ™]\›ˆÙ™œÙ]YBˆÙ™œÙ]H™^ÛÙ™œÙ]ˆ™]\›ˆÙ™œÙ]˜[ÙB‚‚™YˆÛÝ\]\Ê\Ü]Ú\‹ÝÜÙ]™[
+N‚ˆÙ™œÙ]H›Û™Bˆ˜Z[\™\ÈHˆÚ[H›ÝÝÜÙ]™[š\×ÜÙ]
+
+N‚ˆ\˜[\ÈHÂˆ[Y[Ý]ŽˆÝŠÓÕSQSÕU
+Kˆ›[Z]ŽˆŒL‹ˆ˜[ÝÙYÝ\]\ÈŽˆœÛÛ‹™[\ÊÈ›Y\ÜØYÙH‹˜Ø[˜XÚ×Ü]Y\žH—JKˆBˆYˆÙ™œÙ]\È›Ý›Û™N‚ˆ\˜[\ÖÈ›Ù™œÙ]—HHÝŠÙ™œÙ]
+BˆžN‚ˆ\]\ÈHÊ™Ù]\]\È‹\˜[\Ë[Y[Ý]TÓÕSQSÕU
+ÈJBˆYˆ›Ý\Ú[œÝ[˜ÙJ\]\Ë\Ý
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ•[YÜ˜[HÙ]\]\È™]\›™YH›Û‹[\Ý™\Ý[ŠBˆÙ™œÙ]\ÞHH\Ü]ÚÝ\]WØ˜]Ú
+\]\Ë\Ü]Ú\‹Ù™œÙ]
+Bˆ˜Z[\™\ÈHˆYˆ\ÞN‚ˆÝÜÙ]™[ØZ]
+JBˆ^Ù\^Ù\[Ûˆ\È\œ›ÜŽ‚ˆÙ×Ù˜Z[\™J[YÜ˜[HÛ[™È‹\œ›ÜŠBˆ˜Z[\™\È
+ÏHBˆÝÜÙ]™[ØZ]
+Z[ŠÌˆ
+ŠˆZ[Š˜Z[\™\ÈHKJJJB‚‚™YˆXZ[Š
+N‚ˆ˜[Y]WÜ[[YWØÛÛ™šYÊ
+BˆÝÜÙ]™[H™XY[™Ë‘]™[
+
+BˆÚYÛ˜[œÚYÛ˜[
+ÚYÛ˜[”ÒQÕT“K[X™H
+—ÎˆÝÜÙ]™[œÙ]
+
+JBˆÚYÛ˜[œÚYÛ˜[
+ÚYÛ˜[”ÒQÒS•[X™H
+—ÎˆÝÜÙ]™[œÙ]
+
+JBˆÊ™[]UÙXšÛÚÈ‹È™›ÜÜ[™[™×Ý\]\ÈŽˆ™˜[ÙHŸJBˆÊœÙ]^PÛÛ[X[™È‹È˜ÛÛ[X[™ÈŽˆœÛÛ‹™[\ÊÂˆÈ˜ÛÛ[X[™Žˆ˜ÚXÚÈ‹™\ØÜš\[ÛˆŽˆ¹§éz+è¹îäyk¦ˆÙ^H9æ¡9å*:aãÈŸKˆÈ˜ÛÛ[X[™ŽˆœÝ\‹™\ØÜš\[ÛˆŽˆ¹/oùå*:+í9¦#ˆŸKˆK[œÝ\™WØ\ØÚZOQ˜[ÙJ_JBˆš[
+œÝXŒ˜\HÈ›ÝÛ™ÈÛ[™ÈÝ\Y‹›\ÚUYJBˆ™XY[™Ë•™XY
+\™Ù]X[\ÛÛÜ˜[YOHÙYZÛKX[\È‹Y[[ÛUYJKœÝ\
+
+BˆYˆ™\Ù]Ø\WØÛÛ™šYÝ\™Y
+
+N‚ˆ™XY[™Ë•™XY
+\™Ù]X]]×Ü™\Ù]ÛÛÜ˜[YOH˜XØÛÝ[]ÙYZÛK\™\Ù]È‹Y[[ÛUYJKœÝ\
+
+Bˆ\Ü]Ú\ˆH\]Q\Ü]Ú\ŠTUWÕÓÔ’ÑT”ËTUWÓPVÔS‘S‘ÊBˆH™XY[™ÒÙ\™\Š
+TÕS—ÒÔÕTÕS—ÔÔ•
+K[™\ŠBˆ™Y[[Û—Ý™XYÈHYBˆX[Ý™XYH™XY[™Ë•™XY
+\™Ù]ZœÙ\™WÙ›Ü™]™\‹˜[YOHšX[\Ù\™\ˆ‹Y[[ÛUYJBˆX[Ý™XYœÝ\
+
+BˆžN‚ˆÛÝ\]\Ê\Ü]Ú\‹ÝÜÙ]™[
+Bˆš[˜[N‚ˆœÚ]ÝÛŠ
+BˆœÙ\™\—ØÛÜÙJ
+BˆX[Ý™XYš›Ú[Š[Y[Ý]LŠBˆ\Ü]Ú\‹œÚ]ÝÛŠ
+B‚‚šYˆ×Û˜[YW×ÈOH—×ÛXZ[—×ÈŽ‚ˆXZ[Š
+B

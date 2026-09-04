@@ -1,450 +1,351 @@
-\set ON_ERROR_STOP on
+юЉmю&yєЮГтвn¶«Лси™жл{Ь™Ям…йez{м†X§{nяn)я¦Г©z¶­Љ‰зўЪ^®h­µзWЩ]У—СT”“Ф—ФХФЫ‚‚‹KHќ[€\Иљ[H\ИHЭXЊђTH]X\ЩHЭЫ™\‹€]Ь™X]\ИHЩЪ[€]Ш[‚‹KH^XЭ]HЫ™Hљ^YYЩЬ™YШ][Ы€ќ[Э[Ы‹ќ]Ш[››Э™XYЭXЊђTHX›\Л‚‚”СSPХ	РФ‘PUH“УHЭXЊ\WЭЧШ›ЭСТS€“ФХTT•TСT€“РФ‘PUQ€“РФ‘PUT“УH“ТS’T’U“Ф‘TPРUSУ€“Р–TTФФ“ИУУ“‘PХSУ€SRUIВ•ТT‘H“ХVTХИ
+СSPХH”“УHЧШШ][ЩЛњЧЬ›Ы\ИТT‘H›Ы[YHH	ЬЭXЊ\WЭЧШ›Э	КB—Щ^XВ‚ђST€“УHЭXЊ\WЭЧШ›ЭТU€СТS‚€“ФХTT•TСT‚€“РФ‘PUQ‚€“РФ‘PUT“УB€“ТS’T’U€“Ф‘TPРUSУ‚€“Р–TTФФ“В€УУ“‘PХSУ€SRUNВђST€“УHЭXЊ\WЭЧШ›ЭСUY][Э[њШXЭ[Ы—Ь™XYЫЫ›HHЫЋВђST€“УHЭXЊ\WЭЧШ›ЭСUЭ][Y[ќЭ[Y[Э]H	МLЙОВђST€“УHЭXЊ\WЭЧШ›ЭСUШЪЧЭ[Y[Э]H	МњЙОВђST€“УHЭXЊ\WЭЧШ›ЭСU[\Щљ[WЫ[Z]H	МM“P‰ОВ‚ђФ‘PUHРТSPHQ€“ХVTХИЭXЊ\WЭЧШ›ЭШ\NВ”‘U“ТСHSУ€РТSPHЭXЊ\WЭЧШ›ЭШ\H”“УHP“PОВ‚ђФ‘PUHP“HQ€“ХVTХИЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\И
+€XЪЭ\ЪYљYЪ[ќСS‘TђUQSРVTИTИQS•UH’SPT–HСVK€\WЪЩ^WЪYљYЪ[ќ“Х•S€Щ^WЫ[YH^“Х•S€XШЫЭ[ќЪYљYЪ[ќ€™\Щ]ЬЫЭ\ЩH^“Х•SТPТИ
+™\Щ]ЬЫЭ\ЩHS€
+	ЫX[ќX[	Л	Ш]]ЙКJK€]ЪЪY^€Ы\ЪЭњЫЫ€“Х•S€Ь™X]YШ][Y\Э[\€“Х•SQђUSЫШЪЧЭ[Y\Э[\
 
--- Run this file as the Sub2API database owner. It creates a login that can
--- execute one fixed aggregation function, but cannot read Sub2API tables.
+BЉNВђST€P“HЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\В€QУУSS€Q€“ХVTХИ]ЪЪY^ВђФ‘PUHS‘VQ€“ХVTХИ]WЫ[Z]ШXЪЭ\ЧШ]ЪЪYЪY€У€ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\К]ЪЪY
+B€ТT‘H]ЪЪYTИ“Х•SВ”‘U“ТСHSУ€P“HЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\И”“УHP“PОВ”‘U“ТСHSУ€P“HЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\И”“УHЭXЊ\WЭЧШ›ЭВ”‘U“ТСHSУ€СTUQSђСHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\ЧШXЪЭ\ЪYЬЩ\H”“УHP“PОВ”‘U“ТСHSУ€СTUQSђСHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\ЧШXЪЭ\ЪYЬЩ\H”“УHЭXЊ\WЭЧШ›ЭВ‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kќ\ШYЩJЪЩ^WЫ[YH^
+B”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰•ТU›Э[™ИTИ
+€СSPХ€
+]WЭќ[К	Щ^IЛ›ЭК
+HUSQH“У‘H	Р\ЪXKФЪ[™ЪZIКHH[ќ\ќ[	Н€^\ЙКB€USQH“У‘H	Р\ЪXKФЪ[™ЪZIИTИЩ]™[—Щ^\ЧЬЭ\ќ€]WЭќ[К	Щ^IЛ›ЭК
+HUSQH“У‘H	Р\ЪXKФЪ[™ЪZIКB€USQH“У‘H	Р\ЪXKФЪ[™ЪZIИTИЩ^WЬЭ\ќЉKX]Ъ[™ЧЪЩ^\ИTИ
+€СSPХY[YKЭ]\Л][ЭK][ЭWЭ\ЩY€]WЫ[Z]НZ]WЫ[Z]МY]WЫ[Z]НЩ€\ШYЩWНZ\ШYЩWМY\ШYЩWНЩ€Ъ[™ЭЧНZЬЭ\ќЪ[™ЭЧМYЬЭ\ќЪ[™ЭЧНЩЬЭ\ќ€\ЭЭ\ЩYШ]Ь™X]YШ]^\™\ЧШ]€”“УHX›XЛ\WЪЩ^\В€ТT‘H[YHHЪЩ^WЫ[YHS‘[]YШ]TИ•SЉKX]ЪШЫЭ[ќTИ
+€СSPХЫЭ[ќ
 
-SELECT 'CREATE ROLE sub2api_tg_bot LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 5'
-WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'sub2api_tg_bot')
-\gexec
+ЉNЋљ[ќYЩ\€TИЭ[€”“УHX]Ъ[™ЧЪЩ^\ВЉKИTИ
+€СSPХY[YKЭ]\Л][ЭK][ЭWЭ\ЩY€]WЫ[Z]НZ]WЫ[Z]МY]WЫ[Z]НЩ€\ШYЩWНZ\ШYЩWМY\ШYЩWНЩ€Ъ[™ЭЧНZЬЭ\ќЪ[™ЭЧМYЬЭ\ќЪ[™ЭЧНЩЬЭ\ќ€РTСHТS€Ъ[™ЭЧНЩЬЭ\ќTИ“Х•S€S€Ъ[™ЭЧНЩЬЭ\ќ
+И[ќ\ќ[	НИ^\ЙВ€S‘TИЪ[™ЭЧНЩЩ[™€\ЭЭ\ЩYШ]Ь™X]YШ]^\™\ЧШ]€”“УHX]Ъ[™ЧЪЩ^\В€ТT‘H
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+HHBЉKYЩЧНЩTИ
+€СSPХ
+СSPХЩ]™[—Щ^\ЧЬЭ\ќ”“УH›Э[™КHTИЪ[™ЭЧЬЭ\ќ€
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КHTИЪ[™ЭЧЩ[™€ЫЭ[ќ
 
-ALTER ROLE sub2api_tg_bot WITH
-  LOGIN
-  NOSUPERUSER
-  NOCREATEDB
-  NOCREATEROLE
-  NOINHERIT
-  NOREPLICATION
-  NOBYPASSRLS
-  CONNECTION LIMIT 5;
-ALTER ROLE sub2api_tg_bot SET default_transaction_read_only = on;
-ALTER ROLE sub2api_tg_bot SET statement_timeout = '10s';
-ALTER ROLE sub2api_tg_bot SET lock_timeout = '2s';
-ALTER ROLE sub2api_tg_bot SET temp_file_limit = '16MB';
+ЉNЋљYЪ[ќ™\]Y\ЭЛ€ЫШ[\ШЩJЭ[J[њ]ЭЪЩ[њКK
+NЋљYЪ[ќ[њ]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JЭ]]ЭЪЩ[њКK
+NЋљYЪ[ќЭ]]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWШЬ™X][Ы—ЭЪЩ[њКK
+NЋљYЪ[ќШXЪWШЬ™X][Ы—ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWЬ™XYЭЪЩ[њКK
+NЋљYЪ[ќШXЪWЬ™XYЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JXЭX[ШЫЬЭ
+K
+NЋ›ќ[Y\љXКЊL
+HXЭX[ШЫЬЭ€”“УHX›XЛќ\ШYЩWЫЩЬВ€ТT‘H\WЪЩ^WЪYH
+СSPХY”“УHКB€S‘Ь™X]YШ]ЏH
+СSPХЩ]™[—Щ^\ЧЬЭ\ќ”“УH›Э[™КB€S‘Ь™X]YШ]
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КH
+И[ќ\ќ[	МH^IВЉKYЩЧЭЩ^HTИ
+€СSPХЫЭ[ќ
 
-CREATE SCHEMA IF NOT EXISTS sub2api_tg_bot_api;
-REVOKE ALL ON SCHEMA sub2api_tg_bot_api FROM PUBLIC;
+ЉNЋљYЪ[ќ™\]Y\ЭЛ€ЫШ[\ШЩJЭ[J[њ]ЭЪЩ[њКK
+NЋљYЪ[ќ[њ]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JЭ]]ЭЪЩ[њКK
+NЋљYЪ[ќЭ]]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWШЬ™X][Ы—ЭЪЩ[њКK
+NЋљYЪ[ќШXЪWШЬ™X][Ы—ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWЬ™XYЭЪЩ[њКK
+NЋљYЪ[ќШXЪWЬ™XYЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JXЭX[ШЫЬЭ
+K
+NЋ›ќ[Y\љXКЊL
+HXЭX[ШЫЬЭ€”“УHX›XЛќ\ШYЩWЫЩЬВ€ТT‘H\WЪЩ^WЪYH
+СSPХY”“УHКB€S‘Ь™X]YШ]ЏH
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КB€S‘Ь™X]YШ]
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КH
+И[ќ\ќ[	МH^IВЉK[Щ[ЧНЩTИ
+€СSPХЫШ[\ШЩJќ[YЉ™\]Y\ЭYЫ[Щ[	ЙКKќ[YЉ[Щ[	ЙКK	Э[љЫ›ЭЫ‰КH[Щ[€ЫЭ[ќ
 
-CREATE TABLE IF NOT EXISTS sub2api_tg_bot_api.rate_limit_backups (
-  backup_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  api_key_id bigint NOT NULL,
-  key_name text NOT NULL,
-  account_id bigint,
-  reset_source text NOT NULL CHECK (reset_source IN ('manual', 'auto')),
-  snapshot jsonb NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-REVOKE ALL ON TABLE sub2api_tg_bot_api.rate_limit_backups FROM PUBLIC;
-REVOKE ALL ON TABLE sub2api_tg_bot_api.rate_limit_backups FROM sub2api_tg_bot;
-REVOKE ALL ON SEQUENCE sub2api_tg_bot_api.rate_limit_backups_backup_id_seq FROM PUBLIC;
-REVOKE ALL ON SEQUENCE sub2api_tg_bot_api.rate_limit_backups_backup_id_seq FROM sub2api_tg_bot;
+ЉNЋљYЪ[ќ™\]Y\ЭЛ€ЫШ[\ШЩJЭ[J[њ]ЭЪЩ[њКK
+NЋљYЪ[ќ[њ]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JЭ]]ЭЪЩ[њКK
+NЋљYЪ[ќЭ]]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWШЬ™X][Ы—ЭЪЩ[њКK
+NЋљYЪ[ќШXЪWШЬ™X][Ы—ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWЬ™XYЭЪЩ[њКK
+NЋљYЪ[ќШXЪWЬ™XYЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JXЭX[ШЫЬЭ
+K
+NЋ›ќ[Y\љXКЊL
+HXЭX[ШЫЬЭ€”“УHX›XЛќ\ШYЩWЫЩЬВ€ТT‘H\WЪЩ^WЪYH
+СSPХY”“УHКB€S‘Ь™X]YШ]ЏH
+СSPХЩ]™[—Щ^\ЧЬЭ\ќ”“УH›Э[™КB€S‘Ь™X]YШ]
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КH
+И[ќ\ќ[	МH^IВ€Ф“ХT–HB€Ф‘T€–H™\]Y\ЭИTРЛXЭX[ШЫЬЭTРВ€SRUBЉK[Щ[ЧЭЩ^HTИ
+€СSPХЫШ[\ШЩJќ[YЉ™\]Y\ЭYЫ[Щ[	ЙКKќ[YЉ[Щ[	ЙКK	Э[љЫ›ЭЫ‰КH[Щ[€ЫЭ[ќ
 
-CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.usage(p_key_name text)
-RETURNS json
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-WITH bounds AS (
-  SELECT
-    (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') - interval '6 days')
-      AT TIME ZONE 'Asia/Shanghai' AS seven_days_start,
-    date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')
-      AT TIME ZONE 'Asia/Shanghai' AS today_start
-), matching_keys AS (
-  SELECT id, name, status, quota, quota_used,
-         rate_limit_5h, rate_limit_1d, rate_limit_7d,
-         usage_5h, usage_1d, usage_7d,
-         window_5h_start, window_1d_start, window_7d_start,
-         last_used_at, created_at, expires_at
-  FROM public.api_keys
-  WHERE name = p_key_name AND deleted_at IS NULL
-), match_count AS (
-  SELECT count(*)::integer AS total
-  FROM matching_keys
-), k AS (
-  SELECT id, name, status, quota, quota_used,
-         rate_limit_5h, rate_limit_1d, rate_limit_7d,
-         usage_5h, usage_1d, usage_7d,
-         window_5h_start, window_1d_start, window_7d_start,
-         CASE WHEN window_7d_start IS NOT NULL
-              THEN window_7d_start + interval '7 days'
-         END AS window_7d_end,
-         last_used_at, created_at, expires_at
-  FROM matching_keys
-  WHERE (SELECT total FROM match_count) = 1
-), agg_7d AS (
-  SELECT (SELECT seven_days_start FROM bounds) AS window_start,
-         (SELECT today_start FROM bounds) AS window_end,
-         count(*)::bigint requests,
-         coalesce(sum(input_tokens), 0)::bigint input_tokens,
-         coalesce(sum(output_tokens), 0)::bigint output_tokens,
-         coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
-         coalesce(sum(cache_read_tokens), 0)::bigint cache_read_tokens,
-         coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
-  FROM public.usage_logs
-  WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= (SELECT seven_days_start FROM bounds)
-    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
-), agg_today AS (
-  SELECT count(*)::bigint requests,
-         coalesce(sum(input_tokens), 0)::bigint input_tokens,
-         coalesce(sum(output_tokens), 0)::bigint output_tokens,
-         coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
-         coalesce(sum(cache_read_tokens), 0)::bigint cache_read_tokens,
-         coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
-  FROM public.usage_logs
-  WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= (SELECT today_start FROM bounds)
-    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
-), models_7d AS (
-  SELECT coalesce(nullif(requested_model, ''), nullif(model, ''), 'unknown') model,
-         count(*)::bigint requests,
-         coalesce(sum(input_tokens), 0)::bigint input_tokens,
-         coalesce(sum(output_tokens), 0)::bigint output_tokens,
-         coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
-         coalesce(sum(cache_read_tokens), 0)::bigint cache_read_tokens,
-         coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
-  FROM public.usage_logs
-  WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= (SELECT seven_days_start FROM bounds)
-    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
-  GROUP BY 1
-  ORDER BY requests DESC, actual_cost DESC
-  LIMIT 5
-), models_today AS (
-  SELECT coalesce(nullif(requested_model, ''), nullif(model, ''), 'unknown') model,
-         count(*)::bigint requests,
-         coalesce(sum(input_tokens), 0)::bigint input_tokens,
-         coalesce(sum(output_tokens), 0)::bigint output_tokens,
-         coalesce(sum(cache_creation_tokens), 0)::bigint cache_creation_tokens,
-         coalesce(sum(cache_read_tokens), 0)::bigint cache_read_tokens,
-         coalesce(sum(actual_cost), 0)::numeric(20, 10) actual_cost
-  FROM public.usage_logs
-  WHERE api_key_id = (SELECT id FROM k)
-    AND created_at >= (SELECT today_start FROM bounds)
-    AND created_at < (SELECT today_start FROM bounds) + interval '1 day'
-  GROUP BY 1
-  ORDER BY requests DESC, actual_cost DESC
-  LIMIT 5
-)
-SELECT CASE
-  WHEN (SELECT total FROM match_count) = 0
-    THEN json_build_object('error', 'not_found')
-  WHEN (SELECT total FROM match_count) > 1
-    THEN json_build_object('error', 'duplicate_key_name')
-  ELSE json_build_object(
-    'key', (SELECT row_to_json(k) FROM k),
-    'seven_days', (SELECT row_to_json(agg_7d) FROM agg_7d),
-    'today', (SELECT row_to_json(agg_today) FROM agg_today),
-    'models_7d', coalesce((SELECT json_agg(models_7d) FROM models_7d), '[]'::json),
-    'models_today', coalesce((SELECT json_agg(models_today) FROM models_today), '[]'::json)
-  )
-END;
-$function$;
+ЉNЋљYЪ[ќ™\]Y\ЭЛ€ЫШ[\ШЩJЭ[J[њ]ЭЪЩ[њКK
+NЋљYЪ[ќ[њ]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JЭ]]ЭЪЩ[њКK
+NЋљYЪ[ќЭ]]ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWШЬ™X][Ы—ЭЪЩ[њКK
+NЋљYЪ[ќШXЪWШЬ™X][Ы—ЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JШXЪWЬ™XYЭЪЩ[њКK
+NЋљYЪ[ќШXЪWЬ™XYЭЪЩ[њЛ€ЫШ[\ШЩJЭ[JXЭX[ШЫЬЭ
+K
+NЋ›ќ[Y\љXКЊL
+HXЭX[ШЫЬЭ€”“УHX›XЛќ\ШYЩWЫЩЬВ€ТT‘H\WЪЩ^WЪYH
+СSPХY”“УHКB€S‘Ь™X]YШ]ЏH
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КB€S‘Ь™X]YШ]
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КH
+И[ќ\ќ[	МH^IВ€Ф“ХT–HB€Ф‘T€–H™\]Y\ЭИTРЛXЭX[ШЫЬЭTРВ€SRUBЉB”СSPХРTСB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+HH€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	КB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+H€B€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Щ\XШ]WЪЩ^WЫ[YIКB€SСHњЫЫ—ШќZ[ЫШљ™XЭ
+€	ЪЩ^IЛ
+СSPХ›ЭЧЭЧЪњЫЫЉКH”“УHКK€	ЬЩ]™[—Щ^\ЙЛ
+СSPХ›ЭЧЭЧЪњЫЫЉYЩЧНЩ
+H”“УHYЩЧНЩ
+K€	ЭЩ^IЛ
+СSPХ›ЭЧЭЧЪњЫЫЉYЩЧЭЩ^JH”“УHYЩЧЭЩ^JK€	Ы[Щ[ЧНЩ	ЛЫШ[\ШЩJ
+СSPХњЫЫ—ШYЩК[Щ[ЧНЩ
+H”“УH[Щ[ЧНЩ
+K	ЦЧIОЋљњЫЫЉK€	Ы[Щ[ЧЭЩ^IЛЫШ[\ШЩJ
+СSPХњЫЫ—ШYЩК[Щ[ЧЭЩ^JH”“УH[Щ[ЧЭЩ^JK	ЦЧIОЋљњЫЫЉB€
+B‘S‘В‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KљЩ^WЫЭ™\ќљY]КЪЩ^WЫ[YH^
+B”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰•ТU›Э[™ИTИ
+€СSPХ]WЭќ[К	Щ^IЛ›ЭК
+HUSQH“У‘H	Р\ЪXKФЪ[™ЪZIКB€USQH“У‘H	Р\ЪXKФЪ[™ЪZIИTИЩ^WЬЭ\ќЉKX]Ъ[™ЧЪЩ^\ИTИ
+€СSPХY[YK\ЭЭ\ЩYШ]]WЫ[Z]НЩ\ШYЩWНЩ€”“УHX›XЛ\WЪЩ^\В€ТT‘H[YHHЪЩ^WЫ[YHS‘[]YШ]TИ•SЉKX]ЪШЫЭ[ќTИ
+€СSPХЫЭ[ќ
 
-CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.usage_with_account(
-  p_key_name text,
-  p_account_id bigint
-)
-RETURNS json
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-WITH base AS (
-  SELECT sub2api_tg_bot_api.usage(p_key_name)::jsonb AS payload
-), account_snapshot AS (
-  SELECT jsonb_build_object(
-    'id', id,
-    'platform', platform,
-    'type', type,
-    'snapshot_updated_at', extra->>'codex_usage_updated_at',
-    'reset_5h_at', extra->>'codex_5h_reset_at',
-    'reset_7d_at', extra->>'codex_7d_reset_at'
-  ) AS payload
-  FROM public.accounts
-  WHERE id = p_account_id
-    AND deleted_at IS NULL
-)
-SELECT (
-  base.payload || jsonb_build_object(
-    'upstream_account',
-    coalesce(
-      (SELECT payload FROM account_snapshot),
-      jsonb_build_object('error', 'not_found', 'id', p_account_id)
-    )
-  )
-)::json
-FROM base;
-$function$;
+ЉNЋљ[ќYЩ\€TИЭ[”“УHX]Ъ[™ЧЪЩ^\ВЉKЩ^WЬ›ЭИTИ
+€СSPХ
+€”“УHX]Ъ[™ЧЪЩ^\ИТT‘H
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+HHBЉK\ШЫЭ[ќИTИ
+€СSPХ€ЫЭ[ќ
+TХSђХ\ШY™\ЬКH’ST€
+€ТT‘HЬ™X]YШ]ЏH
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КB€S‘Ь™X]YШ]
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КH
+И[ќ\ќ[	МH^IВ€
+NЋљYЪ[ќTИЩ^K€ЫЭ[ќ
+TХSђХ\ШY™\ЬКH’ST€
+€ТT‘HЬ™X]YШ]ЏH
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КHH[ќ\ќ[	МH^IВ€S‘Ь™X]YШ]
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КB€
+NЋљYЪ[ќTИY\Э\™^B€”“УHX›XЛќ\ШYЩWЫЩЬВ€ТT‘H\WЪЩ^WЪYH
+СSPХY”“УHЩ^WЬ›ЭКB€S‘\ШY™\ЬИTИ“Х•S€S‘ќљ[J\ШY™\ЬКH€	ЙВ€S‘Ь™X]YШ]ЏH
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КHH[ќ\ќ[	МH^IВ€S‘Ь™X]YШ]
+СSPХЩ^WЬЭ\ќ”“УH›Э[™КH
+И[ќ\ќ[	МH^IВЉB”СSPХРTСB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+HH€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	КB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+H€B€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Щ\XШ]WЪЩ^WЫ[YIКB€SСHњЫЫ—ШќZ[ЫШљ™XЭ
+€	ЪЩ^IЛ
+СSPХ›ЭЧЭЧЪњЫЫЉЩ^WЬ›ЭКH”“УHЩ^WЬ›ЭКK€	Ъ\ШЫЭ[ќЙЛ
+СSPХ›ЭЧЭЧЪњЫЫЉ\ШЫЭ[ќКH”“УH\ШЫЭ[ќКB€
+B‘S‘В‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KљЩ^WЪ\Ъ\ЭЬћJ€ЪЩ^WЫ[YH^€ЫЩ™њЩ][ќYЩ\‹€Ы[Z][ќYЩ\‚ЉB”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰•ТU›Э[™ИTИ
+€СSPХ€
+]WЭќ[К	Щ^IЛ›ЭК
+HUSQH“У‘H	Р\ЪXKФЪ[™ЪZIКHH[ќ\ќ[	М€^\ЙКB€USQH“У‘H	Р\ЪXKФЪ[™ЪZIИTИЪ[™ЭЧЬЭ\ќ€›ЭК
+HTИЪ[™ЭЧЩ[™ЉKX]Ъ[™ЧЪЩ^\ИTИ
+€СSPХY€”“УHX›XЛ\WЪЩ^\В€ТT‘H[YHHЪЩ^WЫ[YHS‘[]YШ]TИ•SЉKX]ЪШЫЭ[ќTИ
+€СSPХЫЭ[ќ
 
-CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_estimate(
-  p_account_id bigint
-)
-RETURNS json
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-WITH account_snapshot AS (
-  SELECT
-    id,
-    name,
-    platform,
-    type,
-    extra->>'codex_usage_updated_at' AS snapshot_updated_at,
-    extra->>'codex_7d_used_percent' AS used_7d_percent,
-    CASE
-      WHEN extra->>'codex_7d_reset_at' ~
-        '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
-      THEN (extra->>'codex_7d_reset_at')::timestamptz
-    END AS reset_7d_at,
-    CASE
-      WHEN extra->>'codex_7d_window_minutes' ~ '^[0-9]+$'
-        AND (extra->>'codex_7d_window_minutes')::bigint > 0
-      THEN (extra->>'codex_7d_window_minutes')::bigint
-      ELSE 10080
-    END AS window_7d_minutes
-  FROM public.accounts
-  WHERE id = p_account_id
-    AND deleted_at IS NULL
-), account_cost AS (
-  SELECT coalesce(sum(
-    coalesce(
-      nullif(to_jsonb(usage_row)->>'account_stats_cost', '')::numeric,
-      usage_row.total_cost
-    ) * coalesce(
-      nullif(to_jsonb(usage_row)->>'account_rate_multiplier', '')::numeric,
-      1
-    )
-  ), 0)::numeric(20, 10) AS consumed_amount
-  FROM public.usage_logs AS usage_row
-  JOIN account_snapshot AS account ON account.id = usage_row.account_id
-  WHERE account.reset_7d_at IS NOT NULL
-    AND usage_row.created_at >= account.reset_7d_at - account.window_7d_minutes * interval '1 minute'
-    AND usage_row.created_at < account.reset_7d_at
-)
-SELECT CASE
-  WHEN NOT EXISTS (SELECT 1 FROM account_snapshot)
-    THEN json_build_object('error', 'not_found', 'id', p_account_id)
-  ELSE json_build_object(
-    'id', (SELECT id FROM account_snapshot),
-    'name', (SELECT name FROM account_snapshot),
-    'platform', (SELECT platform FROM account_snapshot),
-    'type', (SELECT type FROM account_snapshot),
-    'snapshot_updated_at', (SELECT snapshot_updated_at FROM account_snapshot),
-    'used_7d_percent', (SELECT used_7d_percent FROM account_snapshot),
-    'window_start', (
-      SELECT reset_7d_at - window_7d_minutes * interval '1 minute'
-      FROM account_snapshot
-    ),
-    'window_end', (SELECT reset_7d_at FROM account_snapshot),
-    'consumed_amount', CASE
-      WHEN (SELECT reset_7d_at FROM account_snapshot) IS NULL THEN NULL
-      ELSE (SELECT consumed_amount FROM account_cost)
-    END
-  )
-END;
-$function$;
+ЉNЋљ[ќYЩ\€TИЭ[”“УHX]Ъ[™ЧЪЩ^\ВЉK\Ь›ЭЬИTИ
+€СSPХ€\ШY™\ЬЛ€Z[ЉЬ™X]YШ]
+HTИљ\њЭЬЩY[‹€X^
+Ь™X]YШ]
+HTИ\ЭЬЩY[‹€ЫЭ[ќ
 
-CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_weekly_reset(
-  p_account_id bigint
-)
-RETURNS json
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-SELECT CASE
-  WHEN account.id IS NULL
-    THEN json_build_object('error', 'not_found', 'id', p_account_id)
-  ELSE json_build_object(
-    'id', account.id,
-    'snapshot_updated_at', account.extra->>'codex_usage_updated_at',
-    'reset_7d_at', account.extra->>'codex_7d_reset_at'
-  )
-END
-FROM (SELECT 1) AS seed
-LEFT JOIN public.accounts AS account
-  ON account.id = p_account_id
- AND account.deleted_at IS NULL;
-$function$;
+ЉNЋљYЪ[ќTИ™\]Y\ЭВ€”“УHX›XЛќ\ШYЩWЫЩЬВ€ТT‘H\WЪЩ^WЪYH
+СSPХY”“УHX]Ъ[™ЧЪЩ^\КB€S‘\ШY™\ЬИTИ“Х•S€S‘ќљ[J\ШY™\ЬКH€	ЙВ€S‘Ь™X]YШ]ЏH
+СSPХЪ[™ЭЧЬЭ\ќ”“УH›Э[™КB€S‘Ь™X]YШ]H
+СSPХЪ[™ЭЧЩ[™”“УH›Э[™КB€S‘
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+HHB€Ф“ХT–H\ШY™\ЬВЉKYЩYЪ\ИTИ
+€СSPХ\ШY™\ЬЛљ\њЭЬЩY[‹\ЭЬЩY[‹™\]Y\ЭВ€”“УH\Ь›ЭЬВ€Ф‘T€–H\ЭЬЩY[€TРЛ\ШY™\ЬВ€С‘”СUЫШ[\ШЩJЬ™X]\Э
+ЫЩ™њЩ]
+K
+B€SRUЫШ[\ШЩJЬ™X]\Э
+Ы[Z]
+K
+BЉB”СSPХРTСB€ТS€ЫЩ™њЩ]TИ•SФ€Ы[Z]TИ•S€Ф€ЫЩ™њЩ]Ф€ЫЩ™њЩ]€LФ€Ы[Z]HФ€Ы[Z]€Њ€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ъ[ќ[YЬYЪ[][Ы‰КB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+HH€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	КB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+H€B€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Щ\XШ]WЪЩ^WЫ[YIКB€SСHњЫЫ—ШќZ[ЫШљ™XЭ
+€	ЭЪ[™ЭЧЬЭ\ќ	Л
+СSPХЪ[™ЭЧЬЭ\ќ”“УH›Э[™КK€	ЭЪ[™ЭЧЩ[™	Л
+СSPХЪ[™ЭЧЩ[™”“УH›Э[™КK€	ЭЭ[	Л
+СSPХЫЭ[ќ
 
-CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.backup_rate_limits(
-  p_key_name text,
-  p_account_id bigint,
-  p_reset_source text
-)
-RETURNS json
-LANGUAGE plpgsql
-VOLATILE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-DECLARE
-  v_key public.api_keys%ROWTYPE;
-  v_match_count integer;
-  v_backup_id bigint;
-  v_snapshot jsonb;
-BEGIN
-  IF p_reset_source NOT IN ('manual', 'auto') THEN
-    RETURN json_build_object('error', 'invalid_source');
-  END IF;
-  SELECT count(*)::integer INTO v_match_count
-  FROM public.api_keys
-  WHERE name = p_key_name AND deleted_at IS NULL;
-  IF v_match_count = 0 THEN
-    RETURN json_build_object('error', 'not_found');
-  ELSIF v_match_count > 1 THEN
-    RETURN json_build_object('error', 'duplicate_key_name');
-  END IF;
-  SELECT * INTO v_key
-  FROM public.api_keys
-  WHERE name = p_key_name AND deleted_at IS NULL
-  FOR UPDATE;
-  v_snapshot := jsonb_build_object(
-    'usage_5h', v_key.usage_5h,
-    'usage_1d', v_key.usage_1d,
-    'usage_7d', v_key.usage_7d,
-    'last_used_at', v_key.last_used_at,
-    'rate_limit_7d', v_key.rate_limit_7d,
-    'window_5h_start', v_key.window_5h_start,
-    'window_1d_start', v_key.window_1d_start,
-    'window_7d_start', v_key.window_7d_start
-  );
-  INSERT INTO sub2api_tg_bot_api.rate_limit_backups (
-    api_key_id, key_name, account_id, reset_source, snapshot
-  ) VALUES (
-    v_key.id, v_key.name, p_account_id, p_reset_source, v_snapshot
-  ) RETURNING backup_id INTO v_backup_id;
-  DELETE FROM sub2api_tg_bot_api.rate_limit_backups
-  WHERE api_key_id = v_key.id
-    AND backup_id NOT IN (
-      SELECT backup_id
-      FROM sub2api_tg_bot_api.rate_limit_backups
-      WHERE api_key_id = v_key.id
-      ORDER BY created_at DESC, backup_id DESC
-      LIMIT 3
-    );
-  RETURN json_build_object(
-    'backup_id', v_backup_id,
-    'key_id', v_key.id,
-    'key_name', v_key.name,
-    'reset_source', p_reset_source,
-    'snapshot', v_snapshot
-  );
-END;
-$function$;
+ЉNЋљYЪ[ќ”“УH\Ь›ЭЬКK€	Ъ\ЙЛЫШ[\ШЩJ
+€СSPХњЫЫ—ШYЩК›ЭЧЭЧЪњЫЫЉYЩYЪ\КHФ‘T€–H\ЭЬЩY[€TРЛ\ШY™\ЬКB€”“УHYЩYЪ\В€
+K	ЦЧIОЋљњЫЫЉB€
+B‘S‘В‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kќ\ШYЩWЭЪ]ШXШЫЭ[ќ
+€ЪЩ^WЫ[YH^€ШXШЫЭ[ќЪYљYЪ[ќЉB”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰•ТU\ЩHTИ
+€СSPХЭXЊ\WЭЧШ›ЭШ\Kќ\ШYЩJЪЩ^WЫ[YJNЋљњЫЫ€TИ^[ШYЉKXШЫЭ[ќЬЫ\ЪЭTИ
+€СSPХњЫЫ—ШќZ[ЫШљ™XЭ
+€	ЪY	ЛY€	Ь]›Ь›IЛ]›Ь›K€	Э\IЛ\K€	ЬЫ\ЪЭЭ\]YШ]	Л^KOЏ‰ШЫЩ^Э\ШYЩWЭ\]YШ]	Л€	Ь™\Щ]НZШ]	Л^KOЏ‰ШЫЩ^НZЬ™\Щ]Ш]	Л€	Ь™\Щ]НЩШ]	Л^KOЏ‰ШЫЩ^НЩЬ™\Щ]Ш]	В€
+HTИ^[ШY€”“УHX›XЛXШЫЭ[ќВ€ТT‘HYHШXШЫЭ[ќЪY€S‘[]YШ]TИ•SЉB”СSPХ
+€\ЩKњ^[ШYњЫЫ—ШќZ[ЫШљ™XЭ
+€	Э\Э™X[WШXШЫЭ[ќ	Л€ЫШ[\ШЩJ€
+СSPХ^[ШY”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	Л	ЪY	ЛШXШЫЭ[ќЪY
+B€
+B€
+BЉNЋљњЫЫ‚‘”“УH\ЩNВ‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXШЫЭ[ќЩ\Э[X]J€ШXШЫЭ[ќЪYљYЪ[ќЉB”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰•ТUXШЫЭ[ќЬЫ\ЪЭTИ
+€СSPХ€Y€[YK€]›Ь›K€\K€^KOЏ‰ШЫЩ^Э\ШYЩWЭ\]YШ]	ИTИЫ\ЪЭЭ\]YШ]€^KOЏ‰ШЫЩ^НЩЭ\ЩYЬ\Щ[ќ	ИTИ\ЩYНЩЬ\Щ[ќ€РTСB€ТS€^KOЏ‰ШЫЩ^НЩЬ™\Щ]Ш]	И‚€	Ч–МNW^НKVМNW^МџKVМNW^МџUМNW^МџN–МNW^МџN–МNW^МџJ–МNWJКOКџКЛWVМNW^МџN–МNW^МџJI	В€S€
+^KOЏ‰ШЫЩ^НЩЬ™\Щ]Ш]	КNЋќ[Y\Э[\‚€S‘TИ™\Щ]НЩШ]€РTСB€ТS€^KOЏ‰ШЫЩ^НЩЭЪ[™ЭЧЫZ[ќ]\ЙИ€	Ч–МNWJЙ	В€S‘
+^KOЏ‰ШЫЩ^НЩЭЪ[™ЭЧЫZ[ќ]\ЙКNЋљYЪ[ќ€€S€
+^KOЏ‰ШЫЩ^НЩЭЪ[™ЭЧЫZ[ќ]\ЙКNЋљYЪ[ќ€SСHL€S‘TИЪ[™ЭЧНЩЫZ[ќ]\В€”“УHX›XЛXШЫЭ[ќВ€ТT‘HYHШXШЫЭ[ќЪY€S‘[]YШ]TИ•SЉKXШЫЭ[ќШЫЬЭTИ
+€СSPХЫШ[\ШЩJЭ[J€ЫШ[\ШЩJ€ќ[YЉЧЪњЫЫЉ\ШYЩWЬ›ЭКKOЏ‰ШXШЫЭ[ќЬЭ]ЧШЫЬЭ	Л	ЙКNЋ›ќ[Y\љXЛ€\ШYЩWЬ›ЭЛќЭ[ШЫЬЭ€
+H
+€ЫШ[\ШЩJ€ќ[YЉЧЪњЫЫЉ\ШYЩWЬ›ЭКKOЏ‰ШXШЫЭ[ќЬ]WЫ][\Y\‰Л	ЙКNЋ›ќ[Y\љXЛ€B€
+B€
+K
+NЋ›ќ[Y\љXКЊL
+HTИЫЫњЭ[YYШ[[Э[ќ€”“УHX›XЛќ\ШYЩWЫЩЬИTИ\ШYЩWЬ›ЭВ€“ТS€XШЫЭ[ќЬЫ\ЪЭTИXШЫЭ[ќУ€XШЫЭ[ќљYH\ШYЩWЬ›ЭЛXШЫЭ[ќЪY€ТT‘HXШЫЭ[ќњ™\Щ]НЩШ]TИ“Х•S€S‘\ШYЩWЬ›ЭЛЬ™X]YШ]ЏHXШЫЭ[ќњ™\Щ]НЩШ]HXШЫЭ[ќќЪ[™ЭЧНЩЫZ[ќ]\И
+€[ќ\ќ[	МHZ[ќ]IВ€S‘\ШYЩWЬ›ЭЛЬ™X]YШ]XШЫЭ[ќњ™\Щ]НЩШ]ЉB”СSPХРTСB€ТS€“ХVTХИ
+СSPХH”“УHXШЫЭ[ќЬЫ\ЪЭ
+B€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	Л	ЪY	ЛШXШЫЭ[ќЪY
+B€SСHњЫЫ—ШќZ[ЫШљ™XЭ
+€	ЪY	Л
+СSPХY”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€	Ы[YIЛ
+СSPХ[YH”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€	Ь]›Ь›IЛ
+СSPХ]›Ь›H”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€	Э\IЛ
+СSPХ\H”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€	ЬЫ\ЪЭЭ\]YШ]	Л
+СSPХЫ\ЪЭЭ\]YШ]”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€	Э\ЩYНЩЬ\Щ[ќ	Л
+СSPХ\ЩYНЩЬ\Щ[ќ”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€	ЭЪ[™ЭЧЬЭ\ќ	Л
+€СSPХ™\Щ]НЩШ]HЪ[™ЭЧНЩЫZ[ќ]\И
+€[ќ\ќ[	МHZ[ќ]IВ€”“УHXШЫЭ[ќЬЫ\ЪЭ€
+K€	ЭЪ[™ЭЧЩ[™	Л
+СSPХ™\Щ]НЩШ]”“УHXШЫЭ[ќЬЫ\ЪЭ
+K€	ШЫЫњЭ[YYШ[[Э[ќ	ЛРTСB€ТS€
+СSPХ™\Щ]НЩШ]”“УHXШЫЭ[ќЬЫ\ЪЭ
+HTИ•SS€•S€SСH
+СSPХЫЫњЭ[YYШ[[Э[ќ”“УHXШЫЭ[ќШЫЬЭ
+B€S‘€
+B‘S‘В‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXШЫЭ[ќЭЩYZЫWЬ™\Щ]
+€ШXШЫЭ[ќЪYљYЪ[ќЉB”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰”СSPХРTСB€ТS€XШЫЭ[ќљYTИ•S€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	Л	ЪY	ЛШXШЫЭ[ќЪY
+B€SСHњЫЫ—ШќZ[ЫШљ™XЭ
+€	ЪY	ЛXШЫЭ[ќљY€	ЬЫ\ЪЭЭ\]YШ]	ЛXШЫЭ[ќ™^KOЏ‰ШЫЩ^Э\ШYЩWЭ\]YШ]	Л€	Ь™\Щ]НЩШ]	ЛXШЫЭ[ќ™^KOЏ‰ШЫЩ^НЩЬ™\Щ]Ш]	В€
+B‘S‘‘”“УH
+СSPХJHTИЩYY“Q•“ТS€X›XЛXШЫЭ[ќИTИXШЫЭ[ќ€У€XШЫЭ[ќљYHШXШЫЭ[ќЪY€S‘XШЫЭ[ќ™[]YШ]TИ•SВ‰ќ[Э[Ы‰В‚‘“Ф•SђХSУ€Q€VTХИЭXЊ\WЭЧШ›ЭШ\KXЪЭ\Ь]WЫ[Z]К^љYЪ[ќ^
+NВ‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXЪЭ\Ь]WЫ[Z]К€ЪЩ^WЫ[YH^€ШXШЫЭ[ќЪYљYЪ[ќ€Ь™\Щ]ЬЫЭ\ЩH^€Ш]ЪЪY^ЉB”‘UT“”ИњЫЫ‚“S‘ХPQСHЬЬ[•“УUSB”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰‘PУT‘B€—ЪЩ^HX›XЛ\WЪЩ^\ЙT“ХХTNВ€—ЫX]ЪШЫЭ[ќ[ќYЩ\ЋВ€—ШXЪЭ\ЪYљYЪ[ќВ€—ЬЫ\ЪЭњЫЫЋВђ‘QТS‚€Q€Ь™\Щ]ЬЫЭ\ЩH“ХS€
+	ЫX[ќX[	Л	Ш]]ЙКHS‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ъ[ќ[YЬЫЭ\ЩIКNВ€S‘QЋВ€Q€Ш]ЪЪY_€	Ч–МNXKY—^ОМџI	ИS‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ъ[ќ[YШ]ЪЪY	КNВ€S‘QЋВ€СSPХЫЭ[ќ
 
-CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.rate_limit_backups(p_key_name text)
-RETURNS json
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-WITH matching_keys AS (
-  SELECT id
-  FROM public.api_keys
-  WHERE name = p_key_name AND deleted_at IS NULL
-), match_count AS (
-  SELECT count(*)::integer AS total FROM matching_keys
-), backups AS (
-  SELECT backup_id, reset_source, snapshot, created_at
-  FROM sub2api_tg_bot_api.rate_limit_backups
-  WHERE api_key_id = (SELECT id FROM matching_keys)
-  ORDER BY created_at DESC, backup_id DESC
-  LIMIT 3
-)
-SELECT CASE
-  WHEN (SELECT total FROM match_count) = 0
-    THEN json_build_object('error', 'not_found')
-  WHEN (SELECT total FROM match_count) > 1
-    THEN json_build_object('error', 'duplicate_key_name')
-  ELSE json_build_object(
-    'key_id', (SELECT id FROM matching_keys),
-    'backups', coalesce(
-      (SELECT json_agg(json_build_object(
-        'backup_id', backup_id,
-        'reset_source', reset_source,
-        'created_at', created_at,
-        'snapshot', snapshot
-      )) FROM backups),
-      '[]'::json
-    )
-  )
-END;
-$function$;
+ЉNЋљ[ќYЩ\€S•И—ЫX]ЪШЫЭ[ќ€”“УHX›XЛ\WЪЩ^\В€ТT‘H[YHHЪЩ^WЫ[YHS‘[]YШ]TИ•SВ€Q€—ЫX]ЪШЫЭ[ќHS‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	КNВ€SТQ€—ЫX]ЪШЫЭ[ќ€HS‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Щ\XШ]WЪЩ^WЫ[YIКNВ€S‘QЋВ€СSPХ
+€S•И—ЪЩ^B€”“УHX›XЛ\WЪЩ^\В€ТT‘H[YHHЪЩ^WЫ[YHS‘[]YШ]TИ•S€“Ф€TUNВ€СSPХXЪЭ\ЪYЫ\ЪЭS•И—ШXЪЭ\ЪY—ЬЫ\ЪЭ€”“УHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\В€ТT‘H\WЪЩ^WЪYH—ЪЩ^KљYS‘]ЪЪYHШ]ЪЪY€Ф‘T€–HЬ™X]YШ]TРЛXЪЭ\ЪYTРВ€SRUNВ€Q€“ХS‘S‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+€	ШXЪЭ\ЪY	Л—ШXЪЭ\ЪY€	ЪЩ^WЪY	Л—ЪЩ^KљY€	ЪЩ^WЫ[YIЛ—ЪЩ^K›[YK€	Ь™\Щ]ЬЫЭ\ЩIЛЬ™\Щ]ЬЫЭ\ЩK€	Ш]ЪЪY	ЛШ]ЪЪY€	ЬЫ\ЪЭ	Л—ЬЫ\ЪЭ€
+NВ€S‘QЋВ€—ЬЫ\ЪЭЏHњЫЫ—ШќZ[ЫШљ™XЭ
+€	Э\ШYЩWНZ	Л—ЪЩ^Kќ\ШYЩWНZ€	Э\ШYЩWМY	Л—ЪЩ^Kќ\ШYЩWМY€	Э\ШYЩWНЩ	Л—ЪЩ^Kќ\ШYЩWНЩ€	Ы\ЭЭ\ЩYШ]	Л—ЪЩ^K›\ЭЭ\ЩYШ]€	Ь]WЫ[Z]НЩ	Л—ЪЩ^Kњ]WЫ[Z]НЩ€	ЭЪ[™ЭЧНZЬЭ\ќ	Л—ЪЩ^KќЪ[™ЭЧНZЬЭ\ќ€	ЭЪ[™ЭЧМYЬЭ\ќ	Л—ЪЩ^KќЪ[™ЭЧМYЬЭ\ќ€	ЭЪ[™ЭЧНЩЬЭ\ќ	Л—ЪЩ^KќЪ[™ЭЧНЩЬЭ\ќ€
+NВ€S”СT•S•ИЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\И
+€\WЪЩ^WЪYЩ^WЫ[YKXШЫЭ[ќЪY™\Щ]ЬЫЭ\ЩK]ЪЪYЫ\ЪЭ€
+HђSQTИ
+€—ЪЩ^KљY—ЪЩ^K›[YKШXШЫЭ[ќЪYЬ™\Щ]ЬЫЭ\ЩKШ]ЪЪY—ЬЫ\ЪЭ€
+H‘UT“’S‘ИXЪЭ\ЪYS•И—ШXЪЭ\ЪYВ€SUH”“УHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\В€ТT‘H\WЪЩ^WЪYH—ЪЩ^KљY€S‘XЪЭ\ЪY“ХS€
+€СSPХXЪЭ\ЪY€”“УHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\В€ТT‘H\WЪЩ^WЪYH—ЪЩ^KљY€Ф‘T€–HЬ™X]YШ]TРЛXЪЭ\ЪYTРВ€SRUВ€
+NВ€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+€	ШXЪЭ\ЪY	Л—ШXЪЭ\ЪY€	ЪЩ^WЪY	Л—ЪЩ^KљY€	ЪЩ^WЫ[YIЛ—ЪЩ^K›[YK€	Ь™\Щ]ЬЫЭ\ЩIЛЬ™\Щ]ЬЫЭ\ЩK€	Ш]ЪЪY	ЛШ]ЪЪY€	ЬЫ\ЪЭ	Л—ЬЫ\ЪЭ€
+NВ‘S‘В‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\Ш]Ъ\К€ЪЩ^WЫ[Y\ИњЫЫ‚ЉB”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰•ТU™\]Y\ЭYЪЩ^\ИTИ
+€СSPХTХSђХ[YHTИЩ^WЫ[YB€”“УHњЫЫ—Ш\њ^WЩ[[Y[ќЧЭ^
+€РTСHТS€њЫЫ—Э\[ЩЉЪЩ^WЫ[Y\КHH	Ш\њ^IИS€ЪЩ^WЫ[Y\ИSСH	ЦЧIОЋљњЫЫ€S‘€
+BЉK™\]Y\ЭYШЫЭ[ќTИ
+€СSPХЫЭ[ќ
 
-CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(
-  p_backup_id bigint,
-  p_key_name text
-)
-RETURNS json
-LANGUAGE plpgsql
-VOLATILE
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-DECLARE
-  v_match_count integer;
-  v_key_id bigint;
-  v_backup sub2api_tg_bot_api.rate_limit_backups%ROWTYPE;
-BEGIN
-  SELECT count(*)::integer, min(id) INTO v_match_count, v_key_id
-  FROM public.api_keys
-  WHERE name = p_key_name AND deleted_at IS NULL;
-  IF v_match_count = 0 THEN
-    RETURN json_build_object('error', 'not_found');
-  ELSIF v_match_count > 1 THEN
-    RETURN json_build_object('error', 'duplicate_key_name');
-  END IF;
-  SELECT * INTO v_backup
-  FROM sub2api_tg_bot_api.rate_limit_backups
-  WHERE backup_id = p_backup_id AND api_key_id = v_key_id;
-  IF NOT FOUND THEN
-    RETURN json_build_object('error', 'backup_not_found');
-  END IF;
-  UPDATE public.api_keys
-  SET usage_5h = (v_backup.snapshot->>'usage_5h')::numeric,
-      usage_1d = (v_backup.snapshot->>'usage_1d')::numeric,
-      usage_7d = (v_backup.snapshot->>'usage_7d')::numeric,
-      window_5h_start = (v_backup.snapshot->>'window_5h_start')::timestamptz,
-      window_1d_start = (v_backup.snapshot->>'window_1d_start')::timestamptz,
-      window_7d_start = (v_backup.snapshot->>'window_7d_start')::timestamptz
-  WHERE id = v_key_id;
-  RETURN json_build_object(
-    'backup_id', v_backup.backup_id,
-    'key_id', v_key_id,
-    'key_name', p_key_name,
-    'restored_at', clock_timestamp(),
-    'snapshot', v_backup.snapshot
-  );
-END;
-$function$;
+ЉNЋљ[ќYЩ\€TИЭ[”“УH™\]Y\ЭYЪЩ^\ВЉKX]Ъ[™ЧЪЩ^\ИTИ
+€СSPХ\WЪЩ^KљY\WЪЩ^K›[YB€”“УHX›XЛ\WЪЩ^\ИTИ\WЪЩ^B€“ТS€™\]Y\ЭYЪЩ^\ИTИ™\]Y\ЭYУ€™\]Y\ЭYљЩ^WЫ[YHH\WЪЩ^K›[YB€ТT‘H\WЪЩ^K™[]YШ]TИ•SЉKX]ЪШЫЭ[ќTИ
+€СSPХЫЭ[ќ
 
-REVOKE ALL PRIVILEGES ON DATABASE sub2api FROM sub2api_tg_bot;
-REVOKE ALL PRIVILEGES ON TABLE public.api_keys, public.usage_logs, public.accounts FROM sub2api_tg_bot;
-REVOKE CREATE ON SCHEMA public FROM sub2api_tg_bot;
-REVOKE ALL ON SCHEMA sub2api_tg_bot_api FROM sub2api_tg_bot;
-REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage(text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) FROM PUBLIC;
-REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) FROM PUBLIC;
-REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) FROM PUBLIC;
-REVOKE ALL ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text) FROM PUBLIC;
+ЉNЋљ[ќYЩ\€TИЭ[”“УHX]Ъ[™ЧЪЩ^\ВЉK[YЪX›WШ]Ъ\ИTИ
+€СSPХ€XЪЭ\]ЪЪY€Z[ЉXЪЭ\Ь™X]YШ]
+HTИЬ™X]YШ]€Z[ЉXЪЭ\њ™\Щ]ЬЫЭ\ЩJHTИ™\Щ]ЬЫЭ\ЩK€ЫЭ[ќ
+TХSђХXЪЭ\\WЪЩ^WЪY
+NЋљ[ќYЩ\€TИЩ^WШЫЭ[ќ€”“УHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\ИTИXЪЭ\€“ТS€X]Ъ[™ЧЪЩ^\ИTИX]Ъ[™ИУ€X]Ъ[™ЛљYHXЪЭ\\WЪЩ^WЪY€ТT‘HXЪЭ\]ЪЪYTИ“Х•S€Ф“ХT–HXЪЭ\]ЪЪY€U’S‘ИЫЭ[ќ
+TХSђХXЪЭ\\WЪЩ^WЪY
+HH
+СSPХЭ[”“УH™\]Y\ЭYШЫЭ[ќ
+B€S‘ЫЭ[ќ
+TХSђХXЪЭ\њ™\Щ]ЬЫЭ\ЩJHHB€Ф‘T€–HZ[ЉXЪЭ\Ь™X]YШ]
+HTРЛXЪЭ\]ЪЪYTРВ€SRUВЉK]ЪЬ^[ШYИTИ
+€СSPХ€]Ъ]ЪЪY€]ЪЬ™X]YШ]€]Ъњ™\Щ]ЬЫЭ\ЩK€]ЪљЩ^WШЫЭ[ќ€
+€СSPХњЫЫ—ШYЩКњЫЫ—ШќZ[ЫШљ™XЭ
+€	ШXЪЭ\ЪY	ЛXЪЭ\XЪЭ\ЪY€	ЪЩ^WЫ[YIЛXЪЭ\љЩ^WЫ[YK€	ШXШЫЭ[ќЪY	ЛXЪЭ\XШЫЭ[ќЪY€	ЬЫ\ЪЭ	ЛXЪЭ\њЫ\ЪЭ€
+HФ‘T€–HXЪЭ\љЩ^WЫ[YJB€”“УHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\ИTИXЪЭ\€“ТS€X]Ъ[™ЧЪЩ^\ИTИX]Ъ[™ИУ€X]Ъ[™ЛљYHXЪЭ\\WЪЩ^WЪY€ТT‘HXЪЭ\]ЪЪYH]Ъ]ЪЪY€
+HTИXЪЭ\В€”“УH[YЪX›WШ]Ъ\ИTИ]ЪЉB”СSPХРTСB€ТS€њЫЫ—Э\[ЩЉЪЩ^WЫ[Y\КH€	Ш\њ^IИФ€
+СSPХЭ[”“УH™\]Y\ЭYШЫЭ[ќ
+HH€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ъ[ќ[YЪЩ^WЫ[Y\ЙКB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+H€
+СSPХЭ[”“УH™\]Y\ЭYШЫЭ[ќ
+B€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Шљ[™[™ЧЫZ\ЫX]Ъ	КB€SСHњЫЫ—ШќZ[ЫШљ™XЭ
+€	Ш]Ъ\ЙЛЫШ[\ШЩJ
+€СSPХњЫЫ—ШYЩК›ЭЧЭЧЪњЫЫЉ]ЪЬ^[ШYКHФ‘T€–HЬ™X]YШ]TРЛ]ЪЪYTРКB€”“УH]ЪЬ^[ШYВ€
+K	ЦЧIОЋљњЫЫЉB€
+B‘S‘В‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\КЪЩ^WЫ[YH^
+B”‘UT“”ИњЫЫ‚“S‘ХPQСHЬ[”ХP“B”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰•ТUX]Ъ[™ЧЪЩ^\ИTИ
+€СSPХY€”“УHX›XЛ\WЪЩ^\В€ТT‘H[YHHЪЩ^WЫ[YHS‘[]YШ]TИ•SЉKX]ЪШЫЭ[ќTИ
+€СSPХЫЭ[ќ
 
-GRANT CONNECT ON DATABASE sub2api TO sub2api_tg_bot;
-GRANT USAGE ON SCHEMA sub2api_tg_bot_api TO sub2api_tg_bot;
-GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage(text) TO sub2api_tg_bot;
-GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) TO sub2api_tg_bot;
-GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) TO sub2api_tg_bot;
-GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) TO sub2api_tg_bot;
-GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text) TO sub2api_tg_bot;
-GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) TO sub2api_tg_bot;
-GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text) TO sub2api_tg_bot;
+ЉNЋљ[ќYЩ\€TИЭ[”“УHX]Ъ[™ЧЪЩ^\ВЉKXЪЭ\ИTИ
+€СSPХXЪЭ\ЪY™\Щ]ЬЫЭ\ЩKЫ\ЪЭЬ™X]YШ]€”“УHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\В€ТT‘H\WЪЩ^WЪYH
+СSPХY”“УHX]Ъ[™ЧЪЩ^\КB€Ф‘T€–HЬ™X]YШ]TРЛXЪЭ\ЪYTРВ€SRUВЉB”СSPХРTСB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+HH€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	КB€ТS€
+СSPХЭ[”“УHX]ЪШЫЭ[ќ
+H€B€S€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Щ\XШ]WЪЩ^WЫ[YIКB€SСHњЫЫ—ШќZ[ЫШљ™XЭ
+€	ЪЩ^WЪY	Л
+СSPХY”“УHX]Ъ[™ЧЪЩ^\КK€	ШXЪЭ\ЙЛЫШ[\ШЩJ€
+СSPХњЫЫ—ШYЩКњЫЫ—ШќZ[ЫШљ™XЭ
+€	ШXЪЭ\ЪY	ЛXЪЭ\ЪY€	Ь™\Щ]ЬЫЭ\ЩIЛ™\Щ]ЬЫЭ\ЩK€	ШЬ™X]YШ]	ЛЬ™X]YШ]€	ЬЫ\ЪЭ	ЛЫ\ЪЭ€
+JH”“УHXЪЭ\КK€	ЦЧIОЋљњЫЫ‚€
+B€
+B‘S‘В‰ќ[Э[Ы‰В‚ђФ‘PUHФ€‘TPСH•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ™\ЭЬ™WЬ]WЫ[Z]ШXЪЭ\
+€ШXЪЭ\ЪYљYЪ[ќ€ЪЩ^WЫ[YH^ЉB”‘UT“”ИњЫЫ‚“S‘ХPQСHЬЬ[•“УUSB”СPХT’UHQ’S‘T‚”СUЩX\ЪЬ]HЧШШ][ЩВђTИ	ќ[Э[Ы‰‘PУT‘B€—ЫX]ЪШЫЭ[ќ[ќYЩ\ЋВ€—ЪЩ^WЪYљYЪ[ќВ€—ШXЪЭ\ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\ЙT“ХХTNВђ‘QТS‚€СSPХЫЭ[ќ
+
+ЉNЋљ[ќYЩ\‹Z[ЉY
+HS•И—ЫX]ЪШЫЭ[ќ—ЪЩ^WЪY€”“УHX›XЛ\WЪЩ^\В€ТT‘H[YHHЪЩ^WЫ[YHS‘[]YШ]TИ•SВ€Q€—ЫX]ЪШЫЭ[ќHS‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Ы›ЭЩ›Э[™	КNВ€SТQ€—ЫX]ЪШЫЭ[ќ€HS‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	Щ\XШ]WЪЩ^WЫ[YIКNВ€S‘QЋВ€СSPХ
+€S•И—ШXЪЭ\€”“УHЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\В€ТT‘HXЪЭ\ЪYHШXЪЭ\ЪYS‘\WЪЩ^WЪYH—ЪЩ^WЪYВ€Q€“Х“ХS‘S‚€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+	Щ\њ›Ь‰Л	ШXЪЭ\Ы›ЭЩ›Э[™	КNВ€S‘QЋВ€TUHX›XЛ\WЪЩ^\В€СU\ШYЩWНZH
+—ШXЪЭ\њЫ\ЪЭOЏ‰Э\ШYЩWНZ	КNЋ›ќ[Y\љXЛ€\ШYЩWМYH
+—ШXЪЭ\њЫ\ЪЭOЏ‰Э\ШYЩWМY	КNЋ›ќ[Y\љXЛ€\ШYЩWНЩH
+—ШXЪЭ\њЫ\ЪЭOЏ‰Э\ШYЩWНЩ	КNЋ›ќ[Y\љXЛ€Ъ[™ЭЧНZЬЭ\ќH
+—ШXЪЭ\њЫ\ЪЭOЏ‰ЭЪ[™ЭЧНZЬЭ\ќ	КNЋќ[Y\Э[\‹€Ъ[™ЭЧМYЬЭ\ќH
+—ШXЪЭ\њЫ\ЪЭOЏ‰ЭЪ[™ЭЧМYЬЭ\ќ	КNЋќ[Y\Э[\‹€Ъ[™ЭЧНЩЬЭ\ќH
+—ШXЪЭ\њЫ\ЪЭOЏ‰ЭЪ[™ЭЧНЩЬЭ\ќ	КNЋќ[Y\Э[\‚€ТT‘HYH—ЪЩ^WЪYВ€‘UT“€њЫЫ—ШќZ[ЫШљ™XЭ
+€	ШXЪЭ\ЪY	Л—ШXЪЭ\XЪЭ\ЪY€	ЪЩ^WЪY	Л—ЪЩ^WЪY€	ЪЩ^WЫ[YIЛЪЩ^WЫ[YK€	Ь™\ЭЬ™YШ]	ЛЫШЪЧЭ[Y\Э[\
+
+K€	ЬЫ\ЪЭ	Л—ШXЪЭ\њЫ\ЪЭ€
+NВ‘S‘В‰ќ[Э[Ы‰В‚”‘U“ТСHS’U’SQСTИУ€UPђTСHЭXЊ\H”“УHЭXЊ\WЭЧШ›ЭВ”‘U“ТСHS’U’SQСTИУ€P“HX›XЛ\WЪЩ^\ЛX›XЛќ\ШYЩWЫЩЬЛX›XЛXШЫЭ[ќИ”“УHЭXЊ\WЭЧШ›ЭВ”‘U“ТСHФ‘PUHУ€РТSPHX›XИ”“УHЭXЊ\WЭЧШ›ЭВ”‘U“ТСHSУ€РТSPHЭXЊ\WЭЧШ›ЭШ\H”“УHЭXЊ\WЭЧШ›ЭВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kќ\ШYЩJ^
+H”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KљЩ^WЫЭ™\ќљY]К^
+H”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KљЩ^WЪ\Ъ\ЭЬћJ^[ќYЩ\‹[ќYЩ\ЉH”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kќ\ШYЩWЭЪ]ШXШЫЭ[ќ
+^љYЪ[ќ
+H”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXШЫЭ[ќЩ\Э[X]JљYЪ[ќ
+H”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXШЫЭ[ќЭЩYZЫWЬ™\Щ]
+љYЪ[ќ
+H”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXЪЭ\Ь]WЫ[Z]К^љYЪ[ќ^^
+H”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\К^
+H”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\Ш]Ъ\КњЫЫЉH”“УHP“PОВ”‘U“ТСHSУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ™\ЭЬ™WЬ]WЫ[Z]ШXЪЭ\
+љYЪ[ќ^
+H”“УHP“PОВ‚‘ФђS•УУ“‘PХУ€UPђTСHЭXЊ\HИЭXЊ\WЭЧШ›ЭВ‘ФђS•TРQСHУ€РТSPHЭXЊ\WЭЧШ›ЭШ\HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kќ\ШYЩJ^
+HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KљЩ^WЫЭ™\ќљY]К^
+HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KљЩ^WЪ\Ъ\ЭЬћJ^[ќYЩ\‹[ќYЩ\ЉHИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kќ\ШYЩWЭЪ]ШXШЫЭ[ќ
+^љYЪ[ќ
+HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXШЫЭ[ќЩ\Э[X]JљYЪ[ќ
+HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXШЫЭ[ќЭЩYZЫWЬ™\Щ]
+љYЪ[ќ
+HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\KXЪЭ\Ь]WЫ[Z]К^љYЪ[ќ^^
+HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\К^
+HИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ]WЫ[Z]ШXЪЭ\Ш]Ъ\КњЫЫЉHИЭXЊ\WЭЧШ›ЭВ‘ФђS•VPХUHУ€•SђХSУ€ЭXЊ\WЭЧШ›ЭШ\Kњ™\ЭЬ™WЬ]WЫ[Z]ШXЪЭ\
+љYЪ[ќ^
+HИЭXЊ\WЭЧШ›ЭВ
