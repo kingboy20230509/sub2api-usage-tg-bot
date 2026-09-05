@@ -14,8 +14,6 @@ LISTEN_HOST="${LISTEN_HOST:-127.0.0.1}"
 LISTEN_PORT="${LISTEN_PORT:-8099}"
 ALERT_CHECK_INTERVAL="${ALERT_CHECK_INTERVAL:-600}"
 ALERT_STATE_PATH="${ALERT_STATE_PATH:-/var/lib/sub2api-tg-bot/alert_state.json}"
-AUTO_RESET_CHECK_INTERVAL="${AUTO_RESET_CHECK_INTERVAL:-60}"
-AUTO_RESET_STATE_PATH="${AUTO_RESET_STATE_PATH:-/var/lib/sub2api-tg-bot/auto_reset_state.json}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
@@ -56,7 +54,6 @@ validate_inputs() {
   validate_safe_path SERVICE_FILE "$SERVICE_FILE"
   validate_safe_path CONFIG_FILE "$CONFIG_FILE"
   validate_safe_path ALERT_STATE_PATH "$ALERT_STATE_PATH"
-  validate_safe_path AUTO_RESET_STATE_PATH "$AUTO_RESET_STATE_PATH"
   validate_safe_path PSQL_BIN "$PSQL_BIN"
   if [[ ! "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
     echo "Invalid SERVICE_NAME" >&2
@@ -72,10 +69,6 @@ validate_inputs() {
   fi
   if [[ ! "$ALERT_CHECK_INTERVAL" =~ ^[0-9]{1,7}$ ]] || (( ALERT_CHECK_INTERVAL < 60 )); then
     echo "ALERT_CHECK_INTERVAL must be at least 60 seconds" >&2
-    exit 1
-  fi
-  if [[ ! "$AUTO_RESET_CHECK_INTERVAL" =~ ^[0-9]{1,7}$ ]] || (( AUTO_RESET_CHECK_INTERVAL < 60 || AUTO_RESET_CHECK_INTERVAL > 3600 )); then
-    echo "AUTO_RESET_CHECK_INTERVAL must be between 60 and 3600 seconds" >&2
     exit 1
   fi
   if [[ ! "$TELEGRAM_USER_ID" =~ ^[0-9]{1,20}$ ]]; then
@@ -204,18 +197,12 @@ main() {
   fi
 
   install -d -o root -g root -m 0755 "$INSTALL_DIR"
-  local alert_state_dir auto_reset_state_dir
+  local alert_state_dir
   alert_state_dir="$(dirname -- "$ALERT_STATE_PATH")"
-  auto_reset_state_dir="$(dirname -- "$AUTO_RESET_STATE_PATH")"
   install -d -o "$BOT_USER" -g "$BOT_GROUP" -m 0700 "$alert_state_dir"
-  install -d -o "$BOT_USER" -g "$BOT_GROUP" -m 0700 "$auto_reset_state_dir"
   if [[ -e "$ALERT_STATE_PATH" ]]; then
     chown "$BOT_USER:$BOT_GROUP" "$ALERT_STATE_PATH"
     chmod 0600 "$ALERT_STATE_PATH"
-  fi
-  if [[ -e "$AUTO_RESET_STATE_PATH" ]]; then
-    chown "$BOT_USER:$BOT_GROUP" "$AUTO_RESET_STATE_PATH"
-    chmod 0600 "$AUTO_RESET_STATE_PATH"
   fi
   if [[ -f "$CONFIG_FILE" ]]; then
     cp -a "$CONFIG_FILE" "$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
@@ -246,13 +233,12 @@ JSON
   chown root:"$BOT_GROUP" "$CONFIG_FILE"
   chmod 0640 "$CONFIG_FILE"
 
-  local token_env listen_host_env config_env state_env auto_reset_state_env
+  local token_env listen_host_env config_env state_env
   local psql_bin_env pghost_env pgdatabase_env pguser_env pgpassword_env pgsslmode_env
   token_env="$(env_quote "$TELEGRAM_BOT_TOKEN")"
   listen_host_env="$(env_quote "$LISTEN_HOST")"
   config_env="$(env_quote "$CONFIG_FILE")"
   state_env="$(env_quote "$ALERT_STATE_PATH")"
-  auto_reset_state_env="$(env_quote "$AUTO_RESET_STATE_PATH")"
   psql_bin_env="$(env_quote "$PSQL_BIN")"
   pghost_env="$(env_quote "$PGHOST")"
   pgdatabase_env="$(env_quote "$PGDATABASE")"
@@ -266,8 +252,6 @@ LISTEN_PORT=$LISTEN_PORT
 SUB2API_TG_BOT_CONFIG=$config_env
 ALERT_CHECK_INTERVAL=$ALERT_CHECK_INTERVAL
 ALERT_STATE_PATH=$state_env
-AUTO_RESET_CHECK_INTERVAL=$AUTO_RESET_CHECK_INTERVAL
-AUTO_RESET_STATE_PATH=$auto_reset_state_env
 PSQL_BIN=$psql_bin_env
 PGHOST=$pghost_env
 PGPORT=$PGPORT

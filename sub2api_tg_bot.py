@@ -46,10 +46,6 @@ LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
 ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
 ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
-AUTO_RESET_STATE_PATH = os.environ.get(
-    "AUTO_RESET_STATE_PATH", os.path.join(BASE_DIR, "auto_reset_state.json")
-)
-AUTO_RESET_CHECK_INTERVAL = int(os.environ.get("AUTO_RESET_CHECK_INTERVAL", "60"))
 PSQL_BIN = os.environ.get("PSQL_BIN", "/usr/bin/psql").strip()
 PGHOST = os.environ.get("PGHOST", "127.0.0.1").strip()
 PGPORT = os.environ.get("PGPORT", "5432").strip()
@@ -72,11 +68,8 @@ _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_CHECK_BY_USER = {}
 _BATCH_RESET_LOCK = threading.Lock()
 _BATCH_RESET_SESSIONS = {}
-_AUTO_RESET_LOCK = threading.Lock()
 _RESET_OPERATION_LOCK = threading.Lock()
 BATCH_RESET_SESSION_TTL = 300
-AUTO_RESET_MIN_ADVANCE_SECONDS = 3600
-AUTO_RESET_APPROVAL_SECONDS = 180
 OVERVIEW_PAGE_SIZE = 8
 IP_HISTORY_PAGE_SIZE = 10
 
@@ -105,8 +98,6 @@ def validate_runtime_config():
         raise RuntimeError("POLL_TIMEOUT must be between 1 and 50 seconds")
     if not 1 <= SUB2API_ADMIN_TIMEOUT <= 60:
         raise RuntimeError("SUB2API_ADMIN_TIMEOUT must be between 1 and 60 seconds")
-    if not 60 <= AUTO_RESET_CHECK_INTERVAL <= 3600:
-        raise RuntimeError("AUTO_RESET_CHECK_INTERVAL must be between 60 and 3600 seconds")
     if bool(SUB2API_BASE_URL) != bool(SUB2API_ADMIN_API_KEY):
         raise RuntimeError("SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY must be configured together")
     if SUB2API_BASE_URL:
@@ -615,6 +606,12 @@ class ResetAfterBackupError(RuntimeError):
         self.backup = backup
 
 
+class ResetWindowAlignmentError(RuntimeError):
+    def __init__(self, backup):
+        super().__init__("Reset succeeded but window alignment failed")
+        self.backup = backup
+
+
 def reset_api_configured():
     return bool(SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY)
 
@@ -643,7 +640,7 @@ def reset_key_rate_limit_usage(key_id):
     return json.loads(response_body.decode("utf-8")) if response_body else None
 
 
-def backup_and_reset_key(key_name, account_id, reset_source, batch_id):
+def backup_and_reset_key(key_name, account_id, reset_source, batch_id, reset_at=None):
     with _RESET_OPERATION_LOCK:
         backup = create_rate_limit_backup(key_name, account_id, reset_source, batch_id) or {}
         if backup.get("error"):
@@ -659,12 +656,22 @@ def backup_and_reset_key(key_name, account_id, reset_source, batch_id):
             reset_key_rate_limit_usage(key_id)
         except Exception as error:
             raise ResetAfterBackupError(backup) from error
+        try:
+            aligned = set_rate_limit_window_starts(
+                key_id,
+                datetime.now(timezone.utc) if reset_at is None else reset_at,
+            ) or {}
+            if aligned.get("error"):
+                raise RuntimeError(f"Window alignment failed: {aligned.get('error')}")
+        except Exception as error:
+            raise ResetWindowAlignmentError(backup) from error
         return backup
 
 
-def reset_selected_keys(bindings, selected_user_ids):
+def reset_selected_keys(bindings, selected_user_ids, reset_at=None):
     selected_user_ids = set(selected_user_ids)
     batch_id = secrets.token_hex(8)
+    reset_at = datetime.now(timezone.utc) if reset_at is None else reset_at
     results = []
     for target_user_id, binding in reset_candidates(bindings):
         if target_user_id not in selected_user_ids:
@@ -674,7 +681,7 @@ def reset_selected_keys(bindings, selected_user_ids):
         backup_completed = False
         try:
             backup = backup_and_reset_key(
-                key_name, binding["account_id"], "manual", batch_id
+                key_name, binding["account_id"], "manual", batch_id, reset_at
             )
             backup_completed = True
             reset_completed = True
@@ -696,6 +703,10 @@ def reset_selected_keys(bindings, selected_user_ids):
         except Exception as error:
             if isinstance(error, ResetAfterBackupError):
                 backup_completed = True
+            elif isinstance(error, ResetWindowAlignmentError):
+                backup_completed = True
+                reset_completed = True
+                backup = error.backup
             log_failure(
                 f"batch reset target={masked_id(target_user_id)} recheck={str(reset_completed).lower()}",
                 error,
@@ -705,7 +716,9 @@ def reset_selected_keys(bindings, selected_user_ids):
                 "status": "warning" if reset_completed else "failed",
                 "detail": (
                     "重置成功且已有备份，但复查失败"
-                    if reset_completed else
+                    if reset_completed and not isinstance(error, ResetWindowAlignmentError) else
+                    "重置成功且已有备份，但统一窗口时间失败"
+                    if isinstance(error, ResetWindowAlignmentError) else
                     "已备份，但重置失败" if backup_completed else
                     "备份失败，未执行重置"
                 ),
@@ -967,11 +980,13 @@ def format_key_expiry(value, now=None):
     return f"{timestamp}｜剩余：{remaining}"
 
 
-def append_account_reset(lines, reset_at, now=None):
+def append_reset_time(lines, reset_at, now=None, label="重置时间", indent="  "):
     remaining = reset_remaining_text(reset_at, now)
     if remaining:
         timestamp = parse_upstream_timestamp(reset_at).astimezone(ZoneInfo("Asia/Shanghai"))
-        lines.append(f"  重置时间：{timestamp.strftime('%Y-%m-%d %H:%M:%S')}｜剩余：{remaining}")
+        lines.append(
+            f"{indent}{label}：{timestamp.strftime('%Y-%m-%d %H:%M:%S')}｜剩余：{remaining}"
+        )
 
 
 def append_model_section(lines, title, models):
@@ -1037,13 +1052,6 @@ def query_account_estimate(account_id):
     return run_psql_json(sql, {"account_id": str(account_id)})
 
 
-def query_account_weekly_reset(account_id):
-    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-        raise ValueError("Invalid account ID in binding config")
-    sql = "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;"
-    return run_psql_json(sql, {"account_id": str(account_id)})
-
-
 def create_rate_limit_backup(key_name, account_id, reset_source, batch_id):
     if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
         raise ValueError("Invalid key name")
@@ -1065,6 +1073,23 @@ def create_rate_limit_backup(key_name, account_id, reset_source, batch_id):
         "account_id": "" if account_id is None else str(account_id),
         "reset_source": reset_source,
         "batch_id": batch_id,
+    })
+
+
+def set_rate_limit_window_starts(key_id, reset_at):
+    if isinstance(key_id, bool) or not isinstance(key_id, int) or key_id <= 0:
+        raise ValueError("Invalid API key ID")
+    if not isinstance(reset_at, datetime):
+        raise ValueError("Invalid reset time")
+    if reset_at.tzinfo is None:
+        reset_at = reset_at.replace(tzinfo=timezone.utc)
+    sql = (
+        "SELECT sub2api_tg_bot_api.set_rate_limit_window_starts("
+        ":'key_id'::bigint, :'reset_at'::timestamptz)::text;"
+    )
+    return run_psql_write_json(sql, {
+        "key_id": str(key_id),
+        "reset_at": reset_at.astimezone(timezone.utc).isoformat(),
     })
 
 
@@ -1191,6 +1216,7 @@ def collect_key_overview(bindings):
                 "last_used_at": key.get("last_used_at"),
                 "rate_limit_7d": key.get("rate_limit_7d"),
                 "usage_7d": key.get("usage_7d"),
+                "window_7d_end": key.get("window_7d_end"),
                 "today_ip_count": (data.get("ip_counts") or {}).get("today"),
                 "yesterday_ip_count": (data.get("ip_counts") or {}).get("yesterday"),
             })
@@ -1253,7 +1279,7 @@ def account_estimated_total(consumed_amount, used_percent):
 
 
 def append_account_overview(lines, accounts, now=None):
-    lines.extend(["", "💰 绑定账号金额预估"])
+    lines.extend(["", "🌐 上游账号信息"])
     if not accounts:
         lines.append("• 暂无配置了 account_id 的绑定账号。")
         return
@@ -1283,7 +1309,13 @@ def append_account_overview(lines, accounts, now=None):
                 f"• 账号使用：{money(percent)}%",
                 f"  {progress_bar(percent, 100)}",
             ])
-        append_account_reset(lines, account.get("reset_7d_at"), now)
+        append_reset_time(
+            lines,
+            account.get("reset_7d_at"),
+            now,
+            label="上游 7 日重置时间",
+            indent="• ",
+        )
         if consumed_amount is None:
             lines.append("• 已消耗金额：暂无数据")
         else:
@@ -1335,6 +1367,8 @@ def format_key_overview(overview, page=0, page_size=OVERVIEW_PAGE_SIZE, accounts
             f"• 最后使用：{format_timestamp(last_used_at) if last_used_at else '暂无使用记录'}"
         )
         append_limit(lines, "每周额度", item.get("rate_limit_7d"), item.get("usage_7d"))
+        if dec(item.get("rate_limit_7d")) > 0:
+            append_reset_time(lines, item.get("window_7d_end"), now)
         lines.append(
             f"• 去重 IP：今日 {num(item.get('today_ip_count'))}｜"
             f"昨日 {num(item.get('yesterday_ip_count'))}"
@@ -1396,47 +1430,6 @@ def save_alert_state(state):
     os.chmod(ALERT_STATE_PATH, 0o600)
 
 
-def load_auto_reset_state():
-    try:
-        with open(AUTO_RESET_STATE_PATH, "r", encoding="utf-8") as f:
-            value = json.load(f)
-        return value if isinstance(value, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        log_failure("auto reset state load", e)
-        return {}
-
-
-def save_auto_reset_state(state):
-    tmp = AUTO_RESET_STATE_PATH + ".tmp"
-    os.makedirs(os.path.dirname(AUTO_RESET_STATE_PATH) or ".", exist_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, AUTO_RESET_STATE_PATH)
-    os.chmod(AUTO_RESET_STATE_PATH, 0o600)
-
-
-def canonical_reset_timestamp(value):
-    parsed = parse_upstream_timestamp(value)
-    if parsed is None:
-        return None
-    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def configured_account_keys(bindings):
-    result = {}
-    for _user_id, binding in reset_candidates(bindings):
-        account_id = binding["account_id"]
-        if account_id is not None:
-            result.setdefault(account_id, []).append(binding["key_name"])
-    return result
-
-
 def notify_admins(admins, text):
     delivered = 0
     for admin_user_id in sorted(admins):
@@ -1446,275 +1439,6 @@ def notify_admins(admins, text):
         except Exception as error:
             log_failure(f"notify admin={masked_id(admin_user_id)}", error)
     return delivered
-
-
-def auto_reset_approval_keyboard(account_id, token):
-    return json.dumps({"inline_keyboard": [[
-        {"text": "✅ 同意重置", "callback_data": f"auto_approve:{account_id}:{token}"},
-        {"text": "❌ 不重置", "callback_data": f"auto_reject:{account_id}:{token}"},
-    ]]}, ensure_ascii=False)
-
-
-def notify_auto_reset_approval(admins, account_id, reset_at, key_names, token):
-    lines = [
-        "⚠️ 检测到上游账号 7 日窗口更新",
-        f"账号 ID：{account_id}",
-        f"新的 7 日重置时间：{format_timestamp(reset_at)}",
-        "涉及 Key：" + "、".join(key_names),
-        "",
-        "请在 3 分钟内选择；无人操作将自动备份并重置。",
-    ]
-    delivered = 0
-    reply_markup = auto_reset_approval_keyboard(account_id, token)
-    for admin_user_id in sorted(admins):
-        try:
-            tg("sendMessage", {
-                "chat_id": admin_user_id,
-                "text": "\n".join(lines),
-                "reply_markup": reply_markup,
-            })
-            delivered += 1
-        except Exception as error:
-            log_failure(f"auto reset approval admin={masked_id(admin_user_id)}", error)
-    return delivered
-
-
-def execute_auto_reset_approval(state, account_id, account_state, admins, configured_key_names):
-    approval = account_state.get("approval")
-    if not isinstance(approval, dict) or approval.get("status") != "approved":
-        return []
-    pending_keys = approval.get("keys")
-    if not isinstance(pending_keys, list):
-        pending_keys = []
-    approval["keys"] = [key_name for key_name in pending_keys if key_name in configured_key_names]
-    batch_id = approval.get("batch_id")
-    if not isinstance(batch_id, str) or not re.fullmatch(r"[0-9a-f]{8,32}", batch_id):
-        batch_id = secrets.token_hex(8)
-        approval["batch_id"] = batch_id
-        save_auto_reset_state(state)
-    results = []
-    for key_name in list(approval["keys"]):
-        try:
-            approval["keys"].remove(key_name)
-            save_auto_reset_state(state)
-            backup = backup_and_reset_key(key_name, account_id, "auto", batch_id)
-            results.append({
-                "key_name": key_name,
-                "status": "success",
-                "backup_id": backup["backup_id"],
-                "backup": backup,
-            })
-            notify_admins(
-                admins,
-                "\n".join([
-                    "✅ 上游账号周窗口更新，Key 已自动重置",
-                    f"账号 ID：{account_id}",
-                    f"Key：{key_name}",
-                    f"新的 7 日重置时间：{format_timestamp(approval.get('reset_at'))}",
-                    f"回滚备份：#{backup['backup_id']}",
-                    "",
-                    format_reset_backup_snapshot(key_name, backup),
-                ]),
-            )
-        except Exception as error:
-            if key_name in configured_key_names and key_name not in approval["keys"]:
-                approval["keys"].append(key_name)
-                try:
-                    save_auto_reset_state(state)
-                except Exception as state_error:
-                    log_failure(
-                        f"auto reset state restore account={masked_id(account_id)} key={key_name}",
-                        state_error,
-                    )
-            log_failure(f"auto reset account={masked_id(account_id)} key={key_name}", error)
-            results.append({"key_name": key_name, "status": "failed"})
-            notify_admins(
-                admins,
-                "\n".join([
-                    "❌ 上游账号周窗口更新，但 Key 自动重置失败",
-                    f"账号 ID：{account_id}",
-                    f"Key：{key_name}",
-                    f"新的 7 日重置时间：{format_timestamp(approval.get('reset_at'))}",
-                    "Bot 将在下次检查时重试，也可以使用手动重置功能。",
-                ]),
-            )
-    if not approval["keys"]:
-        account_state.pop("approval", None)
-    save_auto_reset_state(state)
-    return results
-
-
-def decide_auto_reset_approval(account_id, token, approve):
-    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-        raise ValueError("Invalid account ID")
-    if not re.fullmatch(r"[0-9a-f]{8}", token or ""):
-        raise ValueError("Invalid approval token")
-    with _AUTO_RESET_LOCK:
-        cfg = load_config()
-        bindings = config_bindings(cfg)
-        admins = config_admins(cfg)
-        account_keys = configured_account_keys(bindings)
-        state = load_auto_reset_state()
-        account_state = (state.get("accounts") or {}).get(str(account_id))
-        approval = account_state.get("approval") if isinstance(account_state, dict) else None
-        if (
-            not isinstance(approval, dict)
-            or approval.get("token") != token
-            or approval.get("status") != "pending"
-        ):
-            return {"status": "expired"}
-        if not approve:
-            account_state.pop("approval", None)
-            save_auto_reset_state(state)
-            notify_admins(admins, f"⛔ 管理员已拒绝账号 {account_id} 的本次 Key 自动重置。")
-            return {"status": "rejected"}
-        approval["status"] = "approved"
-        save_auto_reset_state(state)
-        notify_admins(admins, f"✅ 管理员已批准账号 {account_id} 的本次 Key 自动重置，正在执行。")
-        results = execute_auto_reset_approval(
-            state,
-            account_id,
-            account_state,
-            admins,
-            account_keys.get(account_id, []),
-        )
-        return {"status": "approved", "results": results}
-
-
-def check_account_weekly_resets(now=None):
-    if not reset_api_configured():
-        return
-    now = time.time() if now is None else now
-    try:
-        with _AUTO_RESET_LOCK:
-            cfg = load_config()
-            bindings = config_bindings(cfg)
-            admins = config_admins(cfg)
-            account_keys = configured_account_keys(bindings)
-            state = load_auto_reset_state()
-            account_states = state.get("accounts")
-            if not isinstance(account_states, dict):
-                account_states = {}
-                state["accounts"] = account_states
-
-            configured_account_ids = {str(account_id) for account_id in account_keys}
-            changed = False
-            for stale_account_id in set(account_states) - configured_account_ids:
-                del account_states[stale_account_id]
-                changed = True
-
-            for account_id, key_names in account_keys.items():
-                account_state_key = str(account_id)
-                try:
-                    account_state = account_states.get(account_state_key)
-                    if isinstance(account_state, dict):
-                        had_legacy_pending_keys = "pending_keys" in account_state
-                        legacy_pending_keys = account_state.pop("pending_keys", [])
-                        if legacy_pending_keys and not isinstance(account_state.get("approval"), dict):
-                            account_state["approval"] = {
-                                "token": secrets.token_hex(4),
-                                "batch_id": secrets.token_hex(8),
-                                "reset_at": account_state.get("observed_reset_at"),
-                                "deadline_at": None,
-                                "status": "pending",
-                                "keys": [key for key in legacy_pending_keys if key in key_names],
-                            }
-                        if had_legacy_pending_keys:
-                            changed = True
-
-                        approval = account_state.get("approval")
-                        if isinstance(approval, dict):
-                            approval["keys"] = [
-                                key for key in approval.get("keys", []) if key in key_names
-                            ]
-                            if not approval["keys"]:
-                                account_state.pop("approval", None)
-                                changed = True
-                            elif approval.get("deadline_at") is None:
-                                save_auto_reset_state(state)
-                                delivered = notify_auto_reset_approval(
-                                    admins,
-                                    account_id,
-                                    approval.get("reset_at"),
-                                    approval["keys"],
-                                    approval.get("token"),
-                                )
-                                if delivered:
-                                    approval["deadline_at"] = now + AUTO_RESET_APPROVAL_SECONDS
-                                    changed = True
-                            elif (
-                                approval.get("status") == "pending"
-                                and now >= approval.get("deadline_at")
-                            ):
-                                approval["status"] = "approved"
-                                save_auto_reset_state(state)
-                                notify_admins(
-                                    admins,
-                                    f"⏱️ 3 分钟内无人操作，账号 {account_id} 的 Key 将自动重置。",
-                                )
-                                execute_auto_reset_approval(
-                                    state, account_id, account_state, admins, key_names,
-                                )
-                            elif approval.get("status") == "approved":
-                                execute_auto_reset_approval(
-                                    state, account_id, account_state, admins, key_names,
-                                )
-
-                    snapshot = query_account_weekly_reset(account_id) or {}
-                    if snapshot.get("error"):
-                        raise RuntimeError("Account weekly reset query did not return account data")
-                    current_reset_at = canonical_reset_timestamp(snapshot.get("reset_7d_at"))
-                    if current_reset_at is None:
-                        continue
-
-                    account_state = account_states.get(account_state_key)
-                    if not isinstance(account_state, dict):
-                        account_states[account_state_key] = {"observed_reset_at": current_reset_at}
-                        changed = True
-                        continue
-
-                    observed_reset_at = canonical_reset_timestamp(account_state.get("observed_reset_at"))
-
-                    if observed_reset_at is None:
-                        account_state["observed_reset_at"] = current_reset_at
-                        account_state.pop("approval", None)
-                        changed = True
-                        continue
-
-                    current_dt = parse_upstream_timestamp(current_reset_at)
-                    observed_dt = parse_upstream_timestamp(observed_reset_at)
-                    reset_advance_seconds = (current_dt - observed_dt).total_seconds()
-                    if reset_advance_seconds >= AUTO_RESET_MIN_ADVANCE_SECONDS:
-                        account_state["observed_reset_at"] = current_reset_at
-                        account_state["approval"] = {
-                            "token": secrets.token_hex(4),
-                            "batch_id": secrets.token_hex(8),
-                            "reset_at": current_reset_at,
-                            "deadline_at": None,
-                            "status": "pending",
-                            "keys": list(key_names),
-                        }
-                        changed = True
-                        save_auto_reset_state(state)
-                        delivered = notify_auto_reset_approval(
-                            admins, account_id, current_reset_at, key_names,
-                            account_state["approval"]["token"],
-                        )
-                        if delivered:
-                            account_state["approval"]["deadline_at"] = (
-                                now + AUTO_RESET_APPROVAL_SECONDS
-                            )
-                        continue
-                    if reset_advance_seconds > 0:
-                        account_state["observed_reset_at"] = current_reset_at
-                        changed = True
-                        continue
-                except Exception as error:
-                    log_failure(f"auto reset check account={masked_id(account_id)}", error)
-            if changed:
-                save_auto_reset_state(state)
-    except Exception as error:
-        log_failure("auto reset scan", error)
 
 
 def check_weekly_alerts():
@@ -1763,13 +1487,6 @@ def alert_loop():
         time.sleep(max(ALERT_CHECK_INTERVAL, 60))
 
 
-def auto_reset_loop():
-    time.sleep(10)
-    while True:
-        check_account_weekly_resets()
-        time.sleep(max(AUTO_RESET_CHECK_INTERVAL, 60))
-
-
 def format_usage(key_name, data, now=None):
     if data.get("error") == "duplicate_key_name":
         return (
@@ -1793,13 +1510,33 @@ def format_usage(key_name, data, now=None):
     ]
     append_limit(lines, "5 小时", k.get("rate_limit_5h"), k.get("usage_5h"))
     if dec(k.get("rate_limit_5h")) > 0:
-        append_account_reset(lines, upstream_account.get("reset_5h_at"), now)
+        append_reset_time(lines, k.get("window_5h_end"), now)
     append_limit(lines, "每日", k.get("rate_limit_1d"), k.get("usage_1d"))
     append_limit(lines, "每周", k.get("rate_limit_7d"), k.get("usage_7d"))
     if dec(k.get("rate_limit_7d")) > 0:
-        append_account_reset(lines, upstream_account.get("reset_7d_at"), now)
-    if upstream_account.get("error") == "not_found":
-        lines.append(f"  ⚠️ 未找到配置的上游账号 ID：{upstream_account.get('id')}")
+        append_reset_time(lines, k.get("window_7d_end"), now)
+    if upstream_account:
+        lines.extend(["", "🌐 上游账号信息"])
+        if upstream_account.get("error") == "not_found":
+            lines.append(f"• ⚠️ 未找到配置的上游账号 ID：{upstream_account.get('id')}")
+        else:
+            appended_lines = len(lines)
+            append_reset_time(
+                lines,
+                upstream_account.get("reset_5h_at"),
+                now,
+                label="上游 5 小时重置时间",
+                indent="• ",
+            )
+            append_reset_time(
+                lines,
+                upstream_account.get("reset_7d_at"),
+                now,
+                label="上游 7 日重置时间",
+                indent="• ",
+            )
+            if len(lines) == appended_lines:
+                lines.append("• 重置时间：暂无数据")
     lines.extend([
         "",
         "📅 今日用量",
@@ -1917,7 +1654,6 @@ def handle_callback_query(callback):
         "batch_start", "batch_toggle", "batch_all", "batch_clear",
         "batch_review", "batch_back", "batch_confirm", "batch_cancel",
         "reset_prompt", "reset_confirm", "reset_cancel",
-        "auto_approve", "auto_reject",
         "rollback_start", "rollback_single", "rollback_key", "rollback_prompt",
         "rollback_confirm", "rollback_all", "rollback_all_prompt",
         "rollback_all_confirm", "rollback_back",
@@ -1938,41 +1674,6 @@ def handle_callback_query(callback):
                 "callback_query_id": callback_id,
                 "text": "你没有管理员权限。",
                 "show_alert": "true",
-            })
-            return
-        if action in {"auto_approve", "auto_reject"}:
-            account_id_text, token_separator, token = target_user_id.partition(":")
-            if not token_separator or not account_id_text.isdigit():
-                tg("answerCallbackQuery", {
-                    "callback_query_id": callback_id,
-                    "text": "审批信息无效或已过期。",
-                    "show_alert": "true",
-                })
-                return
-            tg("answerCallbackQuery", {
-                "callback_query_id": callback_id,
-                "text": "正在处理本次决定…",
-            })
-            decision = decide_auto_reset_approval(
-                int(account_id_text), token, action == "auto_approve",
-            )
-            status = decision.get("status")
-            if status == "expired":
-                decision_text = "⚠️ 本次自动重置审批已被其他管理员处理或已经失效。"
-            elif status == "rejected":
-                decision_text = f"⛔ 已拒绝账号 {account_id_text} 的本次 Key 自动重置。"
-            else:
-                results = decision.get("results") or []
-                success_count = sum(result.get("status") == "success" for result in results)
-                failed_count = sum(result.get("status") == "failed" for result in results)
-                decision_text = (
-                    f"✅ 已批准账号 {account_id_text} 的本次 Key 自动重置。\n"
-                    f"成功：{success_count}；失败待重试：{failed_count}"
-                )
-            tg("editMessageText", {
-                "chat_id": chat.get("id"),
-                "message_id": message.get("message_id"),
-                "text": decision_text,
             })
             return
         if action.startswith("rollback_"):
@@ -2552,8 +2253,6 @@ def main():
     ], ensure_ascii=False)})
     print("sub2api tg bot long polling started", flush=True)
     threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
-    if reset_api_configured():
-        threading.Thread(target=auto_reset_loop, name="account-weekly-resets", daemon=True).start()
     dispatcher = UpdateDispatcher(UPDATE_WORKERS, UPDATE_MAX_PENDING)
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     httpd.daemon_threads = True
