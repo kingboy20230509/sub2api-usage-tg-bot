@@ -663,7 +663,7 @@ class MessageAuthorizationTests(unittest.TestCase):
         },
     })
     @mock.patch.object(bot, "tg")
-    def test_admin_key_view_shows_upstream_account_information(self, tg, _query, _allow):
+    def test_admin_key_view_hides_upstream_account_information(self, tg, _query, _allow):
         config = {
             "admins": [123],
             "bindings": {"456": {"key_name": "User A", "account_id": 12}},
@@ -680,9 +680,9 @@ class MessageAuthorizationTests(unittest.TestCase):
             if call.args[0] == "editMessageText"
         ]
         self.assertEqual(len(edits), 1)
-        self.assertIn("🌐 上游账号信息", edits[0])
-        self.assertIn("上游 5 小时重置时间", edits[0])
-        self.assertIn("上游 7 日重置时间", edits[0])
+        self.assertNotIn("🌐 上游账号信息", edits[0])
+        self.assertNotIn("上游 5 小时重置时间", edits[0])
+        self.assertNotIn("上游 7 日重置时间", edits[0])
 
     @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "tg")
@@ -1510,14 +1510,13 @@ class DataSafetyTests(unittest.TestCase):
             "example-key",
             data,
             now=bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00"),
-            show_upstream_account=True,
         )
         self.assertIn("• 5 小时：已用 25 / 限额 100 / 剩余 75", output)
         self.assertIn("重置时间：2026-08-24 19:00:00｜剩余：4h", output)
         self.assertIn("重置时间：2026-08-30 08:00:00｜剩余：5d 17h", output)
-        self.assertIn("🌐 上游账号信息", output)
-        self.assertIn("上游 5 小时重置时间：2026-08-24 20:30:00｜剩余：5h 30m", output)
-        self.assertIn("上游 7 日重置时间：2026-08-31 08:00:00｜剩余：6d 17h", output)
+        self.assertNotIn("🌐 上游账号信息", output)
+        self.assertNotIn("上游 5 小时重置时间", output)
+        self.assertNotIn("上游 7 日重置时间", output)
         self.assertNotIn("快照更新：", output)
         self.assertNotIn("重置周期：", output)
         self.assertIn("  [███░░░░░░░░░] 25%", output)
@@ -1555,16 +1554,17 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("状态：已过期", expired)
         self.assertIn("📅 到期时间：数据不可用", invalid)
 
-    def test_missing_configured_account_is_visible_without_guessing_a_reset(self):
+    def test_missing_configured_account_is_hidden_from_key_view(self):
         data = {
             "key": {"name": "example-key", "status": "active"},
             "upstream_account": {"error": "not_found", "id": 99},
         }
-        output = bot.format_usage("example-key", data, show_upstream_account=True)
-        self.assertIn("未找到配置的上游账号 ID：99", output)
+        output = bot.format_usage("example-key", data)
+        self.assertNotIn("上游账号", output)
+        self.assertNotIn("未找到配置的上游账号 ID：99", output)
         self.assertNotIn("重置时间：", output)
 
-    def test_unlimited_window_does_not_show_its_upstream_reset(self):
+    def test_key_view_does_not_show_upstream_reset(self):
         data = {
             "key": {
                 "name": "example-key",
@@ -1582,12 +1582,11 @@ class DataSafetyTests(unittest.TestCase):
             "example-key",
             data,
             now=bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00"),
-            show_upstream_account=True,
         )
         self.assertIn("• 5 小时：不限", output)
-        self.assertIn("🌐 上游账号信息", output)
-        self.assertIn("上游 5 小时重置时间：2026-08-24 20:30:00｜剩余：5h 30m", output)
-        self.assertIn("上游 7 日重置时间：2026-08-31 08:00:00｜剩余：6d 17h", output)
+        self.assertNotIn("🌐 上游账号信息", output)
+        self.assertNotIn("上游 5 小时重置时间", output)
+        self.assertNotIn("上游 7 日重置时间", output)
 
     def test_upstream_reset_supports_unix_seconds_and_expired_snapshots(self):
         reset_at = bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00").timestamp()
