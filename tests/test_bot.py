@@ -628,6 +628,62 @@ class MessageAuthorizationTests(unittest.TestCase):
         query.assert_called_once_with("User A", None)
         self.assertEqual(tg.call_args.args[0], "sendMessage")
 
+    @mock.patch.object(bot, "query_key_usage", return_value={
+        "key": {"name": "User A", "status": "active"},
+        "upstream_account": {
+            "id": 12,
+            "reset_5h_at": "2026-09-05T15:32:15Z",
+            "reset_7d_at": "2026-09-12T04:45:13Z",
+        },
+    })
+    @mock.patch.object(bot, "tg")
+    def test_regular_user_check_hides_upstream_account_information(self, tg, _query):
+        config = {
+            "admins": [123],
+            "bindings": {"456": {"key_name": "User A", "account_id": 12}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_message({
+                "chat": {"id": 456, "type": "private"},
+                "from": {"id": 456},
+                "text": "/check",
+            })
+        text = tg.call_args.args[1]["text"]
+        self.assertNotIn("🌐 上游账号信息", text)
+        self.assertNotIn("上游 5 小时重置时间", text)
+        self.assertNotIn("上游 7 日重置时间", text)
+
+    @mock.patch.object(bot, "allow_check", return_value=(True, 0))
+    @mock.patch.object(bot, "query_key_usage", return_value={
+        "key": {"name": "User A", "status": "active"},
+        "upstream_account": {
+            "id": 12,
+            "reset_5h_at": "2026-09-05T15:32:15Z",
+            "reset_7d_at": "2026-09-12T04:45:13Z",
+        },
+    })
+    @mock.patch.object(bot, "tg")
+    def test_admin_key_view_shows_upstream_account_information(self, tg, _query, _allow):
+        config = {
+            "admins": [123],
+            "bindings": {"456": {"key_name": "User A", "account_id": 12}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({
+                "id": "callback-admin-usage",
+                "from": {"id": 123},
+                "data": "usage:456",
+                "message": {"message_id": 8, "chat": {"id": 123, "type": "private"}},
+            })
+        edits = [
+            call.args[1]["text"] for call in tg.call_args_list
+            if call.args[0] == "editMessageText"
+        ]
+        self.assertEqual(len(edits), 1)
+        self.assertIn("🌐 上游账号信息", edits[0])
+        self.assertIn("上游 5 小时重置时间", edits[0])
+        self.assertIn("上游 7 日重置时间", edits[0])
+
     @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "tg")
     def test_non_admin_cannot_use_admin_callback(self, tg, query):
@@ -1454,6 +1510,7 @@ class DataSafetyTests(unittest.TestCase):
             "example-key",
             data,
             now=bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00"),
+            show_upstream_account=True,
         )
         self.assertIn("• 5 小时：已用 25 / 限额 100 / 剩余 75", output)
         self.assertIn("重置时间：2026-08-24 19:00:00｜剩余：4h", output)
@@ -1503,7 +1560,7 @@ class DataSafetyTests(unittest.TestCase):
             "key": {"name": "example-key", "status": "active"},
             "upstream_account": {"error": "not_found", "id": 99},
         }
-        output = bot.format_usage("example-key", data)
+        output = bot.format_usage("example-key", data, show_upstream_account=True)
         self.assertIn("未找到配置的上游账号 ID：99", output)
         self.assertNotIn("重置时间：", output)
 
@@ -1525,6 +1582,7 @@ class DataSafetyTests(unittest.TestCase):
             "example-key",
             data,
             now=bot.datetime.fromisoformat("2026-08-24T07:00:00+00:00"),
+            show_upstream_account=True,
         )
         self.assertIn("• 5 小时：不限", output)
         self.assertIn("🌐 上游账号信息", output)
