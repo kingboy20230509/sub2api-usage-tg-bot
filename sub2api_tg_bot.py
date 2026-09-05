@@ -1487,7 +1487,7 @@ def alert_loop():
         time.sleep(max(ALERT_CHECK_INTERVAL, 60))
 
 
-def format_usage(key_name, data, now=None, show_upstream_account=False):
+def format_usage(key_name, data, now=None):
     if data.get("error") == "duplicate_key_name":
         return (
             f"⚠️ 检测到多个同名 Key：{key_name}\n\n"
@@ -1500,7 +1500,6 @@ def format_usage(key_name, data, now=None, show_upstream_account=False):
     today = data.get("today") or {}
     models_today = data.get("models_today") or []
     models_7d = data.get("models_7d") or []
-    upstream_account = data.get("upstream_account") or {}
     lines = [
         f"🔑 Key：{k.get('name')}",
         f"📅 到期时间：{format_key_expiry(k.get('expires_at'), now)}",
@@ -1515,28 +1514,6 @@ def format_usage(key_name, data, now=None, show_upstream_account=False):
     append_limit(lines, "每周", k.get("rate_limit_7d"), k.get("usage_7d"))
     if dec(k.get("rate_limit_7d")) > 0:
         append_reset_time(lines, k.get("window_7d_end"), now)
-    if show_upstream_account and upstream_account:
-        lines.extend(["", "🌐 上游账号信息"])
-        if upstream_account.get("error") == "not_found":
-            lines.append(f"• ⚠️ 未找到配置的上游账号 ID：{upstream_account.get('id')}")
-        else:
-            appended_lines = len(lines)
-            append_reset_time(
-                lines,
-                upstream_account.get("reset_5h_at"),
-                now,
-                label="上游 5 小时重置时间",
-                indent="• ",
-            )
-            append_reset_time(
-                lines,
-                upstream_account.get("reset_7d_at"),
-                now,
-                label="上游 7 日重置时间",
-                indent="• ",
-            )
-            if len(lines) == appended_lines:
-                lines.append("• 重置时间：暂无数据")
     lines.extend([
         "",
         "📅 今日用量",
@@ -2097,7 +2074,7 @@ def handle_callback_query(callback):
             return
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
         data = query_key_usage(key_name, binding["account_id"])
-        reply = format_usage(key_name, data or {}, show_upstream_account=True)
+        reply = format_usage(key_name, data or {})
         reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
         tg("editMessageText", {
             "chat_id": chat.get("id"),

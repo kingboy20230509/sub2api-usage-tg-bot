@@ -118,7 +118,7 @@ docker compose exec -T postgres psql -U sub2api -d sub2api -P pager=off \
   -c "SELECT id, name, platform, type, status, extra->>'codex_usage_updated_at' AS snapshot_updated_at, extra->>'codex_7d_reset_at' AS reset_7d_at FROM accounts WHERE deleted_at IS NULL ORDER BY id;"
 ```
 
-`account_id` 必须按账号逐个绑定，不能用 Key 名称推断。Bot 使用 `accounts.extra` 中由 Sub2API 保存的 `codex_5h_reset_at`、`codex_7d_reset_at` 和 `codex_7d_used_percent`，仅在独立的“上游账号信息”区域展示；Key 限额区域的重置时间来自 `api_keys` 自身窗口。管理员的 Key 总览还会按账号当前周窗口汇总 Sub2API 账号成本，并用“消耗金额 ÷ 使用百分比”线性预估满额金额。该快照可能在账号尚未使用或后台尚未刷新时为空或过期；百分比为 0 或数据不完整时不会进行预估。Bot 不会伪造重置周期，也不会使用管理员 Token 强制刷新。旧版字符串绑定仍可继续使用，但不会显示上游账号重置时间或账号金额预估。
+`account_id` 必须按账号逐个绑定，不能用 Key 名称推断。Bot 使用 `accounts.extra` 中由 Sub2API 保存的 `codex_5h_reset_at`、`codex_7d_reset_at` 和 `codex_7d_used_percent`，仅在管理员的 Key 总览“上游账号信息”区域展示；单个 Key 限额区域的重置时间来自 `api_keys` 自身窗口。管理员的 Key 总览还会按账号当前周窗口汇总 Sub2API 账号成本，并用“消耗金额 ÷ 使用百分比”线性预估满额金额。该快照可能在账号尚未使用或后台尚未刷新时为空或过期；百分比为 0 或数据不完整时不会进行预估。Bot 不会伪造重置周期，也不会使用管理员 Token 强制刷新。旧版字符串绑定仍可继续使用，但不会显示上游账号重置时间或账号金额预估。
 
 Key 名称必须唯一。如果数据库中存在多个未删除且同名的 Key，Bot 会拒绝返回数据并提示先改成唯一名称，避免误显示其他 Key 的用量。生产 Linux 主机使用：
 
@@ -189,7 +189,7 @@ sub2api tg bot long polling started
 /check
 ```
 
-普通用户直接查询自己的 Key，且不会显示上游账号信息；管理员会先看到 Key 查询按钮、“Key 总览”、“批量重置速率限制”和“回滚 Key 使用量”按钮。管理员查看单个 Key 时可以看到独立的“上游账号信息”区域。“Key 总览”按 Key 名称去重，每页显示 8 个 Key，展示最后使用时间、每周已用/限额/剩余、Key 自身的周重置时间和 12 格进度条；下方“上游账号信息”按 `account_id` 去重展示账号周使用百分比、明确标注的上游周重置时间、账号消耗金额、满额金额预估及汇总，最后显示本次刷新时间。账号名称若为邮箱格式会自动脱敏。总览支持刷新、翻页和返回，不显示请求、Tokens、模型、5 小时或每日信息。
+普通用户直接查询自己的 Key；管理员会先看到 Key 查询按钮、“Key 总览”、“批量重置速率限制”和“回滚 Key 使用量”按钮。普通用户和管理员查看单个 Key 时都不会显示上游账号信息。“Key 总览”按 Key 名称去重，每页显示 8 个 Key，展示最后使用时间、每周已用/限额/剩余、Key 自身的周重置时间和 12 格进度条；下方“上游账号信息”按 `account_id` 去重展示账号周使用百分比、明确标注的上游周重置时间、账号消耗金额、满额金额预估及汇总，最后显示本次刷新时间。账号名称若为邮箱格式会自动脱敏。总览支持刷新、翻页和返回，不显示请求、Tokens、模型、5 小时或每日信息。
 
 账号金额预估只对配置中的管理员开放。普通用户看不到 Key 总览按钮；即使伪造 `overview` 回调，Bot 也会在执行任何 Key 或账号数据库查询前重新校验 Telegram 管理员 ID。账号消耗金额采用 Sub2API 的账号用量统计口径，不代表 OpenAI 实际账单；满额金额是线性预估值。
 
