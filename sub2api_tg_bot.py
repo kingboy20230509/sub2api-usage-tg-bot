@@ -1487,7 +1487,7 @@ def alert_loop():
         time.sleep(max(ALERT_CHECK_INTERVAL, 60))
 
 
-def format_usage(key_name, data, now=None):
+def format_usage(key_name, data, now=None, show_upstream_account=False):
     if data.get("error") == "duplicate_key_name":
         return (
             f"⚠️ 检测到多个同名 Key：{key_name}\n\n"
@@ -1515,7 +1515,7 @@ def format_usage(key_name, data, now=None):
     append_limit(lines, "每周", k.get("rate_limit_7d"), k.get("usage_7d"))
     if dec(k.get("rate_limit_7d")) > 0:
         append_reset_time(lines, k.get("window_7d_end"), now)
-    if upstream_account:
+    if show_upstream_account and upstream_account:
         lines.extend(["", "🌐 上游账号信息"])
         if upstream_account.get("error") == "not_found":
             lines.append(f"• ⚠️ 未找到配置的上游账号 ID：{upstream_account.get('id')}")
@@ -2097,7 +2097,7 @@ def handle_callback_query(callback):
             return
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
         data = query_key_usage(key_name, binding["account_id"])
-        reply = format_usage(key_name, data or {})
+        reply = format_usage(key_name, data or {}, show_upstream_account=True)
         reply += f"\n\n🔄 刷新时间：{format_refresh_timestamp(cfg)}"
         tg("editMessageText", {
             "chat_id": chat.get("id"),
