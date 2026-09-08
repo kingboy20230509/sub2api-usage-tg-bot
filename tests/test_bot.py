@@ -1528,6 +1528,8 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("'models_today'", sql)
         self.assertIn("'ip_counts'", sql)
         self.assertIn("count(DISTINCT ip_address)", sql)
+        self.assertIn("(SELECT max(usage_row.created_at)", sql)
+        self.assertIn("WHERE usage_row.api_key_id = api_key_row.id) AS last_used_at", sql)
         self.assertIn("'models_7d'", sql)
         self.assertIn("interval '6 days'", sql)
         self.assertIn("AS window_start", sql)
