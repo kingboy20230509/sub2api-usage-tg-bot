@@ -11,7 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -46,6 +46,10 @@ LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8099"))
 ALERT_STATE_PATH = os.environ.get("ALERT_STATE_PATH", os.path.join(BASE_DIR, "alert_state.json"))
 ALERT_CHECK_INTERVAL = int(os.environ.get("ALERT_CHECK_INTERVAL", "600"))
+AUTO_RESET_STATE_PATH = os.environ.get(
+    "AUTO_RESET_STATE_PATH", os.path.join(BASE_DIR, "auto_reset_state.json")
+)
+AUTO_RESET_CHECK_INTERVAL = int(os.environ.get("AUTO_RESET_CHECK_INTERVAL", "60"))
 PSQL_BIN = os.environ.get("PSQL_BIN", "/usr/bin/psql").strip()
 PGHOST = os.environ.get("PGHOST", "127.0.0.1").strip()
 PGPORT = os.environ.get("PGPORT", "5432").strip()
@@ -68,8 +72,11 @@ _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_CHECK_BY_USER = {}
 _BATCH_RESET_LOCK = threading.Lock()
 _BATCH_RESET_SESSIONS = {}
+_AUTO_RESET_LOCK = threading.Lock()
 _RESET_OPERATION_LOCK = threading.Lock()
 BATCH_RESET_SESSION_TTL = 300
+AUTO_RESET_MIN_ADVANCE_SECONDS = 3600
+AUTO_RESET_APPROVAL_SECONDS = 180
 OVERVIEW_PAGE_SIZE = 8
 IP_HISTORY_PAGE_SIZE = 10
 
@@ -98,6 +105,8 @@ def validate_runtime_config():
         raise RuntimeError("POLL_TIMEOUT must be between 1 and 50 seconds")
     if not 1 <= SUB2API_ADMIN_TIMEOUT <= 60:
         raise RuntimeError("SUB2API_ADMIN_TIMEOUT must be between 1 and 60 seconds")
+    if not 60 <= AUTO_RESET_CHECK_INTERVAL <= 3600:
+        raise RuntimeError("AUTO_RESET_CHECK_INTERVAL must be between 60 and 3600 seconds")
     if bool(SUB2API_BASE_URL) != bool(SUB2API_ADMIN_API_KEY):
         raise RuntimeError("SUB2API_BASE_URL and SUB2API_ADMIN_API_KEY must be configured together")
     if SUB2API_BASE_URL:
@@ -668,7 +677,9 @@ def backup_and_reset_key(key_name, account_id, reset_source, batch_id, reset_at=
         return backup
 
 
-def reset_selected_keys(bindings, selected_user_ids, reset_at=None):
+def reset_selected_keys(bindings, selected_user_ids, reset_at=None, reset_source="manual"):
+    if reset_source not in {"manual", "auto"}:
+        raise ValueError("Invalid reset source")
     selected_user_ids = set(selected_user_ids)
     batch_id = secrets.token_hex(8)
     reset_at = datetime.now(timezone.utc) if reset_at is None else reset_at
@@ -681,7 +692,7 @@ def reset_selected_keys(bindings, selected_user_ids, reset_at=None):
         backup_completed = False
         try:
             backup = backup_and_reset_key(
-                key_name, binding["account_id"], "manual", batch_id, reset_at
+                key_name, binding["account_id"], reset_source, batch_id, reset_at
             )
             backup_completed = True
             reset_completed = True
@@ -1049,6 +1060,13 @@ def query_account_estimate(account_id):
     if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
         raise ValueError("Invalid account ID in binding config")
     sql = "SELECT sub2api_tg_bot_api.account_estimate(:'account_id'::bigint)::text;"
+    return run_psql_json(sql, {"account_id": str(account_id)})
+
+
+def query_account_weekly_reset(account_id):
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        raise ValueError("Invalid account ID in binding config")
+    sql = "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;"
     return run_psql_json(sql, {"account_id": str(account_id)})
 
 
@@ -1430,6 +1448,58 @@ def save_alert_state(state):
     os.chmod(ALERT_STATE_PATH, 0o600)
 
 
+def load_auto_reset_state():
+    try:
+        with open(AUTO_RESET_STATE_PATH, "r", encoding="utf-8") as state_file:
+            value = json.load(state_file)
+        return value if isinstance(value, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as error:
+        log_failure("auto reset state load", error)
+        return {}
+
+
+def save_auto_reset_state(state):
+    tmp = AUTO_RESET_STATE_PATH + ".tmp"
+    os.makedirs(os.path.dirname(AUTO_RESET_STATE_PATH) or ".", exist_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, ensure_ascii=False, indent=2)
+        state_file.flush()
+        os.fsync(state_file.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, AUTO_RESET_STATE_PATH)
+    os.chmod(AUTO_RESET_STATE_PATH, 0o600)
+
+
+def canonical_reset_timestamp(value):
+    parsed = parse_upstream_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def classify_upstream_reset(previous_reset_at, current_reset_at, now=None):
+    previous = parse_upstream_timestamp(previous_reset_at)
+    current = parse_upstream_timestamp(current_reset_at)
+    if previous is None or current is None or current <= previous:
+        return None
+    if (current - previous).total_seconds() < AUTO_RESET_MIN_ADVANCE_SECONDS:
+        return "drift"
+    current_time = datetime.now(timezone.utc) if now is None else parse_upstream_timestamp(now)
+    if current_time is None:
+        raise ValueError("Invalid current time")
+    return "sudden" if current_time < previous else "natural"
+
+
+def upstream_alignment_time(reset_at):
+    parsed = parse_upstream_timestamp(reset_at)
+    if parsed is None:
+        raise ValueError("Invalid upstream reset time")
+    return parsed.astimezone(timezone.utc) - timedelta(days=7)
+
+
 def notify_admins(admins, text):
     delivered = 0
     for admin_user_id in sorted(admins):
@@ -1439,6 +1509,301 @@ def notify_admins(admins, text):
         except Exception as error:
             log_failure(f"notify admin={masked_id(admin_user_id)}", error)
     return delivered
+
+
+def configured_account_ids(bindings):
+    return sorted({
+        binding["account_id"]
+        for binding in bindings.values()
+        if binding["account_id"] is not None
+    })
+
+
+def sudden_reset_approval_keyboard(token):
+    return json.dumps({"inline_keyboard": [[
+        {"text": "✅ 对齐并重置全部", "callback_data": f"auto_approve:{token}"},
+        {"text": "⛔ 本次不重置", "callback_data": f"auto_reject:{token}"},
+    ]]}, ensure_ascii=False)
+
+
+def format_sudden_reset_approval(approval):
+    return "\n".join([
+        "通知：检测到 OpenAI 7 日额度提前重置",
+        "",
+        f"原计划重置时间：{format_timestamp(approval.get('previous_reset_at'))}",
+        f"新的重置时间：{format_timestamp(approval.get('reset_at'))}",
+        f"新周期开始时间：{format_timestamp(approval.get('align_at'))}",
+        f"涉及 Key：{len(approval.get('keys') or [])} 个",
+        "",
+        "本次属于突然重置，是否将所有绑定 Key 随号重置？",
+        "",
+        "执行后将：",
+        "• 备份所有 Key 当前用量",
+        "• 清零 5 小时、每日和 7 日用量",
+        "• 将所有 Key 的窗口对齐到新周期开始时间",
+        "• 只向重置成功的用户发送公告",
+        "",
+        "3 分钟内未操作将自动执行。",
+    ])
+
+
+def format_sudden_reset_result(approval, results, automatic=False):
+    success_count = sum(result.get("status") == "success" for result in results)
+    warning_count = sum(result.get("status") == "warning" for result in results)
+    failed_count = sum(result.get("status") == "failed" for result in results)
+    heading = (
+        "通知：3 分钟内未收到操作，已自动执行全员随号重置。"
+        if automatic else
+        "通知：全员随号重置完成"
+    )
+    lines = [
+        heading,
+        "",
+        f"• 对齐时间：{format_timestamp(approval.get('align_at'))}",
+        f"• 成功：{success_count} 个 Key",
+        f"• 需复查：{warning_count} 个 Key",
+        f"• 失败：{failed_count} 个 Key",
+    ]
+    unsuccessful = [result for result in results if result.get("status") != "success"]
+    if unsuccessful:
+        lines.extend(["", "未完成："])
+        lines.extend(
+            f"• {result.get('key_name') or '-'}：{result.get('detail') or '重置失败'}"
+            for result in unsuccessful[:30]
+        )
+    lines.extend([
+        "",
+        "所有成功用户均已收到公告，失败或需复查用户未收到。",
+        "已创建的重置前备份均已保留，可在回滚菜单中恢复。",
+    ])
+    return "\n".join(lines)
+
+
+def notify_successful_bound_users(bindings, results):
+    successful_keys = {
+        result.get("key_name") for result in results if result.get("status") == "success"
+    }
+    delivered = 0
+    for user_id, binding in sorted(bindings.items()):
+        if binding["key_name"] not in successful_keys:
+            continue
+        try:
+            tg("sendMessage", {
+                "chat_id": user_id,
+                "text": "\n".join([
+                    "公告：OpenAI重置，随号重置",
+                    "",
+                    f"Key：{binding['key_name']}",
+                    "• 5 小时用量已重置",
+                    "• 每日用量已重置",
+                    "• 7 日用量已重置",
+                    "• 重置时间已与 OpenAI 新周期对齐",
+                ]),
+            })
+            delivered += 1
+        except Exception as error:
+            log_failure(f"sudden reset announcement user={masked_id(user_id)}", error)
+    return delivered
+
+
+def notify_sudden_reset_approval(admins, approval):
+    delivered = 0
+    reply_markup = sudden_reset_approval_keyboard(approval["token"])
+    for admin_user_id in sorted(admins):
+        try:
+            tg("sendMessage", {
+                "chat_id": admin_user_id,
+                "text": format_sudden_reset_approval(approval),
+                "reply_markup": reply_markup,
+            })
+            delivered += 1
+        except Exception as error:
+            log_failure(f"sudden reset approval admin={masked_id(admin_user_id)}", error)
+    return delivered
+
+
+def new_sudden_reset_approval(bindings, account_id, previous_reset_at, reset_at):
+    keys = [binding["key_name"] for _user_id, binding in reset_candidates(bindings)]
+    return {
+        "token": secrets.token_hex(4),
+        "trigger_account_id": account_id,
+        "previous_reset_at": canonical_reset_timestamp(previous_reset_at),
+        "reset_at": canonical_reset_timestamp(reset_at),
+        "align_at": canonical_reset_timestamp(upstream_alignment_time(reset_at)),
+        "deadline_at": None,
+        "status": "pending",
+        "keys": keys,
+    }
+
+
+def execute_sudden_reset_approval(state, approval, config):
+    if approval.get("status") != "approved":
+        return [], {}
+    bindings = config_bindings(config)
+    approved_keys = set(approval.get("keys") or [])
+    selected_user_ids = {
+        user_id
+        for user_id, binding in reset_candidates(bindings)
+        if binding["key_name"] in approved_keys
+    }
+    approval["status"] = "executing"
+    save_auto_reset_state(state)
+    try:
+        results = reset_selected_keys(
+            bindings,
+            selected_user_ids,
+            reset_at=upstream_alignment_time(approval.get("reset_at")),
+            reset_source="auto",
+        )
+    except Exception:
+        approval["status"] = "pending"
+        approval["deadline_at"] = None
+        save_auto_reset_state(state)
+        raise
+    state.pop("approval", None)
+    save_auto_reset_state(state)
+    return results, bindings
+
+
+def decide_sudden_reset_approval(token, approve):
+    if not re.fullmatch(r"[0-9a-f]{8}", token or ""):
+        raise ValueError("Invalid approval token")
+    with _AUTO_RESET_LOCK:
+        config = load_config()
+        state = load_auto_reset_state()
+        approval = state.get("approval")
+        if (
+            not isinstance(approval, dict)
+            or approval.get("token") != token
+            or approval.get("status") != "pending"
+        ):
+            return {"status": "expired"}
+        if not approve:
+            state.pop("approval", None)
+            save_auto_reset_state(state)
+            return {"status": "rejected"}
+        approval["status"] = "approved"
+        save_auto_reset_state(state)
+        results, bindings = execute_sudden_reset_approval(state, approval, config)
+        return {
+            "status": "approved",
+            "approval": approval,
+            "results": results,
+            "bindings": bindings,
+        }
+
+
+def check_account_weekly_resets(now=None):
+    if not reset_api_configured():
+        return
+    now_epoch = time.time() if now is None else (
+        now.timestamp() if isinstance(now, datetime) else float(now)
+    )
+    with _AUTO_RESET_LOCK:
+        config = load_config()
+        bindings = config_bindings(config)
+        admins = config_admins(config)
+        account_ids = configured_account_ids(bindings)
+        state = load_auto_reset_state()
+        account_states = state.get("accounts")
+        if not isinstance(account_states, dict):
+            account_states = {}
+            state["accounts"] = account_states
+        changed = False
+
+        configured_ids = {str(account_id) for account_id in account_ids}
+        for stale_account_id in set(account_states) - configured_ids:
+            del account_states[stale_account_id]
+            changed = True
+
+        approval = state.get("approval")
+        if isinstance(approval, dict):
+            if approval.get("status") == "pending" and approval.get("deadline_at") is None:
+                if notify_sudden_reset_approval(admins, approval):
+                    approval["deadline_at"] = now_epoch + AUTO_RESET_APPROVAL_SECONDS
+                    changed = True
+            elif (
+                approval.get("status") == "pending"
+                and now_epoch >= float(approval.get("deadline_at") or 0)
+            ):
+                approval["status"] = "approved"
+                save_auto_reset_state(state)
+                results, reset_bindings = execute_sudden_reset_approval(
+                    state, approval, config
+                )
+                notify_admins(
+                    admins,
+                    format_sudden_reset_result(approval, results, automatic=True),
+                )
+                notify_successful_bound_users(reset_bindings, results)
+                approval = None
+            elif approval.get("status") == "approved":
+                results, reset_bindings = execute_sudden_reset_approval(
+                    state, approval, config
+                )
+                notify_admins(admins, format_sudden_reset_result(approval, results))
+                notify_successful_bound_users(reset_bindings, results)
+                approval = None
+            elif approval.get("status") == "executing":
+                state.pop("approval", None)
+                changed = True
+                notify_admins(
+                    admins,
+                    "通知：上次全员随号重置在执行中被中断。\n\n"
+                    "Bot 未自动重复执行，请查询各 Key 状态后手动处理。",
+                )
+                approval = None
+
+        for account_id in account_ids:
+            try:
+                snapshot = query_account_weekly_reset(account_id) or {}
+                if snapshot.get("error"):
+                    raise RuntimeError("Account weekly reset query did not return account data")
+                current_reset_at = canonical_reset_timestamp(snapshot.get("reset_7d_at"))
+                if current_reset_at is None:
+                    continue
+                account_key = str(account_id)
+                account_state = account_states.get(account_key)
+                if not isinstance(account_state, dict):
+                    account_states[account_key] = {"observed_reset_at": current_reset_at}
+                    changed = True
+                    continue
+                previous_reset_at = canonical_reset_timestamp(
+                    account_state.get("observed_reset_at")
+                )
+                if previous_reset_at is None:
+                    account_state["observed_reset_at"] = current_reset_at
+                    changed = True
+                    continue
+                classification = classify_upstream_reset(
+                    previous_reset_at, current_reset_at, now_epoch
+                )
+                if classification in {"drift", "natural", "sudden"}:
+                    account_state["observed_reset_at"] = current_reset_at
+                    changed = True
+                if classification == "sudden" and not isinstance(state.get("approval"), dict):
+                    approval = new_sudden_reset_approval(
+                        bindings, account_id, previous_reset_at, current_reset_at
+                    )
+                    state["approval"] = approval
+                    save_auto_reset_state(state)
+                    if notify_sudden_reset_approval(admins, approval):
+                        approval["deadline_at"] = now_epoch + AUTO_RESET_APPROVAL_SECONDS
+                    changed = True
+            except Exception as error:
+                log_failure(f"auto reset check account={masked_id(account_id)}", error)
+        if changed:
+            save_auto_reset_state(state)
+
+
+def auto_reset_loop():
+    time.sleep(10)
+    while True:
+        try:
+            check_account_weekly_resets()
+        except Exception as error:
+            log_failure("auto reset scan", error)
+        time.sleep(max(AUTO_RESET_CHECK_INTERVAL, 60))
 
 
 def check_weekly_alerts():
@@ -1627,6 +1992,7 @@ def handle_callback_query(callback):
     user_id = str(user.get("id"))
     action, separator, target_user_id = callback_data.partition(":")
     if not callback_id or not separator or action not in {
+        "auto_approve", "auto_reject",
         "usage", "overview", "overview_back", "ip_detail",
         "batch_start", "batch_toggle", "batch_all", "batch_clear",
         "batch_review", "batch_back", "batch_confirm", "batch_cancel",
@@ -1651,6 +2017,36 @@ def handle_callback_query(callback):
                 "callback_query_id": callback_id,
                 "text": "你没有管理员权限。",
                 "show_alert": "true",
+            })
+            return
+        if action in {"auto_approve", "auto_reject"}:
+            decision = decide_sudden_reset_approval(
+                target_user_id, action == "auto_approve"
+            )
+            if decision["status"] == "expired":
+                tg("answerCallbackQuery", {
+                    "callback_query_id": callback_id,
+                    "text": "本次处理已经完成或已失效。",
+                    "show_alert": "true",
+                })
+                return
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+            if decision["status"] == "rejected":
+                text = (
+                    "通知：管理员已拒绝本次全员随号重置。\n\n"
+                    "所有 Key 保持原状，本次不发送公告。"
+                )
+            else:
+                text = format_sudden_reset_result(
+                    decision["approval"], decision["results"]
+                )
+                notify_successful_bound_users(
+                    decision["bindings"], decision["results"]
+                )
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": text,
             })
             return
         if action.startswith("rollback_"):
@@ -2084,7 +2480,9 @@ def handle_callback_query(callback):
         })
     except Exception as error:
         log_failure(f"admin {action} user={masked_id(user_id)}", error)
-        if action == "batch_confirm":
+        if action.startswith("auto_"):
+            error_text = "突然重置处理失败，请稍后重试。"
+        elif action == "batch_confirm":
             error_text = "批量重置执行异常，请重新发送 /check 查询当前用量。"
         elif action.startswith("batch_"):
             error_text = "批量重置操作失败，请重新发送 /check。"
@@ -2230,6 +2628,8 @@ def main():
     ], ensure_ascii=False)})
     print("sub2api tg bot long polling started", flush=True)
     threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
+    if reset_api_configured():
+        threading.Thread(target=auto_reset_loop, name="account-weekly-resets", daemon=True).start()
     dispatcher = UpdateDispatcher(UPDATE_WORKERS, UPDATE_MAX_PENDING)
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     httpd.daemon_threads = True

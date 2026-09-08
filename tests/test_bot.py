@@ -29,6 +29,7 @@ class RuntimeConfigTests(unittest.TestCase):
             UPDATE_MAX_PENDING=16,
             CHECK_COOLDOWN=10,
             ADMIN_CHECK_COOLDOWN=2,
+            AUTO_RESET_CHECK_INTERVAL=60,
             POLL_TIMEOUT=10,
         )
 
@@ -39,6 +40,11 @@ class RuntimeConfigTests(unittest.TestCase):
     def test_poll_timeout_is_bounded(self):
         with self.valid_runtime(), mock.patch.object(bot, "POLL_TIMEOUT", 0):
             with self.assertRaisesRegex(RuntimeError, "POLL_TIMEOUT"):
+                bot.validate_runtime_config()
+
+    def test_auto_reset_check_interval_is_bounded(self):
+        with self.valid_runtime(), mock.patch.object(bot, "AUTO_RESET_CHECK_INTERVAL", 59):
+            with self.assertRaisesRegex(RuntimeError, "AUTO_RESET_CHECK_INTERVAL"):
                 bot.validate_runtime_config()
 
     def test_remote_database_requires_tls(self):
@@ -112,6 +118,73 @@ class MessageAuthorizationTests(unittest.TestCase):
     def setUp(self):
         bot._LAST_CHECK_BY_USER.clear()
         bot._BATCH_RESET_SESSIONS.clear()
+
+    def test_upstream_reset_classification_distinguishes_sudden_and_natural(self):
+        previous = "2026-09-12T04:45:13Z"
+        current = "2026-09-15T20:18:30Z"
+        self.assertEqual(
+            bot.classify_upstream_reset(previous, current, "2026-09-08T12:18:30Z"),
+            "sudden",
+        )
+        self.assertEqual(
+            bot.classify_upstream_reset(previous, current, previous),
+            "natural",
+        )
+
+    def test_upstream_reset_classification_ignores_drift_and_stale_snapshots(self):
+        previous = "2026-09-12T04:45:13Z"
+        self.assertEqual(
+            bot.classify_upstream_reset(
+                previous, "2026-09-12T05:15:12Z", "2026-09-08T12:18:30Z"
+            ),
+            "drift",
+        )
+        self.assertIsNone(bot.classify_upstream_reset(previous, previous))
+        self.assertIsNone(
+            bot.classify_upstream_reset(previous, "2026-09-11T04:45:13Z")
+        )
+
+    def test_upstream_alignment_uses_new_reset_time_minus_seven_days(self):
+        self.assertEqual(
+            bot.upstream_alignment_time("2026-09-15T20:18:30Z"),
+            bot.datetime.fromisoformat("2026-09-08T20:18:30+00:00"),
+        )
+
+    def test_sudden_reset_prompt_and_result_use_notification_prefix(self):
+        approval = {
+            "previous_reset_at": "2026-09-12T04:45:13Z",
+            "reset_at": "2026-09-15T20:18:30Z",
+            "align_at": "2026-09-08T20:18:30Z",
+            "keys": ["Key A", "Key B"],
+        }
+        prompt = bot.format_sudden_reset_approval(approval)
+        self.assertTrue(prompt.startswith("通知："))
+        self.assertIn("3 分钟内未操作将自动执行", prompt)
+        result = bot.format_sudden_reset_result(approval, [
+            {"key_name": "Key A", "status": "success"},
+            {"key_name": "Key B", "status": "failed", "detail": "备份失败"},
+        ])
+        self.assertTrue(result.startswith("通知："))
+        self.assertIn("成功：1 个 Key", result)
+        self.assertIn("失败：1 个 Key", result)
+
+    @mock.patch.object(bot, "tg")
+    def test_sudden_reset_announcement_only_goes_to_successful_key_users(self, tg):
+        bindings = {
+            "123": {"key_name": "Key A", "account_id": 1},
+            "456": {"key_name": "Key B", "account_id": 2},
+            "789": {"key_name": "Key A", "account_id": 1},
+        }
+        delivered = bot.notify_successful_bound_users(bindings, [
+            {"key_name": "Key A", "status": "success"},
+            {"key_name": "Key B", "status": "failed"},
+        ])
+        self.assertEqual(delivered, 2)
+        self.assertEqual([call.args[1]["chat_id"] for call in tg.call_args_list], ["123", "789"])
+        self.assertTrue(all(
+            call.args[1]["text"].startswith("公告：OpenAI重置，随号重置")
+            for call in tg.call_args_list
+        ))
 
     def test_batch_reset_keyboard_tracks_selection_and_deduplicates_key_names(self):
         bindings = {
@@ -262,6 +335,22 @@ class MessageAuthorizationTests(unittest.TestCase):
         bot.reset_selected_keys(bindings, {"456", "789"}, reset_at=reset_at)
         self.assertEqual(reset.call_count, 2)
         self.assertEqual({call.args[4] for call in reset.call_args_list}, {reset_at})
+
+    @mock.patch.object(bot, "query_key_usage", return_value={
+        "key": {"usage_5h": 0, "usage_1d": 0, "usage_7d": 0},
+    })
+    @mock.patch.object(bot, "backup_and_reset_key", return_value={
+        "key_id": 41, "backup_id": 1,
+    })
+    def test_automatic_batch_uses_auto_backup_source(self, reset, _query):
+        bindings = {"456": {"key_name": "Key A", "account_id": 1}}
+        reset_at = bot.datetime.fromisoformat("2026-09-08T20:18:30+00:00")
+        results = bot.reset_selected_keys(
+            bindings, {"456"}, reset_at=reset_at, reset_source="auto"
+        )
+        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(reset.call_args.args[2], "auto")
+        self.assertEqual(reset.call_args.args[4], reset_at)
 
     @mock.patch.object(bot, "query_key_usage")
     @mock.patch.object(bot, "set_rate_limit_window_starts", side_effect=RuntimeError("database unavailable"))
@@ -1328,6 +1417,14 @@ class DataSafetyTests(unittest.TestCase):
             {"account_id": "12"},
         )
 
+    def test_account_weekly_reset_uses_fixed_read_only_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_account_weekly_reset(12)
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.account_weekly_reset(:'account_id'::bigint)::text;",
+            {"account_id": "12"},
+        )
+
     def test_invalid_account_id_is_rejected_before_subprocess(self):
         for value in (True, 0, -1, "12"):
             with self.subTest(value=value), mock.patch.object(bot, "run_psql_json") as run:
@@ -1402,7 +1499,11 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_ip_history(text, integer, integer)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint)", sql)
-        self.assertIn("DROP FUNCTION IF EXISTS sub2api_tg_bot_api.account_weekly_reset(bigint)", sql)
+        self.assertIn("CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_weekly_reset", sql)
+        self.assertIn(
+            "GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint)",
+            sql,
+        )
         self.assertIn("CREATE TABLE IF NOT EXISTS sub2api_tg_bot_api.rate_limit_backups", sql)
         self.assertIn("LIMIT 3", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text)", sql)
@@ -1628,6 +1729,216 @@ class DataSafetyTests(unittest.TestCase):
             self.assertEqual(mode, 0o600)
 
 
+class SuddenUpstreamResetTests(unittest.TestCase):
+    def config(self):
+        return {
+            "admins": [123],
+            "bindings": {
+                "100": {"key_name": "Key A", "account_id": 12},
+                "101": {"key_name": "Key B", "account_id": 12},
+                "102": {"key_name": "Key A", "account_id": 12},
+                "103": {"key_name": "Key C", "account_id": 13},
+            },
+        }
+
+    def runtime(self, state_path):
+        return mock.patch.multiple(
+            bot,
+            AUTO_RESET_STATE_PATH=state_path,
+            SUB2API_BASE_URL="http://sub2api:8080",
+            SUB2API_ADMIN_API_KEY="admin-secret",
+        )
+
+    def test_first_snapshot_only_establishes_account_baselines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.runtime(state_path), \
+                    mock.patch.object(bot, "load_config", return_value=self.config()), \
+                    mock.patch.object(bot, "query_account_weekly_reset", side_effect=lambda account_id: {
+                        "id": account_id,
+                        "reset_7d_at": f"2026-09-{account_id:02d}T04:45:13Z",
+                    }), \
+                    mock.patch.object(bot, "reset_selected_keys") as reset, \
+                    mock.patch.object(bot, "tg") as tg:
+                bot.check_account_weekly_resets(
+                    now=bot.datetime.fromisoformat("2026-09-08T20:18:30+00:00")
+                )
+                state = bot.load_auto_reset_state()
+            reset.assert_not_called()
+            tg.assert_not_called()
+            self.assertEqual(set(state["accounts"]), {"12", "13"})
+            self.assertNotIn("approval", state)
+            self.assertEqual(stat.S_IMODE(os.stat(state_path).st_mode), 0o600)
+
+    def test_natural_reset_updates_baseline_without_notification_or_key_reset(self):
+        previous = "2026-09-12T04:45:13Z"
+        current = "2026-09-19T04:45:13Z"
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({
+                    "accounts": {"12": {"observed_reset_at": previous}},
+                })
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12, "reset_7d_at": current,
+                        }), \
+                        mock.patch.object(bot, "reset_selected_keys") as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets(
+                        now=bot.datetime.fromisoformat("2026-09-12T04:45:13+00:00")
+                    )
+                state = bot.load_auto_reset_state()
+            reset.assert_not_called()
+            tg.assert_not_called()
+            self.assertEqual(state["accounts"]["12"]["observed_reset_at"], current)
+            self.assertNotIn("approval", state)
+
+    def test_sudden_reset_prompts_once_and_targets_all_unique_keys(self):
+        previous = "2026-09-12T04:45:13Z"
+        current = "2026-09-15T20:18:30Z"
+        now = bot.datetime.fromisoformat("2026-09-08T20:19:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    "12": {"observed_reset_at": previous},
+                    "13": {"observed_reset_at": "2026-09-13T04:45:13Z"},
+                }})
+                with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                        mock.patch.object(bot, "query_account_weekly_reset", side_effect=lambda account_id: {
+                            "id": account_id,
+                            "reset_7d_at": current if account_id == 12 else "2026-09-13T04:45:13Z",
+                        }), \
+                        mock.patch.object(bot.secrets, "token_hex", return_value="a1b2c3d4"), \
+                        mock.patch.object(bot, "reset_selected_keys") as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets(now=now)
+                    bot.check_account_weekly_resets(now=now.timestamp() + 60)
+                state = bot.load_auto_reset_state()
+            reset.assert_not_called()
+            self.assertEqual(tg.call_count, 1)
+            self.assertEqual(tg.call_args.args[1]["chat_id"], "123")
+            self.assertTrue(tg.call_args.args[1]["text"].startswith("通知："))
+            self.assertEqual(state["approval"]["keys"], ["Key A", "Key B", "Key C"])
+            self.assertEqual(state["approval"]["align_at"], "2026-09-08T20:18:30Z")
+            self.assertEqual(state["approval"]["deadline_at"], now.timestamp() + 180)
+
+    def test_timeout_resets_all_keys_and_announces_only_successes(self):
+        approval = {
+            "token": "a1b2c3d4",
+            "trigger_account_id": 12,
+            "previous_reset_at": "2026-09-12T04:45:13Z",
+            "reset_at": "2026-09-15T20:18:30Z",
+            "align_at": "2026-09-08T20:18:30Z",
+            "deadline_at": 1180,
+            "status": "pending",
+            "keys": ["Key A", "Key B", "Key C"],
+        }
+        results = [
+            {"key_name": "Key A", "status": "success", "detail": "完成"},
+            {"key_name": "Key B", "status": "failed", "detail": "重置失败"},
+            {"key_name": "Key C", "status": "warning", "detail": "需复查"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({
+                    "accounts": {
+                        "12": {"observed_reset_at": approval["reset_at"]},
+                        "13": {"observed_reset_at": "2026-09-13T04:45:13Z"},
+                    },
+                    "approval": approval,
+                })
+                with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                        mock.patch.object(bot, "query_account_weekly_reset", side_effect=lambda account_id: {
+                            "id": account_id,
+                            "reset_7d_at": (
+                                approval["reset_at"] if account_id == 12
+                                else "2026-09-13T04:45:13Z"
+                            ),
+                        }), \
+                        mock.patch.object(bot, "reset_selected_keys", return_value=results) as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets(now=1180)
+                state = bot.load_auto_reset_state()
+            reset.assert_called_once_with(
+                self.config()["bindings"],
+                {"100", "101", "103"},
+                reset_at=bot.datetime.fromisoformat("2026-09-08T20:18:30+00:00"),
+                reset_source="auto",
+            )
+            self.assertNotIn("approval", state)
+            messages = [call.args[1] for call in tg.call_args_list]
+            self.assertEqual([message["chat_id"] for message in messages], ["123", "100", "102"])
+            self.assertTrue(messages[0]["text"].startswith("通知："))
+            self.assertTrue(all(
+                message["text"].startswith("公告：") for message in messages[1:]
+            ))
+
+    def test_rejection_prevents_timeout_reset(self):
+        approval = {
+            "token": "a1b2c3d4",
+            "reset_at": "2026-09-15T20:18:30Z",
+            "align_at": "2026-09-08T20:18:30Z",
+            "deadline_at": 1180,
+            "status": "pending",
+            "keys": ["Key A"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {}, "approval": approval})
+                with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                        mock.patch.object(bot, "reset_selected_keys") as reset:
+                    first = bot.decide_sudden_reset_approval("a1b2c3d4", False)
+                    second = bot.decide_sudden_reset_approval("a1b2c3d4", True)
+                state = bot.load_auto_reset_state()
+            self.assertEqual(first["status"], "rejected")
+            self.assertEqual(second["status"], "expired")
+            self.assertNotIn("approval", state)
+            reset.assert_not_called()
+
+    @mock.patch.object(bot, "notify_successful_bound_users")
+    @mock.patch.object(bot, "decide_sudden_reset_approval", return_value={
+        "status": "approved",
+        "approval": {"align_at": "2026-09-08T20:18:30Z"},
+        "results": [{"key_name": "Key A", "status": "success"}],
+        "bindings": {"100": {"key_name": "Key A", "account_id": 12}},
+    })
+    @mock.patch.object(bot, "tg")
+    def test_admin_approval_button_executes_and_replaces_prompt(
+        self, tg, decide, announce,
+    ):
+        callback = {
+            "id": "callback-auto-approve",
+            "from": {"id": 123},
+            "data": "auto_approve:a1b2c3d4",
+            "message": {"message_id": 8, "chat": {"id": 123, "type": "private"}},
+        }
+        with mock.patch.object(bot, "load_config", return_value=self.config()):
+            bot.handle_callback_query(callback)
+        decide.assert_called_once_with("a1b2c3d4", True)
+        announce.assert_called_once()
+        edits = [
+            call.args[1]["text"] for call in tg.call_args_list
+            if call.args[0] == "editMessageText"
+        ]
+        self.assertEqual(len(edits), 1)
+        self.assertTrue(edits[0].startswith("通知："))
+
+    def test_approval_keyboard_has_align_and_reject_actions(self):
+        buttons = bot.json.loads(
+            bot.sudden_reset_approval_keyboard("a1b2c3d4")
+        )["inline_keyboard"][0]
+        self.assertEqual(
+            [button["callback_data"] for button in buttons],
+            ["auto_approve:a1b2c3d4", "auto_reject:a1b2c3d4"],
+        )
+
+
 class ContainerPackagingTests(unittest.TestCase):
     def test_example_config_binds_key_names_to_account_ids(self):
         with open("config.example.json", "r", encoding="utf-8") as file:
@@ -1652,8 +1963,11 @@ class ContainerPackagingTests(unittest.TestCase):
         self.assertIn("PG_ALLOW_INSECURE_PRIVATE_NETWORK: \"1\"", compose)
         self.assertIn("SUB2API_ADMIN_API_KEY_FILE: /run/secrets/sub2api_admin_api_key", compose)
         self.assertIn("SUB2API_BASE_URL:", compose)
-        self.assertNotIn("AUTO_RESET_STATE_PATH", compose)
-        self.assertNotIn("AUTO_RESET_CHECK_INTERVAL", compose)
+        self.assertIn(
+            "AUTO_RESET_STATE_PATH: /var/lib/sub2api-tg-bot/auto_reset_state.json",
+            compose,
+        )
+        self.assertIn("AUTO_RESET_CHECK_INTERVAL:", compose)
         self.assertIn("file: ./secrets/sub2api_admin_api_key", compose)
         self.assertNotIn("docker.sock", compose)
         self.assertNotIn("ports:", compose)

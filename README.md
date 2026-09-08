@@ -23,9 +23,9 @@ Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API
 
 - `/start` 显示使用提示，`/check` 查询用量；管理员可以查看所有已绑定 Key 的最后使用时间、每周额度进度条、今日/昨日去重 IP 数量，并可分页查看具体 Key 近 3 个自然日的去重 IP、首次/最近时间和请求次数；普通用户的查询内容不变。
 - 管理员还可以查看绑定账号的周使用百分比、周重置时间、消耗金额和满额金额预估，也可以通过复选按钮选择一个或多个 Key，在最终确认后批量重置 5 小时/日/周限速用量。
-- 显示 Key 到期时间、总额度、5 小时/日/周限额、Key 自身的 5 小时与每周重置时间、今日及 7 天用量和模型统计；上游账号重置时间在独立区域明确标注，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
+- 显示 Key 到期时间、总额度、5 小时/日/周限额、Key 自身的 5 小时与每周重置时间、今日及 7 天用量和模型统计；上游账号重置时间只在管理员 Key 总览中明确标注，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
 - 周额度剩余不超过 20% 时主动提醒，每个周窗口只提醒一次。
-- 上游账号的重置时间只用于展示，不会触发或修改 Key 的用量与窗口。
+- 上游账号自然到达原计划时间后更新 7 日重置时间时，Bot 不重置 Key 且不通知；只有原计划时间尚未到却提前跳到新周期时，才进入全员随号重置审批。
 - 手动重置前会完整备份三个用量及三个窗口开始时间，每个 Key 保留最近 3 份；管理员可在 `/check` 菜单中选择单 Key 备份回滚，也可选择完整覆盖当前全部绑定 Key 的批次版本执行全员回滚。
 - 重置成功后会向管理员发送重置前快照，格式与 Key 总览一致，包含最后使用时间、每周已用/限额/剩余及进度条。
 - 仅允许绑定用户在与 Bot 的私聊中查询；群聊不返回用量。
@@ -201,9 +201,13 @@ sub2api tg bot long polling started
 
 批量选择会话只保存在 Bot 内存中，按管理员及当前 Telegram 消息隔离，并在 5 分钟后过期。Bot 重启、配置中的 Key 被移除或重复点击已执行的确认按钮，都不会再次执行旧批次。批量重置和回滚只操作现有 `bindings`，不需要修改 `config.json` 结构。
 
-手动重置使用 Sub2API 官方管理员接口清零用量并定向失效缓存，再通过受控数据库函数统一设置本批次的窗口起点。只有备份成功后才会执行重置；上游账号快照变化不会触发重置。
+手动重置使用 Sub2API 官方管理员接口清零用量并定向失效缓存，再通过受控数据库函数统一设置本批次的窗口起点。只有备份成功后才会执行重置。
 
-Key 总览只使用现有 `bindings` 和只读数据库函数，不依赖 Sub2API Admin API Key。本功能升级不需要修改 Compose、secret 或 `config.json`，但必须以数据库所有者重新执行 `deploy/create_readonly_role.sql`，以安装备份表、固定查询/备份/恢复函数及其最小执行权限。
+Bot 每 60 秒读取已绑定上游账号保存的 7 日重置时间。第一次读取只建立基线；新时间在原计划时间到达后出现属于自然重置，Bot 只更新基线，不重置任何 Key，也不发送消息。如果原计划时间尚未到，新时间却向后推进至少 1 小时，则判定为 OpenAI 突然重置，并向唯一管理员发送以“通知：”开头的询问。管理员可以选择“对齐并重置全部”或“本次不重置”；3 分钟未操作会自动执行。
+
+批准或超时后，Bot 先为当前全部唯一绑定 Key 创建备份，再清零 5 小时、每日和 7 日用量，并把三个窗口统一对齐到“新的上游 7 日重置时间减 7 天”。只有确认成功的 Key 对应用户会收到以“公告：”开头的“OpenAI重置，随号重置”；失败或需复查的 Key 用户不收到公告，管理员会看到完整结果。拒绝后不重置、不公告，同一事件不会重复询问。
+
+Key 总览只使用现有 `bindings` 和只读数据库函数，不依赖 Sub2API Admin API Key。突然重置监控依赖现有 `account_id`、Sub2API Admin API Key，以及持久化的 `AUTO_RESET_STATE_PATH`。本功能升级不需要修改 secret 或 `config.json`，但必须合并新的 Compose 环境变量，并以数据库所有者重新执行 `deploy/create_readonly_role.sql`，以安装轻量级账号时间查询、备份、对齐和恢复函数及其最小执行权限。
 
 普通用户的数据库查询冷却默认是 10 秒，管理员切换或刷新 Key 的冷却默认是 2 秒。可分别通过 `.env` 中的 `SUB2API_TG_BOT_CHECK_COOLDOWN` 和 `SUB2API_TG_BOT_ADMIN_CHECK_COOLDOWN` 调整。
 
@@ -241,6 +245,7 @@ docker compose logs --tail=200 sub2api-tg-bot
 - 重置返回 `401`：`secrets/sub2api_admin_api_key` 与 Sub2API 系统设置中的 Admin API Key 不一致。
 - 无法连接重置接口：确认 Bot 与 Sub2API 服务位于同一个内部 Compose 网络，且 `SUB2API_TG_BOT_SUB2API_BASE_URL` 使用服务名和容器内部端口。
 - 批量选择已过期：重新发送 `/check`，再次进入批量重置；未确认的选择不会执行。
+- 突然重置未触发：首次启动只会建立上游时间基线；确认 `AUTO_RESET_STATE_PATH` 位于持久化卷，并检查绑定中的 `account_id` 是否正确。
 
 容器健康检查访问 `127.0.0.1:8099/health`，该端口只在容器内部监听且不发布到宿主机。
 
@@ -288,7 +293,7 @@ The expected startup message is `sub2api tg bot long polling started`. Only one 
 
 Bot admins can reset the selected key's 5-hour, daily, and 7-day rate-limit counters after a second confirmation. Every reset first stores all six rate-limit values, keeping the latest three backups per key. Admins can select one backup to restore through the bot. Regular Telegram users cannot invoke reset or rollback callbacks.
 
-When a configured upstream account's saved 7-day reset timestamp advances by at least one hour, the bot requests admin approval. The first admin decision wins; approval resets immediately, rejection skips the event, and no response resets after three minutes. Only unique configured keys are affected, failures are retried, and every key result is sent to all configured admins. The bot polls Sub2API's saved snapshot rather than contacting the upstream provider directly.
+The bot treats a 7-day timestamp advance as natural when the previous scheduled reset time has already arrived; natural resets only update the saved baseline and remain silent. If the timestamp advances by at least one hour before the previous reset was due, the bot asks the configured admin whether all unique bound keys should be backed up, reset, and aligned to the new upstream cycle start. Approval runs immediately, rejection skips the event, and no response runs it after three minutes. Only users whose keys are confirmed successful receive the public announcement. The bot polls Sub2API's saved snapshot rather than contacting the upstream provider directly.
 
 ## License
 
