@@ -376,7 +376,29 @@ SELECT CASE
 END;
 $function$;
 
-DROP FUNCTION IF EXISTS sub2api_tg_bot_api.account_weekly_reset(bigint);
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_weekly_reset(
+  p_account_id bigint
+)
+RETURNS json
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+SELECT CASE
+  WHEN account.id IS NULL
+    THEN json_build_object('error', 'not_found', 'id', p_account_id)
+  ELSE json_build_object(
+    'id', account.id,
+    'snapshot_updated_at', account.extra->>'codex_usage_updated_at',
+    'reset_7d_at', account.extra->>'codex_7d_reset_at'
+  )
+END
+FROM (SELECT 1) AS seed
+LEFT JOIN public.accounts AS account
+  ON account.id = p_account_id
+ AND account.deleted_at IS NULL;
+$function$;
 
 DROP FUNCTION IF EXISTS sub2api_tg_bot_api.backup_rate_limits(text, bigint, text);
 
@@ -669,6 +691,7 @@ REVOKE ALL ON FUNCTION sub2api_tg_bot_api.key_overview(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.key_ip_history(text, integer, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.set_rate_limit_window_starts(bigint, timestamptz) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) FROM PUBLIC;
@@ -682,6 +705,7 @@ GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_overview(text) TO sub2api_tg_bo
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_ip_history(text, integer, integer) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.set_rate_limit_window_starts(bigint, timestamptz) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) TO sub2api_tg_bot;
