@@ -192,6 +192,13 @@ def config_bindings(config):
         if not user_id.isdigit() or not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
             raise ValueError("Invalid Telegram ID or key name in binding config")
         normalized[user_id] = {"key_name": key_name, "account_id": account_id}
+    key_accounts = {}
+    for binding in normalized.values():
+        key_name = binding["key_name"]
+        account_id = binding["account_id"]
+        if key_name in key_accounts and key_accounts[key_name] != account_id:
+            raise ValueError("The same key name cannot be bound to different account_id values")
+        key_accounts[key_name] = account_id
     return normalized
 
 
@@ -1519,9 +1526,80 @@ def configured_account_ids(bindings):
     })
 
 
+def bindings_for_account(bindings, account_id):
+    return {
+        user_id: binding
+        for user_id, binding in bindings.items()
+        if binding["account_id"] == account_id
+    }
+
+
+def approval_keys_for_account(bindings, account_id):
+    return [
+        binding["key_name"]
+        for _user_id, binding in reset_candidates(
+            bindings_for_account(bindings, account_id)
+        )
+    ]
+
+
+def enqueue_sudden_reset_approval(state, approval):
+    if not isinstance(state.get("approval"), dict):
+        state["approval"] = approval
+        return True
+    approval_queue = state.get("approval_queue")
+    if not isinstance(approval_queue, list):
+        approval_queue = []
+        state["approval_queue"] = approval_queue
+    approval_queue.append(approval)
+    return False
+
+
+def promote_sudden_reset_approval(state):
+    if isinstance(state.get("approval"), dict):
+        return state["approval"]
+    approval_queue = state.get("approval_queue")
+    if not isinstance(approval_queue, list):
+        state.pop("approval_queue", None)
+        return None
+    while approval_queue:
+        approval = approval_queue.pop(0)
+        if isinstance(approval, dict) and approval.get("status") == "pending":
+            state["approval"] = approval
+            break
+    if not approval_queue:
+        state.pop("approval_queue", None)
+    return state.get("approval")
+
+
+def scope_sudden_reset_approval(approval, bindings):
+    account_id = approval.get("trigger_account_id")
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        raise ValueError("Sudden reset approval has an invalid account_id")
+    keys = approval_keys_for_account(bindings, account_id)
+    changed = approval.get("keys") != keys
+    approval["keys"] = keys
+    return bindings_for_account(bindings, account_id), changed
+
+
+def activate_sudden_reset_approval(state, bindings, admins, now_epoch):
+    had_active_approval = isinstance(state.get("approval"), dict)
+    approval = promote_sudden_reset_approval(state)
+    changed = not had_active_approval and isinstance(approval, dict)
+    if not isinstance(approval, dict):
+        return None, changed
+    _account_bindings, scoped = scope_sudden_reset_approval(approval, bindings)
+    changed = changed or scoped
+    if approval.get("status") == "pending" and approval.get("deadline_at") is None:
+        if notify_sudden_reset_approval(admins, approval):
+            approval["deadline_at"] = now_epoch + AUTO_RESET_APPROVAL_SECONDS
+            changed = True
+    return approval, changed
+
+
 def sudden_reset_approval_keyboard(token):
     return json.dumps({"inline_keyboard": [[
-        {"text": "✅ 对齐并重置全部", "callback_data": f"auto_approve:{token}"},
+        {"text": "✅ 对齐并重置此账号 Key", "callback_data": f"auto_approve:{token}"},
         {"text": "⛔ 本次不重置", "callback_data": f"auto_reject:{token}"},
     ]]}, ensure_ascii=False)
 
@@ -1533,14 +1611,15 @@ def format_sudden_reset_approval(approval):
         f"原计划重置时间：{format_timestamp(approval.get('previous_reset_at'))}",
         f"新的重置时间：{format_timestamp(approval.get('reset_at'))}",
         f"新周期开始时间：{format_timestamp(approval.get('align_at'))}",
+        f"上游账号 ID：{approval.get('trigger_account_id')}",
         f"涉及 Key：{len(approval.get('keys') or [])} 个",
         "",
-        "本次属于突然重置，是否将所有绑定 Key 随号重置？",
+        "本次属于突然重置，是否将该账号绑定的 Key 随号重置？",
         "",
         "执行后将：",
-        "• 备份所有 Key 当前用量",
+        "• 备份该账号绑定 Key 的当前用量",
         "• 清零 5 小时、每日和 7 日用量",
-        "• 将所有 Key 的窗口对齐到新周期开始时间",
+        "• 将这些 Key 的窗口对齐到该账号的新周期开始时间",
         "• 只向重置成功的用户发送公告",
         "",
         "3 分钟内未操作将自动执行。",
@@ -1552,13 +1631,14 @@ def format_sudden_reset_result(approval, results, automatic=False):
     warning_count = sum(result.get("status") == "warning" for result in results)
     failed_count = sum(result.get("status") == "failed" for result in results)
     heading = (
-        "通知：3 分钟内未收到操作，已自动执行全员随号重置。"
+        "通知：3 分钟内未收到操作，已自动执行该账号随号重置。"
         if automatic else
-        "通知：全员随号重置完成"
+        "通知：该账号随号重置完成"
     )
     lines = [
         heading,
         "",
+        f"• 上游账号 ID：{approval.get('trigger_account_id')}",
         f"• 对齐时间：{format_timestamp(approval.get('align_at'))}",
         f"• 成功：{success_count} 个 Key",
         f"• 需复查：{warning_count} 个 Key",
@@ -1623,7 +1703,7 @@ def notify_sudden_reset_approval(admins, approval):
 
 
 def new_sudden_reset_approval(bindings, account_id, previous_reset_at, reset_at):
-    keys = [binding["key_name"] for _user_id, binding in reset_candidates(bindings)]
+    keys = approval_keys_for_account(bindings, account_id)
     return {
         "token": secrets.token_hex(4),
         "trigger_account_id": account_id,
@@ -1640,17 +1720,15 @@ def execute_sudden_reset_approval(state, approval, config):
     if approval.get("status") != "approved":
         return [], {}
     bindings = config_bindings(config)
-    approved_keys = set(approval.get("keys") or [])
+    account_bindings, _changed = scope_sudden_reset_approval(approval, bindings)
     selected_user_ids = {
-        user_id
-        for user_id, binding in reset_candidates(bindings)
-        if binding["key_name"] in approved_keys
+        user_id for user_id, _binding in reset_candidates(account_bindings)
     }
     approval["status"] = "executing"
     save_auto_reset_state(state)
     try:
         results = reset_selected_keys(
-            bindings,
+            account_bindings,
             selected_user_ids,
             reset_at=upstream_alignment_time(approval.get("reset_at")),
             reset_source="auto",
@@ -1662,7 +1740,7 @@ def execute_sudden_reset_approval(state, approval, config):
         raise
     state.pop("approval", None)
     save_auto_reset_state(state)
-    return results, bindings
+    return results, account_bindings
 
 
 def decide_sudden_reset_approval(token, approve):
@@ -1681,7 +1759,7 @@ def decide_sudden_reset_approval(token, approve):
         if not approve:
             state.pop("approval", None)
             save_auto_reset_state(state)
-            return {"status": "rejected"}
+            return {"status": "rejected", "approval": approval}
         approval["status"] = "approved"
         save_auto_reset_state(state)
         results, bindings = execute_sudden_reset_approval(state, approval, config)
@@ -1716,14 +1794,14 @@ def check_account_weekly_resets(now=None):
             del account_states[stale_account_id]
             changed = True
 
-        approval = state.get("approval")
+        approval, approval_changed = activate_sudden_reset_approval(
+            state, bindings, admins, now_epoch
+        )
+        changed = changed or approval_changed
         if isinstance(approval, dict):
-            if approval.get("status") == "pending" and approval.get("deadline_at") is None:
-                if notify_sudden_reset_approval(admins, approval):
-                    approval["deadline_at"] = now_epoch + AUTO_RESET_APPROVAL_SECONDS
-                    changed = True
-            elif (
+            if (
                 approval.get("status") == "pending"
+                and approval.get("deadline_at") is not None
                 and now_epoch >= float(approval.get("deadline_at") or 0)
             ):
                 approval["status"] = "approved"
@@ -1749,10 +1827,17 @@ def check_account_weekly_resets(now=None):
                 changed = True
                 notify_admins(
                     admins,
-                    "通知：上次全员随号重置在执行中被中断。\n\n"
+                    "通知：上次账号随号重置在执行中被中断。\n\n"
+                    f"上游账号 ID：{approval.get('trigger_account_id')}\n"
                     "Bot 未自动重复执行，请查询各 Key 状态后手动处理。",
                 )
                 approval = None
+
+        if approval is None:
+            _next_approval, approval_changed = activate_sudden_reset_approval(
+                state, bindings, admins, now_epoch
+            )
+            changed = changed or approval_changed
 
         for account_id in account_ids:
             try:
@@ -1781,14 +1866,17 @@ def check_account_weekly_resets(now=None):
                 if classification in {"drift", "natural", "sudden"}:
                     account_state["observed_reset_at"] = current_reset_at
                     changed = True
-                if classification == "sudden" and not isinstance(state.get("approval"), dict):
+                if classification == "sudden":
                     approval = new_sudden_reset_approval(
                         bindings, account_id, previous_reset_at, current_reset_at
                     )
-                    state["approval"] = approval
+                    became_active = enqueue_sudden_reset_approval(state, approval)
                     save_auto_reset_state(state)
-                    if notify_sudden_reset_approval(admins, approval):
-                        approval["deadline_at"] = now_epoch + AUTO_RESET_APPROVAL_SECONDS
+                    if became_active:
+                        _active_approval, approval_changed = activate_sudden_reset_approval(
+                            state, bindings, admins, now_epoch
+                        )
+                        changed = changed or approval_changed
                     changed = True
             except Exception as error:
                 log_failure(f"auto reset check account={masked_id(account_id)}", error)
@@ -2033,8 +2121,9 @@ def handle_callback_query(callback):
             tg("answerCallbackQuery", {"callback_query_id": callback_id})
             if decision["status"] == "rejected":
                 text = (
-                    "通知：管理员已拒绝本次全员随号重置。\n\n"
-                    "所有 Key 保持原状，本次不发送公告。"
+                    "通知：管理员已拒绝本次账号随号重置。\n\n"
+                    f"上游账号 ID：{decision['approval'].get('trigger_account_id')}\n"
+                    "该账号绑定的 Key 保持原状，本次不发送公告。"
                 )
             else:
                 text = format_sudden_reset_result(
@@ -2618,6 +2707,7 @@ def poll_updates(dispatcher, stop_event):
 
 def main():
     validate_runtime_config()
+    config_bindings(load_config())
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())

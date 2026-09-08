@@ -152,6 +152,7 @@ class MessageAuthorizationTests(unittest.TestCase):
 
     def test_sudden_reset_prompt_and_result_use_notification_prefix(self):
         approval = {
+            "trigger_account_id": 12,
             "previous_reset_at": "2026-09-12T04:45:13Z",
             "reset_at": "2026-09-15T20:18:30Z",
             "align_at": "2026-09-08T20:18:30Z",
@@ -159,6 +160,7 @@ class MessageAuthorizationTests(unittest.TestCase):
         }
         prompt = bot.format_sudden_reset_approval(approval)
         self.assertTrue(prompt.startswith("通知："))
+        self.assertIn("上游账号 ID：12", prompt)
         self.assertIn("3 分钟内未操作将自动执行", prompt)
         result = bot.format_sudden_reset_result(approval, [
             {"key_name": "Key A", "status": "success"},
@@ -667,6 +669,15 @@ class MessageAuthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive integer"):
             bot.config_bindings({
                 "bindings": {"123": {"key_name": "Administrator", "account_id": "12"}},
+            })
+
+    def test_binding_rejects_same_key_across_different_accounts(self):
+        with self.assertRaisesRegex(ValueError, "different account_id"):
+            bot.config_bindings({
+                "bindings": {
+                    "123": {"key_name": "Shared Key", "account_id": 12},
+                    "456": {"key_name": "Shared Key", "account_id": 13},
+                },
             })
 
     @mock.patch.object(bot, "query_key_usage")
@@ -1798,7 +1809,7 @@ class SuddenUpstreamResetTests(unittest.TestCase):
             self.assertEqual(state["accounts"]["12"]["observed_reset_at"], current)
             self.assertNotIn("approval", state)
 
-    def test_sudden_reset_prompts_once_and_targets_all_unique_keys(self):
+    def test_sudden_reset_prompts_once_and_targets_trigger_account_keys(self):
         previous = "2026-09-12T04:45:13Z"
         current = "2026-09-15T20:18:30Z"
         now = bot.datetime.fromisoformat("2026-09-08T20:19:00+00:00")
@@ -1824,11 +1835,42 @@ class SuddenUpstreamResetTests(unittest.TestCase):
             self.assertEqual(tg.call_count, 1)
             self.assertEqual(tg.call_args.args[1]["chat_id"], "123")
             self.assertTrue(tg.call_args.args[1]["text"].startswith("通知："))
-            self.assertEqual(state["approval"]["keys"], ["Key A", "Key B", "Key C"])
+            self.assertEqual(state["approval"]["trigger_account_id"], 12)
+            self.assertEqual(state["approval"]["keys"], ["Key A", "Key B"])
             self.assertEqual(state["approval"]["align_at"], "2026-09-08T20:18:30Z")
             self.assertEqual(state["approval"]["deadline_at"], now.timestamp() + 180)
 
-    def test_timeout_resets_all_keys_and_announces_only_successes(self):
+    def test_failed_admin_notification_does_not_trigger_immediate_timeout_reset(self):
+        previous = "2026-09-12T04:45:13Z"
+        current = "2026-09-15T20:18:30Z"
+        now = bot.datetime.fromisoformat("2026-09-08T20:19:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({
+                    "accounts": {"12": {"observed_reset_at": previous}},
+                })
+                config = self.config()
+                config["bindings"] = {
+                    user_id: binding
+                    for user_id, binding in config["bindings"].items()
+                    if binding["account_id"] == 12
+                }
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": current,
+                        }), \
+                        mock.patch.object(bot, "reset_selected_keys") as reset, \
+                        mock.patch.object(bot, "tg", side_effect=RuntimeError("telegram unavailable")):
+                    bot.check_account_weekly_resets(now=now)
+                state = bot.load_auto_reset_state()
+
+            reset.assert_not_called()
+            self.assertEqual(state["approval"]["status"], "pending")
+            self.assertIsNone(state["approval"]["deadline_at"])
+
+    def test_timeout_resets_only_trigger_account_keys_and_announces_successes(self):
         approval = {
             "token": "a1b2c3d4",
             "trigger_account_id": 12,
@@ -1842,7 +1884,6 @@ class SuddenUpstreamResetTests(unittest.TestCase):
         results = [
             {"key_name": "Key A", "status": "success", "detail": "完成"},
             {"key_name": "Key B", "status": "failed", "detail": "重置失败"},
-            {"key_name": "Key C", "status": "warning", "detail": "需复查"},
         ]
         with tempfile.TemporaryDirectory() as directory:
             state_path = os.path.join(directory, "auto_reset_state.json")
@@ -1867,8 +1908,12 @@ class SuddenUpstreamResetTests(unittest.TestCase):
                     bot.check_account_weekly_resets(now=1180)
                 state = bot.load_auto_reset_state()
             reset.assert_called_once_with(
-                self.config()["bindings"],
-                {"100", "101", "103"},
+                {
+                    "100": {"key_name": "Key A", "account_id": 12},
+                    "101": {"key_name": "Key B", "account_id": 12},
+                    "102": {"key_name": "Key A", "account_id": 12},
+                },
+                {"100", "101"},
                 reset_at=bot.datetime.fromisoformat("2026-09-08T20:18:30+00:00"),
                 reset_source="auto",
             )
@@ -1880,9 +1925,62 @@ class SuddenUpstreamResetTests(unittest.TestCase):
                 message["text"].startswith("公告：") for message in messages[1:]
             ))
 
+    def test_sudden_resets_for_multiple_accounts_are_queued_without_losing_alignment(self):
+        previous_by_account = {
+            12: "2026-09-12T04:45:13Z",
+            13: "2026-09-13T04:45:13Z",
+        }
+        current_by_account = {
+            12: "2026-09-15T20:18:30Z",
+            13: "2026-09-16T08:30:00Z",
+        }
+        now = bot.datetime.fromisoformat("2026-09-08T20:19:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {
+                    str(account_id): {"observed_reset_at": reset_at}
+                    for account_id, reset_at in previous_by_account.items()
+                }})
+                with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                        mock.patch.object(bot, "query_account_weekly_reset", side_effect=lambda account_id: {
+                            "id": account_id,
+                            "reset_7d_at": current_by_account[account_id],
+                        }), \
+                        mock.patch.object(
+                            bot.secrets, "token_hex", side_effect=["a1b2c3d4", "b2c3d4e5"]
+                        ), \
+                        mock.patch.object(bot, "reset_selected_keys") as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets(now=now)
+                    first_state = bot.load_auto_reset_state()
+                    rejected = bot.decide_sudden_reset_approval("a1b2c3d4", False)
+                    bot.check_account_weekly_resets(now=now.timestamp() + 60)
+                    second_state = bot.load_auto_reset_state()
+
+            reset.assert_not_called()
+            self.assertEqual(rejected["status"], "rejected")
+            self.assertEqual(first_state["approval"]["trigger_account_id"], 12)
+            self.assertEqual(first_state["approval"]["keys"], ["Key A", "Key B"])
+            self.assertEqual(len(first_state["approval_queue"]), 1)
+            self.assertEqual(first_state["approval_queue"][0]["trigger_account_id"], 13)
+            self.assertEqual(first_state["approval_queue"][0]["keys"], ["Key C"])
+            self.assertEqual(second_state["approval"]["trigger_account_id"], 13)
+            self.assertEqual(second_state["approval"]["keys"], ["Key C"])
+            self.assertEqual(second_state["approval"]["align_at"], "2026-09-09T08:30:00Z")
+            self.assertNotIn("approval_queue", second_state)
+            prompts = [
+                call.args[1] for call in tg.call_args_list
+                if call.args[0] == "sendMessage"
+            ]
+            self.assertEqual([message["chat_id"] for message in prompts], ["123", "123"])
+            self.assertIn("上游账号 ID：12", prompts[0]["text"])
+            self.assertIn("上游账号 ID：13", prompts[1]["text"])
+
     def test_rejection_prevents_timeout_reset(self):
         approval = {
             "token": "a1b2c3d4",
+            "trigger_account_id": 12,
             "reset_at": "2026-09-15T20:18:30Z",
             "align_at": "2026-09-08T20:18:30Z",
             "deadline_at": 1180,
@@ -1939,6 +2037,7 @@ class SuddenUpstreamResetTests(unittest.TestCase):
             [button["callback_data"] for button in buttons],
             ["auto_approve:a1b2c3d4", "auto_reject:a1b2c3d4"],
         )
+        self.assertEqual(buttons[0]["text"], "✅ 对齐并重置此账号 Key")
 
 
 class ContainerPackagingTests(unittest.TestCase):
