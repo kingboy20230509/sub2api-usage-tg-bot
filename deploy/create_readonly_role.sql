@@ -166,13 +166,17 @@ WITH bounds AS (
   SELECT date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')
     AT TIME ZONE 'Asia/Shanghai' AS today_start
 ), matching_keys AS (
-  SELECT id, name, last_used_at, rate_limit_7d, usage_7d,
-         window_7d_start,
-         CASE WHEN window_7d_start IS NOT NULL
-              THEN window_7d_start + interval '7 days'
+  SELECT api_key_row.id, api_key_row.name,
+         (SELECT max(usage_row.created_at)
+          FROM public.usage_logs AS usage_row
+          WHERE usage_row.api_key_id = api_key_row.id) AS last_used_at,
+         api_key_row.rate_limit_7d, api_key_row.usage_7d,
+         api_key_row.window_7d_start,
+         CASE WHEN api_key_row.window_7d_start IS NOT NULL
+              THEN api_key_row.window_7d_start + interval '7 days'
          END AS window_7d_end
-  FROM public.api_keys
-  WHERE name = p_key_name AND deleted_at IS NULL
+  FROM public.api_keys AS api_key_row
+  WHERE api_key_row.name = p_key_name AND api_key_row.deleted_at IS NULL
 ), match_count AS (
   SELECT count(*)::integer AS total FROM matching_keys
 ), key_row AS (

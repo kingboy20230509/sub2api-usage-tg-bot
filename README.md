@@ -109,7 +109,7 @@ chmod 600 secrets/telegram_bot_token secrets/postgres_password secrets/sub2api_a
 }
 ```
 
-`admins` 中填写管理员的 Telegram 数字用户 ID。`bindings` 左边是 Telegram 数字用户 ID 字符串；`key_name` 是 Sub2API 数据库中准确的 `api_keys.name`；`account_id` 是该 Key 要参考的上游账号 `accounts.id`。管理员发送 `/check` 后会看到所有 `bindings` 的 Key 按钮，普通用户只能查询自己的绑定。按钮文字直接使用 Key 名称，不需要额外的 `label`。Key 总览中的 IP 数据取自 `usage_logs.ip_address`，今日和昨日按 `Asia/Shanghai` 自然日去重；近 3 日详情为今天及前两个自然日，只允许管理员查看。
+`admins` 中填写管理员的 Telegram 数字用户 ID。`bindings` 左边是 Telegram 数字用户 ID 字符串；`key_name` 是 Sub2API 数据库中准确的 `api_keys.name`；`account_id` 是该 Key 要参考的上游账号 `accounts.id`。管理员发送 `/check` 后会看到所有 `bindings` 的 Key 按钮，普通用户只能查询自己的绑定。按钮文字直接使用 Key 名称，不需要额外的 `label`。Key 总览中的最后使用时间取自该 Key 最新一条 `usage_logs.created_at`；IP 数据取自 `usage_logs.ip_address`，今日和昨日按 `Asia/Shanghai` 自然日去重；近 3 日详情为今天及前两个自然日，只允许管理员查看。
 
 在 Sub2API Compose 目录执行下面的只读查询，找到账号 ID：
 
