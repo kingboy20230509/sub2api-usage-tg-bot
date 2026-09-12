@@ -77,6 +77,8 @@ _RESET_OPERATION_LOCK = threading.Lock()
 BATCH_RESET_SESSION_TTL = 300
 AUTO_RESET_MIN_ADVANCE_SECONDS = 3600
 AUTO_RESET_APPROVAL_SECONDS = 180
+AUTO_RESET_ANCHOR_TOLERANCE_SECONDS = 300
+AUTO_RESET_FULL_WINDOW_TOLERANCE_SECONDS = 900
 OVERVIEW_PAGE_SIZE = 8
 IP_HISTORY_PAGE_SIZE = 10
 
@@ -1502,6 +1504,118 @@ def canonical_reset_timestamp(value):
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def optional_nonnegative_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite() or number < 0:
+        return None
+    return float(number)
+
+
+def weekly_reset_observation(snapshot):
+    return {
+        "reset_at": canonical_reset_timestamp(snapshot.get("reset_7d_at")),
+        "snapshot_updated_at": canonical_reset_timestamp(
+            snapshot.get("snapshot_updated_at")
+        ),
+        "reset_after_seconds": optional_nonnegative_number(
+            snapshot.get("reset_7d_after_seconds")
+        ),
+        "used_percent": optional_nonnegative_number(snapshot.get("used_7d_percent")),
+        "window_minutes": optional_nonnegative_number(
+            snapshot.get("window_7d_minutes")
+        ),
+    }
+
+
+def weekly_reset_observation_is_fresh(account_state, observation):
+    current = parse_upstream_timestamp(observation.get("snapshot_updated_at"))
+    previous = parse_upstream_timestamp(account_state.get("snapshot_updated_at"))
+    if current is None or previous is None:
+        return True
+    return current > previous
+
+
+def weekly_reset_observation_needs_anchor(observation):
+    used_percent = observation.get("used_percent")
+    reset_after_seconds = observation.get("reset_after_seconds")
+    window_minutes = observation.get("window_minutes")
+    if used_percent is None or reset_after_seconds is None or not window_minutes:
+        return False
+    full_window_seconds = window_minutes * 60
+    return (
+        used_percent <= 0
+        and reset_after_seconds
+        >= max(0, full_window_seconds - AUTO_RESET_FULL_WINDOW_TOLERANCE_SECONDS)
+    )
+
+
+def weekly_reset_endpoint_delta(account_state, observation):
+    previous_reset = parse_upstream_timestamp(account_state.get("snapshot_reset_at"))
+    current_reset = parse_upstream_timestamp(observation.get("reset_at"))
+    previous_snapshot = parse_upstream_timestamp(
+        account_state.get("snapshot_updated_at")
+    )
+    current_snapshot = parse_upstream_timestamp(
+        observation.get("snapshot_updated_at")
+    )
+    if None in {previous_reset, current_reset, previous_snapshot, current_snapshot}:
+        return None
+    snapshot_delta = (current_snapshot - previous_snapshot).total_seconds()
+    if snapshot_delta <= 0:
+        return None
+    return (
+        (current_reset - previous_reset).total_seconds(),
+        snapshot_delta,
+    )
+
+
+def weekly_reset_observation_is_rolling(account_state, observation):
+    if not weekly_reset_observation_needs_anchor(observation):
+        return False
+    deltas = weekly_reset_endpoint_delta(account_state, observation)
+    if deltas is None:
+        return False
+    reset_delta, snapshot_delta = deltas
+    return (
+        reset_delta > AUTO_RESET_ANCHOR_TOLERANCE_SECONDS
+        and abs(reset_delta - snapshot_delta)
+        <= AUTO_RESET_ANCHOR_TOLERANCE_SECONDS
+    )
+
+
+def weekly_reset_observation_is_anchored(account_state, observation):
+    if observation.get("snapshot_updated_at") is None:
+        return False
+    if not weekly_reset_observation_needs_anchor(observation):
+        return True
+    deltas = weekly_reset_endpoint_delta(account_state, observation)
+    if deltas is None:
+        return False
+    reset_delta, _snapshot_delta = deltas
+    return abs(reset_delta) <= AUTO_RESET_ANCHOR_TOLERANCE_SECONDS
+
+
+def store_weekly_reset_observation(account_state, observation):
+    changed = False
+    values = {
+        "snapshot_reset_at": observation.get("reset_at"),
+        "snapshot_updated_at": observation.get("snapshot_updated_at"),
+        "reset_7d_after_seconds": observation.get("reset_after_seconds"),
+        "used_7d_percent": observation.get("used_percent"),
+        "window_7d_minutes": observation.get("window_minutes"),
+    }
+    for key, value in values.items():
+        if value is not None and account_state.get(key) != value:
+            account_state[key] = value
+            changed = True
+    return changed
+
+
 def classify_upstream_reset(previous_reset_at, current_reset_at, now=None):
     previous = parse_upstream_timestamp(previous_reset_at)
     current = parse_upstream_timestamp(current_reset_at)
@@ -1731,6 +1845,32 @@ def new_sudden_reset_approval(bindings, account_id, previous_reset_at, reset_at)
     }
 
 
+def mark_sudden_reset_handled(state, approval):
+    account_id = approval.get("trigger_account_id")
+    reset_at = canonical_reset_timestamp(approval.get("reset_at"))
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        return False
+    if reset_at is None:
+        return False
+    account_states = state.get("accounts")
+    if not isinstance(account_states, dict):
+        account_states = {}
+        state["accounts"] = account_states
+    account_state = account_states.get(str(account_id))
+    if not isinstance(account_state, dict):
+        account_state = {"observed_reset_at": reset_at}
+        account_states[str(account_id)] = account_state
+    changed = False
+    for key, value in {
+        "handled_reset_at": reset_at,
+        "awaiting_anchor": True,
+    }.items():
+        if account_state.get(key) != value:
+            account_state[key] = value
+            changed = True
+    return changed
+
+
 def execute_sudden_reset_approval(state, approval, config):
     if approval.get("status") != "approved":
         return [], {}
@@ -1753,6 +1893,7 @@ def execute_sudden_reset_approval(state, approval, config):
         approval["deadline_at"] = None
         save_auto_reset_state(state)
         raise
+    mark_sudden_reset_handled(state, approval)
     state.pop("approval", None)
     save_auto_reset_state(state)
     return results, account_bindings
@@ -1772,6 +1913,7 @@ def decide_sudden_reset_approval(token, approve):
         ):
             return {"status": "expired"}
         if not approve:
+            mark_sudden_reset_handled(state, approval)
             state.pop("approval", None)
             save_auto_reset_state(state)
             return {"status": "rejected", "approval": approval}
@@ -1859,13 +2001,46 @@ def check_account_weekly_resets(now=None):
                 snapshot = query_account_weekly_reset(account_id) or {}
                 if snapshot.get("error"):
                     raise RuntimeError("Account weekly reset query did not return account data")
-                current_reset_at = canonical_reset_timestamp(snapshot.get("reset_7d_at"))
+                observation = weekly_reset_observation(snapshot)
+                current_reset_at = observation.get("reset_at")
                 if current_reset_at is None:
                     continue
                 account_key = str(account_id)
                 account_state = account_states.get(account_key)
                 if not isinstance(account_state, dict):
-                    account_states[account_key] = {"observed_reset_at": current_reset_at}
+                    account_state = {"observed_reset_at": current_reset_at}
+                    account_states[account_key] = account_state
+                    store_weekly_reset_observation(account_state, observation)
+                    if weekly_reset_observation_needs_anchor(observation):
+                        account_state["awaiting_anchor"] = True
+                    changed = True
+                    continue
+                if (
+                    observation.get("snapshot_updated_at") is not None
+                    and account_state.get("snapshot_updated_at") is None
+                ):
+                    changed = store_weekly_reset_observation(
+                        account_state, observation
+                    ) or changed
+                    if weekly_reset_observation_needs_anchor(observation):
+                        account_state["awaiting_anchor"] = True
+                        changed = True
+                    continue
+                if not weekly_reset_observation_is_fresh(account_state, observation):
+                    continue
+                if account_state.get("awaiting_anchor") is True:
+                    if weekly_reset_observation_is_anchored(account_state, observation):
+                        account_state.pop("awaiting_anchor", None)
+                        account_state["observed_reset_at"] = current_reset_at
+                        changed = True
+                    changed = store_weekly_reset_observation(
+                        account_state, observation
+                    ) or changed
+                    continue
+                if weekly_reset_observation_is_rolling(account_state, observation):
+                    account_state["observed_reset_at"] = current_reset_at
+                    account_state["awaiting_anchor"] = True
+                    store_weekly_reset_observation(account_state, observation)
                     changed = True
                     continue
                 previous_reset_at = canonical_reset_timestamp(
@@ -1873,6 +2048,9 @@ def check_account_weekly_resets(now=None):
                 )
                 if previous_reset_at is None:
                     account_state["observed_reset_at"] = current_reset_at
+                    changed = store_weekly_reset_observation(
+                        account_state, observation
+                    ) or changed
                     changed = True
                     continue
                 classification = classify_upstream_reset(
@@ -1881,6 +2059,15 @@ def check_account_weekly_resets(now=None):
                 if classification in {"drift", "natural", "sudden"}:
                     account_state["observed_reset_at"] = current_reset_at
                     changed = True
+                if (
+                    classification in {"natural", "sudden"}
+                    and weekly_reset_observation_needs_anchor(observation)
+                ):
+                    account_state["awaiting_anchor"] = True
+                    changed = True
+                changed = store_weekly_reset_observation(
+                    account_state, observation
+                ) or changed
                 if classification == "sudden":
                     approval = new_sudden_reset_approval(
                         bindings, account_id, previous_reset_at, current_reset_at
