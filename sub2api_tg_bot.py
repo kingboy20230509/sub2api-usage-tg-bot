@@ -385,6 +385,7 @@ def admin_keyboard(bindings, selected_user_id=None):
             "text": "↩️ 回滚 Key 使用量",
             "callback_data": "rollback_start:0",
         }])
+    rows.append([{"text": "🌐 IP 使用记录", "callback_data": "ip_menu:0"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
@@ -393,15 +394,15 @@ def overview_keyboard(bindings, page, total_pages):
     page_candidates = reset_candidates(bindings)[
         page * OVERVIEW_PAGE_SIZE:(page + 1) * OVERVIEW_PAGE_SIZE
     ]
-    ip_buttons = []
+    key_buttons = []
     for target_user_id, binding in page_candidates:
         key_name = binding["key_name"]
         label = key_name if len(key_name) <= 60 else key_name[:57] + "..."
-        ip_buttons.append({
-            "text": f"🌐 {label}",
-            "callback_data": f"ip_detail:{target_user_id}:0:{page}",
+        key_buttons.append({
+            "text": f"🔑 {label}",
+            "callback_data": f"usage:{target_user_id}",
         })
-    rows.extend([ip_buttons[index:index + 2] for index in range(0, len(ip_buttons), 2)])
+    rows.extend([key_buttons[index:index + 2] for index in range(0, len(key_buttons), 2)])
     if total_pages > 1:
         previous_page = max(0, page - 1)
         next_page = min(total_pages - 1, page + 1)
@@ -411,6 +412,20 @@ def overview_keyboard(bindings, page, total_pages):
             {"text": "▶️", "callback_data": f"overview:{next_page}"},
         ])
     rows.append([{"text": "◀️ 返回", "callback_data": "overview_back:0"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def ip_menu_keyboard(bindings):
+    buttons = []
+    for target_user_id, binding in reset_candidates(bindings):
+        key_name = binding["key_name"]
+        label = key_name if len(key_name) <= 60 else key_name[:57] + "..."
+        buttons.append({
+            "text": f"🌐 {label}",
+            "callback_data": f"ip_detail:{target_user_id}:0:0",
+        })
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([{"text": "◀️ 返回主页", "callback_data": "overview_back:0"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
@@ -436,7 +451,7 @@ def ip_history_keyboard(target_user_id, page, total_pages, overview_page):
             "text": "🔄 刷新",
             "callback_data": f"ip_detail:{target_user_id}:{page}:{overview_page}",
         }],
-        [{"text": "◀️ 返回 Key 总览", "callback_data": f"overview:{overview_page}"}],
+        [{"text": "◀️ 返回 IP 使用记录", "callback_data": "ip_menu:0"}],
     ])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
@@ -2081,7 +2096,7 @@ def handle_callback_query(callback):
     action, separator, target_user_id = callback_data.partition(":")
     if not callback_id or not separator or action not in {
         "auto_approve", "auto_reject",
-        "usage", "overview", "overview_back", "ip_detail",
+        "usage", "overview", "overview_back", "ip_menu", "ip_detail",
         "batch_start", "batch_toggle", "batch_all", "batch_clear",
         "batch_review", "batch_back", "batch_confirm", "batch_cancel",
         "reset_prompt", "reset_confirm", "reset_cancel",
@@ -2319,6 +2334,15 @@ def handle_callback_query(callback):
                 "message_id": message.get("message_id"),
                 "text": "请选择要查看的 Key：",
                 "reply_markup": admin_keyboard(bindings),
+            })
+            return
+        if action == "ip_menu":
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+            tg("editMessageText", {
+                "chat_id": chat.get("id"),
+                "message_id": message.get("message_id"),
+                "text": "🌐 IP 使用记录\n\n请选择要查看的 Key：",
+                "reply_markup": ip_menu_keyboard(bindings),
             })
             return
         if action == "ip_detail":
@@ -2577,7 +2601,7 @@ def handle_callback_query(callback):
             error_text = "批量重置操作失败，请重新发送 /check。"
         elif action.startswith("rollback_"):
             error_text = "回滚操作失败；备份仍保留，请重新发送 /check 后重试。"
-        elif action.startswith("overview") or action == "ip_detail":
+        elif action.startswith("overview") or action in {"ip_menu", "ip_detail"}:
             error_text = "总览查询失败，请稍后再试。"
         else:
             error_text = "查询失败，请稍后再试。"
