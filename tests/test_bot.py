@@ -144,6 +144,43 @@ class MessageAuthorizationTests(unittest.TestCase):
             bot.classify_upstream_reset(previous, "2026-09-11T04:45:13Z")
         )
 
+    def test_weekly_reset_observation_recognizes_unanchored_full_window(self):
+        observation = bot.weekly_reset_observation({
+            "reset_7d_at": "2026-09-15T00:00:00Z",
+            "snapshot_updated_at": "2026-09-08T00:00:00Z",
+            "reset_7d_after_seconds": "604800",
+            "used_7d_percent": "0",
+            "window_7d_minutes": "10080",
+        })
+        self.assertTrue(bot.weekly_reset_observation_needs_anchor(observation))
+
+        observation["used_percent"] = 1.0
+        self.assertFalse(bot.weekly_reset_observation_needs_anchor(observation))
+
+    def test_weekly_reset_observation_distinguishes_rolling_and_stable_endpoint(self):
+        state = {
+            "snapshot_reset_at": "2026-09-15T00:00:00Z",
+            "snapshot_updated_at": "2026-09-08T00:00:00Z",
+        }
+        rolling = bot.weekly_reset_observation({
+            "reset_7d_at": "2026-09-15T02:00:00Z",
+            "snapshot_updated_at": "2026-09-08T02:00:00Z",
+            "reset_7d_after_seconds": "604800",
+            "used_7d_percent": "0",
+            "window_7d_minutes": "10080",
+        })
+        stable = bot.weekly_reset_observation({
+            "reset_7d_at": "2026-09-15T00:00:00Z",
+            "snapshot_updated_at": "2026-09-08T02:00:00Z",
+            "reset_7d_after_seconds": "597600",
+            "used_7d_percent": "0",
+            "window_7d_minutes": "10080",
+        })
+        self.assertTrue(bot.weekly_reset_observation_is_rolling(state, rolling))
+        self.assertFalse(bot.weekly_reset_observation_is_anchored(state, rolling))
+        self.assertFalse(bot.weekly_reset_observation_is_rolling(state, stable))
+        self.assertTrue(bot.weekly_reset_observation_is_anchored(state, stable))
+
     def test_upstream_alignment_uses_new_reset_time_minus_seven_days(self):
         self.assertEqual(
             bot.upstream_alignment_time("2026-09-15T20:18:30Z"),
@@ -1535,6 +1572,9 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint)", sql)
         self.assertIn("CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_weekly_reset", sql)
+        self.assertIn("'reset_7d_after_seconds', account.extra->>'codex_7d_reset_after_seconds'", sql)
+        self.assertIn("'used_7d_percent', account.extra->>'codex_7d_used_percent'", sql)
+        self.assertIn("'window_7d_minutes', account.extra->>'codex_7d_window_minutes'", sql)
         self.assertIn(
             "GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint)",
             sql,
@@ -1816,11 +1856,23 @@ class SuddenUpstreamResetTests(unittest.TestCase):
             config["bindings"] = {"100": config["bindings"]["100"]}
             with self.runtime(state_path):
                 bot.save_auto_reset_state({
-                    "accounts": {"12": {"observed_reset_at": previous}},
+                    "accounts": {"12": {
+                        "observed_reset_at": previous,
+                        "snapshot_reset_at": previous,
+                        "snapshot_updated_at": "2026-09-12T04:40:00Z",
+                        "reset_7d_after_seconds": 313.0,
+                        "used_7d_percent": 42.0,
+                        "window_7d_minutes": 10080.0,
+                    }},
                 })
                 with mock.patch.object(bot, "load_config", return_value=config), \
                         mock.patch.object(bot, "query_account_weekly_reset", return_value={
-                            "id": 12, "reset_7d_at": current,
+                            "id": 12,
+                            "reset_7d_at": current,
+                            "snapshot_updated_at": previous,
+                            "reset_7d_after_seconds": "604800",
+                            "used_7d_percent": "0",
+                            "window_7d_minutes": "10080",
                         }), \
                         mock.patch.object(bot, "reset_selected_keys") as reset, \
                         mock.patch.object(bot, "tg") as tg:
@@ -1831,7 +1883,108 @@ class SuddenUpstreamResetTests(unittest.TestCase):
             reset.assert_not_called()
             tg.assert_not_called()
             self.assertEqual(state["accounts"]["12"]["observed_reset_at"], current)
+            self.assertTrue(state["accounts"]["12"]["awaiting_anchor"])
             self.assertNotIn("approval", state)
+
+    def test_rolling_unanchored_reset_time_does_not_prompt(self):
+        now = bot.datetime.fromisoformat("2026-09-08T02:01:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {"12": {
+                    "observed_reset_at": "2026-09-15T00:00:00Z",
+                    "snapshot_reset_at": "2026-09-15T00:00:00Z",
+                    "snapshot_updated_at": "2026-09-08T00:00:00Z",
+                    "reset_7d_after_seconds": 604800.0,
+                    "used_7d_percent": 0.0,
+                    "window_7d_minutes": 10080.0,
+                }}})
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": "2026-09-15T02:00:00Z",
+                            "snapshot_updated_at": "2026-09-08T02:00:00Z",
+                            "reset_7d_after_seconds": "604800",
+                            "used_7d_percent": "0",
+                            "window_7d_minutes": "10080",
+                        }), \
+                        mock.patch.object(bot, "reset_selected_keys") as reset, \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets(now=now)
+                state = bot.load_auto_reset_state()
+            reset.assert_not_called()
+            tg.assert_not_called()
+            self.assertTrue(state["accounts"]["12"]["awaiting_anchor"])
+            self.assertNotIn("approval", state)
+
+    def test_stable_endpoint_ends_anchor_wait_without_prompt(self):
+        now = bot.datetime.fromisoformat("2026-09-08T02:11:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {"12": {
+                    "observed_reset_at": "2026-09-15T02:00:00Z",
+                    "snapshot_reset_at": "2026-09-15T02:00:00Z",
+                    "snapshot_updated_at": "2026-09-08T02:00:00Z",
+                    "reset_7d_after_seconds": 604800.0,
+                    "used_7d_percent": 0.0,
+                    "window_7d_minutes": 10080.0,
+                    "awaiting_anchor": True,
+                }}})
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": "2026-09-15T02:00:00Z",
+                            "snapshot_updated_at": "2026-09-08T02:10:00Z",
+                            "reset_7d_after_seconds": "604200",
+                            "used_7d_percent": "0",
+                            "window_7d_minutes": "10080",
+                        }), \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets(now=now)
+                state = bot.load_auto_reset_state()
+            tg.assert_not_called()
+            self.assertNotIn("awaiting_anchor", state["accounts"]["12"])
+            self.assertEqual(
+                state["accounts"]["12"]["observed_reset_at"],
+                "2026-09-15T02:00:00Z",
+            )
+
+    def test_sudden_reset_with_fresh_signals_prompts_then_waits_for_anchor(self):
+        now = bot.datetime.fromisoformat("2026-09-08T20:19:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "auto_reset_state.json")
+            config = self.config()
+            config["bindings"] = {"100": config["bindings"]["100"]}
+            with self.runtime(state_path):
+                bot.save_auto_reset_state({"accounts": {"12": {
+                    "observed_reset_at": "2026-09-12T04:45:13Z",
+                    "snapshot_reset_at": "2026-09-12T04:45:13Z",
+                    "snapshot_updated_at": "2026-09-08T20:00:00Z",
+                    "reset_7d_after_seconds": 288313.0,
+                    "used_7d_percent": 42.0,
+                    "window_7d_minutes": 10080.0,
+                }}})
+                with mock.patch.object(bot, "load_config", return_value=config), \
+                        mock.patch.object(bot, "query_account_weekly_reset", return_value={
+                            "id": 12,
+                            "reset_7d_at": "2026-09-15T20:18:30Z",
+                            "snapshot_updated_at": "2026-09-08T20:18:30Z",
+                            "reset_7d_after_seconds": "604800",
+                            "used_7d_percent": "0",
+                            "window_7d_minutes": "10080",
+                        }), \
+                        mock.patch.object(bot.secrets, "token_hex", return_value="a1b2c3d4"), \
+                        mock.patch.object(bot, "tg") as tg:
+                    bot.check_account_weekly_resets(now=now)
+                state = bot.load_auto_reset_state()
+            self.assertEqual(tg.call_count, 1)
+            self.assertEqual(state["approval"]["trigger_account_id"], 12)
+            self.assertTrue(state["accounts"]["12"]["awaiting_anchor"])
 
     def test_sudden_reset_prompts_once_and_targets_trigger_account_keys(self):
         previous = "2026-09-12T04:45:13Z"
@@ -2023,6 +2176,11 @@ class SuddenUpstreamResetTests(unittest.TestCase):
             self.assertEqual(first["status"], "rejected")
             self.assertEqual(second["status"], "expired")
             self.assertNotIn("approval", state)
+            self.assertTrue(state["accounts"]["12"]["awaiting_anchor"])
+            self.assertEqual(
+                state["accounts"]["12"]["handled_reset_at"],
+                "2026-09-15T20:18:30Z",
+            )
             reset.assert_not_called()
 
     @mock.patch.object(bot, "notify_successful_bound_users")

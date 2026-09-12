@@ -395,7 +395,10 @@ SELECT CASE
   ELSE json_build_object(
     'id', account.id,
     'snapshot_updated_at', account.extra->>'codex_usage_updated_at',
-    'reset_7d_at', account.extra->>'codex_7d_reset_at'
+    'reset_7d_at', account.extra->>'codex_7d_reset_at',
+    'reset_7d_after_seconds', account.extra->>'codex_7d_reset_after_seconds',
+    'used_7d_percent', account.extra->>'codex_7d_used_percent',
+    'window_7d_minutes', account.extra->>'codex_7d_window_minutes'
   )
 END
 FROM (SELECT 1) AS seed
