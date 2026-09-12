@@ -701,15 +701,15 @@ class MessageAuthorizationTests(unittest.TestCase):
         params = tg.call_args.args[1]
         self.assertEqual(params["text"], "请选择要查看的 Key：")
         keyboard = bot.json.loads(params["reply_markup"])["inline_keyboard"]
-        self.assertEqual([len(row) for row in keyboard], [2, 1, 1])
+        self.assertEqual([len(row) for row in keyboard], [2, 1, 1, 1])
         buttons = [button for row in keyboard for button in row]
         self.assertEqual(
             {button["text"] for button in buttons},
-            {"Administrator", "User A", "User B", "📊 Key 总览"},
+            {"Administrator", "User A", "User B", "📊 Key 总览", "🌐 IP 使用记录"},
         )
         self.assertEqual(
             {button["callback_data"] for button in buttons},
-            {"usage:123", "usage:456", "usage:789", "overview:0"},
+            {"usage:123", "usage:456", "usage:789", "overview:0", "ip_menu:0"},
         )
 
     @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
@@ -879,7 +879,7 @@ class MessageAuthorizationTests(unittest.TestCase):
         ]
         self.assertEqual(
             {button["callback_data"] for button in overview_buttons},
-            {"ip_detail:456:0:0", "overview:0", "overview_back:0"},
+            {"usage:456", "overview:0", "overview_back:0"},
         )
         self.assertEqual(edits[1]["text"], "请选择要查看的 Key：")
         collect_keys.assert_called_once()
@@ -901,7 +901,8 @@ class MessageAuthorizationTests(unittest.TestCase):
         ]
         callback_data = {button["callback_data"] for button in buttons}
         self.assertTrue({"overview:0", "overview:1", "overview:2", "overview_back:0"} <= callback_data)
-        self.assertEqual(len([value for value in callback_data if value.startswith("ip_detail:")]), 8)
+        self.assertEqual(len([value for value in callback_data if value.startswith("usage:")]), 8)
+        self.assertFalse(any(value.startswith("ip_detail:") for value in callback_data))
         self.assertIn("2/3", {button["text"] for button in buttons})
 
     def test_ip_history_formats_unique_addresses_and_pagination(self):
@@ -920,6 +921,19 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIn("🌐 Key A｜近 3 日去重 IP", text)
         self.assertIn("203.0.113.25", text)
         self.assertIn("请求：126 次", text)
+
+    def test_ip_menu_lists_unique_keys_and_returns_to_home(self):
+        bindings = {
+            "100": {"key_name": "Key A", "account_id": 12},
+            "101": {"key_name": "Key B", "account_id": 12},
+            "102": {"key_name": "Key A", "account_id": 12},
+        }
+        keyboard = bot.json.loads(bot.ip_menu_keyboard(bindings))["inline_keyboard"]
+        buttons = [button for row in keyboard for button in row]
+        self.assertEqual(
+            {button["callback_data"] for button in buttons},
+            {"ip_detail:100:0:0", "ip_detail:101:0:0", "overview_back:0"},
+        )
 
     @mock.patch.object(bot, "query_key_ip_history")
     @mock.patch.object(bot, "tg")
@@ -951,23 +965,33 @@ class MessageAuthorizationTests(unittest.TestCase):
     @mock.patch.object(bot, "tg")
     def test_admin_can_open_ip_history(self, tg, query, allow, _refresh):
         config = {"admins": [123], "bindings": {"456": "Key A"}}
+        callback = {
+            "from": {"id": 123},
+            "message": {"message_id": 8, "chat": {"id": 123, "type": "private"}},
+        }
         with mock.patch.object(bot, "load_config", return_value=config):
+            bot.handle_callback_query({**callback, "id": "callback-ip-menu", "data": "ip_menu:0"})
             bot.handle_callback_query({
-                "id": "callback-ip",
-                "from": {"id": 123},
-                "data": "ip_detail:456:0:0",
-                "message": {"message_id": 8, "chat": {"id": 123, "type": "private"}},
+                **callback, "id": "callback-ip", "data": "ip_detail:456:0:0",
             })
         query.assert_called_once_with("Key A", 0)
         allow.assert_called_once_with("123", cooldown=bot.ADMIN_CHECK_COOLDOWN)
-        edit = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"][0]
+        edits = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"]
+        self.assertIn("请选择要查看的 Key", edits[0]["text"])
+        menu_callbacks = {
+            button["callback_data"]
+            for row in bot.json.loads(edits[0]["reply_markup"])["inline_keyboard"]
+            for button in row
+        }
+        self.assertEqual(menu_callbacks, {"ip_detail:456:0:0", "overview_back:0"})
+        edit = edits[1]
         self.assertIn("203.0.113.25", edit["text"])
         callbacks = {
             button["callback_data"]
             for row in bot.json.loads(edit["reply_markup"])["inline_keyboard"]
             for button in row
         }
-        self.assertEqual(callbacks, {"ip_detail:456:0:0", "overview:0"})
+        self.assertEqual(callbacks, {"ip_detail:456:0:0", "ip_menu:0"})
 
     @mock.patch.object(bot, "query_key_usage", return_value={"error": "not_found"})
     @mock.patch.object(bot, "tg")
