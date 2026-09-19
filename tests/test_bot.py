@@ -1443,6 +1443,15 @@ class DataSafetyTests(unittest.TestCase):
             {"key_id": "41", "reset_at": "2026-09-06T04:00:00+00:00"},
         )
 
+    def test_natural_weekly_reset_uses_fixed_write_function(self):
+        with mock.patch.object(bot, "run_psql_write_json", return_value={}) as run:
+            bot.reset_expired_weekly_window("example-key")
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.reset_expired_weekly_window("
+            ":'key_name')::text;",
+            {"key_name": "example-key"},
+        )
+
     def test_backup_batch_list_uses_fixed_read_only_function(self):
         bindings = {
             "123": {"key_name": "Key A", "account_id": 1},
@@ -1584,6 +1593,13 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.set_rate_limit_window_starts(bigint, timestamptz)", sql)
         self.assertIn("window_7d_start = CASE WHEN rate_limit_7d > 0 THEN p_reset_at ELSE NULL END", sql)
+        self.assertIn(
+            "GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.reset_expired_weekly_window(text)",
+            sql,
+        )
+        self.assertIn("v_key.window_7d_start + interval '7 days' > v_reset_at", sql)
+        self.assertIn("SET usage_7d = 0", sql)
+        self.assertIn("window_7d_start = v_reset_at", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backup_batches(jsonb)", sql)
         self.assertIn("ADD COLUMN IF NOT EXISTS batch_id text", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text)", sql)
@@ -1804,6 +1820,63 @@ class DataSafetyTests(unittest.TestCase):
                 bot.save_alert_state({"example": {"alerted_at": 1}})
             mode = stat.S_IMODE(os.stat(path).st_mode)
             self.assertEqual(mode, 0o600)
+
+
+class NaturalKeyResetTests(unittest.TestCase):
+    def config(self):
+        return {
+            "admins": [123],
+            "bindings": {
+                "100": {"key_name": "Key A", "account_id": 12},
+                "101": {"key_name": "Key B", "account_id": 13},
+                "102": {"key_name": "Key A", "account_id": 12},
+            },
+        }
+
+    @mock.patch.object(bot, "tg")
+    def test_expired_weekly_window_resets_each_key_once_and_notifies_bound_users(self, tg):
+        def reset(key_name):
+            return {
+                "key_id": 41,
+                "key_name": key_name,
+                "reset": key_name == "Key A",
+            }
+
+        with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                mock.patch.object(bot, "reset_expired_weekly_window", side_effect=reset) as run:
+            results = bot.check_expired_key_weekly_windows()
+
+        self.assertEqual([call.args[0] for call in run.call_args_list], ["Key A", "Key B"])
+        self.assertEqual([result["key_name"] for result in results], ["Key A"])
+        messages = [call.args[1] for call in tg.call_args_list]
+        self.assertEqual([message["chat_id"] for message in messages], ["100", "102"])
+        self.assertTrue(all(
+            message["text"].startswith("公告：额度已经自然重置\n\nKey：Key A")
+            for message in messages
+        ))
+
+    @mock.patch.object(bot, "tg")
+    def test_failed_weekly_window_reset_does_not_notify_and_other_keys_continue(self, tg):
+        def reset(key_name):
+            if key_name == "Key A":
+                raise RuntimeError("database unavailable")
+            return {"key_id": 42, "key_name": key_name, "reset": True}
+
+        with mock.patch.object(bot, "load_config", return_value=self.config()), \
+                mock.patch.object(bot, "reset_expired_weekly_window", side_effect=reset):
+            results = bot.check_expired_key_weekly_windows()
+
+        self.assertEqual([result["key_name"] for result in results], ["Key B"])
+        self.assertEqual([call.args[1]["chat_id"] for call in tg.call_args_list], ["101"])
+
+    def test_automatic_loop_checks_key_windows_without_reset_api_dependency(self):
+        with mock.patch.object(bot, "check_expired_key_weekly_windows") as natural, \
+                mock.patch.object(bot, "check_account_weekly_resets") as upstream, \
+                mock.patch.object(bot.time, "sleep", side_effect=[None, KeyboardInterrupt]):
+            with self.assertRaises(KeyboardInterrupt):
+                bot.auto_reset_loop()
+        natural.assert_called_once_with()
+        upstream.assert_called_once_with()
 
 
 class SuddenUpstreamResetTests(unittest.TestCase):
