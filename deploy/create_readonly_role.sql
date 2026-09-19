@@ -532,6 +532,64 @@ BEGIN
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.reset_expired_weekly_window(
+  p_key_name text
+)
+RETURNS json
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  v_key public.api_keys%ROWTYPE;
+  v_match_count integer;
+  v_reset_at timestamptz;
+BEGIN
+  SELECT count(*)::integer INTO v_match_count
+  FROM public.api_keys
+  WHERE name = p_key_name AND deleted_at IS NULL;
+  IF v_match_count = 0 THEN
+    RETURN json_build_object('error', 'not_found');
+  ELSIF v_match_count > 1 THEN
+    RETURN json_build_object('error', 'duplicate_key_name');
+  END IF;
+
+  SELECT * INTO v_key
+  FROM public.api_keys
+  WHERE name = p_key_name AND deleted_at IS NULL
+  FOR UPDATE;
+
+  v_reset_at := clock_timestamp();
+  IF v_key.rate_limit_7d <= 0
+     OR v_key.window_7d_start IS NULL
+     OR v_key.window_7d_start + interval '7 days' > v_reset_at THEN
+    RETURN json_build_object(
+      'key_id', v_key.id,
+      'key_name', v_key.name,
+      'reset', false,
+      'window_7d_start', v_key.window_7d_start
+    );
+  END IF;
+
+  UPDATE public.api_keys
+  SET usage_7d = 0,
+      window_7d_start = v_reset_at,
+      updated_at = v_reset_at
+  WHERE id = v_key.id AND deleted_at IS NULL
+  RETURNING * INTO v_key;
+
+  RETURN json_build_object(
+    'key_id', v_key.id,
+    'key_name', v_key.name,
+    'reset', true,
+    'reset_at', v_reset_at,
+    'window_7d_start', v_key.window_7d_start,
+    'window_7d_end', v_key.window_7d_start + interval '7 days'
+  );
+END;
+$function$;
+
 CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.rate_limit_backup_batches(
   p_key_names jsonb
 )
@@ -701,6 +759,7 @@ REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.set_rate_limit_window_starts(bigint, timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.reset_expired_weekly_window(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.rate_limit_backup_batches(jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text) FROM PUBLIC;
@@ -715,6 +774,7 @@ GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) TO sub2api
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.set_rate_limit_window_starts(bigint, timestamptz) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.reset_expired_weekly_window(text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backup_batches(jsonb) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text) TO sub2api_tg_bot;
