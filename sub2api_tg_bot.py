@@ -1135,6 +1135,16 @@ def set_rate_limit_window_starts(key_id, reset_at):
     })
 
 
+def reset_expired_weekly_window(key_name):
+    if not isinstance(key_name, str) or not KEY_NAME_RE.fullmatch(key_name):
+        raise ValueError("Invalid key name")
+    sql = (
+        "SELECT sub2api_tg_bot_api.reset_expired_weekly_window("
+        ":'key_name')::text;"
+    )
+    return run_psql_write_json(sql, {"key_name": key_name})
+
+
 def query_rate_limit_backup_batches(bindings):
     key_names = [binding["key_name"] for _user_id, binding in reset_candidates(bindings)]
     if not key_names:
@@ -1815,6 +1825,26 @@ def notify_successful_bound_users(bindings, results):
     return delivered
 
 
+def notify_natural_weekly_reset_users(bindings, key_name):
+    delivered = 0
+    for user_id, binding in sorted(bindings.items()):
+        if binding["key_name"] != key_name:
+            continue
+        try:
+            tg("sendMessage", {
+                "chat_id": user_id,
+                "text": "\n".join([
+                    "公告：额度已经自然重置",
+                    "",
+                    f"Key：{key_name}",
+                ]),
+            })
+            delivered += 1
+        except Exception as error:
+            log_failure(f"natural reset announcement user={masked_id(user_id)}", error)
+    return delivered
+
+
 def notify_sudden_reset_approval(admins, approval):
     delivered = 0
     reply_markup = sudden_reset_approval_keyboard(approval["token"])
@@ -1926,6 +1956,27 @@ def decide_sudden_reset_approval(token, approve):
             "results": results,
             "bindings": bindings,
         }
+
+
+def check_expired_key_weekly_windows():
+    bindings = config_bindings(load_config())
+    results = []
+    for _target_user_id, binding in reset_candidates(bindings):
+        key_name = binding["key_name"]
+        try:
+            with _RESET_OPERATION_LOCK:
+                result = reset_expired_weekly_window(key_name) or {}
+            if result.get("error"):
+                raise RuntimeError(
+                    f"Weekly window reset failed: {result.get('error')}"
+                )
+            if result.get("reset") is not True:
+                continue
+            notify_natural_weekly_reset_users(bindings, key_name)
+            results.append(result)
+        except Exception as error:
+            log_failure(f"natural weekly reset key={key_name}", error)
+    return results
 
 
 def check_account_weekly_resets(now=None):
@@ -2089,6 +2140,10 @@ def check_account_weekly_resets(now=None):
 def auto_reset_loop():
     time.sleep(10)
     while True:
+        try:
+            check_expired_key_weekly_windows()
+        except Exception as error:
+            log_failure("natural weekly reset scan", error)
         try:
             check_account_weekly_resets()
         except Exception as error:
@@ -2929,8 +2984,7 @@ def main():
     ], ensure_ascii=False)})
     print("sub2api tg bot long polling started", flush=True)
     threading.Thread(target=alert_loop, name="weekly-alerts", daemon=True).start()
-    if reset_api_configured():
-        threading.Thread(target=auto_reset_loop, name="account-weekly-resets", daemon=True).start()
+    threading.Thread(target=auto_reset_loop, name="rate-limit-resets", daemon=True).start()
     dispatcher = UpdateDispatcher(UPDATE_WORKERS, UPDATE_MAX_PENDING)
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     httpd.daemon_threads = True
