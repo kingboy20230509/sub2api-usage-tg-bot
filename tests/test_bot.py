@@ -130,6 +130,22 @@ class MessageAuthorizationTests(unittest.TestCase):
             bot.classify_upstream_reset(previous, current, previous),
             "natural",
         )
+        self.assertEqual(
+            bot.classify_upstream_reset(
+                "2026-09-26T08:21:40Z",
+                "2026-10-03T08:12:36Z",
+                "2026-09-26T08:13:00Z",
+            ),
+            "natural",
+        )
+        self.assertEqual(
+            bot.classify_upstream_reset(
+                "2026-09-26T08:21:40Z",
+                "2026-10-03T07:20:40Z",
+                "2026-09-26T07:21:00Z",
+            ),
+            "sudden",
+        )
 
     def test_upstream_reset_classification_ignores_drift_and_stale_snapshots(self):
         previous = "2026-09-12T04:45:13Z"
@@ -198,6 +214,8 @@ class MessageAuthorizationTests(unittest.TestCase):
         prompt = bot.format_sudden_reset_approval(approval)
         self.assertTrue(prompt.startswith("通知："))
         self.assertIn("上游账号 ID：12", prompt)
+        self.assertIn("提前重置时间：3 天 8 小时 26 分钟", prompt)
+        self.assertNotIn("新的重置时间：", prompt)
         self.assertIn("3 分钟内未操作将自动执行", prompt)
         result = bot.format_sudden_reset_result(approval, [
             {"key_name": "Key A", "status": "success"},
@@ -522,6 +540,24 @@ class MessageAuthorizationTests(unittest.TestCase):
             {"key_name": "Key B", "error": True},
         ])
         self.assertEqual(query.call_args_list, [mock.call("Key A"), mock.call("Key B")])
+
+    @mock.patch.object(bot, "query_key_overview", side_effect=[
+        {"key": {"status": "active", "expires_at": "2026-10-01T00:00:00Z"}},
+        {"key": {"status": "disabled", "expires_at": None}},
+        {"key": {"status": "expired", "expires_at": None}},
+        {"key": {"status": "active", "expires_at": "2026-09-25T00:00:00Z"}},
+        {"key": {"status": "quota_exhausted", "expires_at": None}},
+    ])
+    def test_key_overview_excludes_expired_and_disabled_keys(self, query):
+        bindings = {
+            str(index): {"key_name": f"Key {name}", "account_id": index}
+            for index, name in enumerate("ABCDE", start=1)
+        }
+        overview = bot.collect_key_overview(
+            bindings, now=bot.datetime.fromisoformat("2026-09-26T00:00:00+00:00")
+        )
+        self.assertEqual([item["key_name"] for item in overview], ["Key A", "Key E"])
+        self.assertEqual(query.call_count, 5)
 
     @mock.patch.object(bot, "query_account_estimate", side_effect=[
         {
@@ -892,7 +928,7 @@ class MessageAuthorizationTests(unittest.TestCase):
     def test_admin_can_open_refresh_and_return_from_key_overview(
         self, tg, collect_keys, collect_accounts, allow, _refresh
     ):
-        config = {"admins": [123], "bindings": {"456": "Key A"}}
+        config = {"admins": [123], "bindings": {"456": "Key A", "789": "Key B"}}
         callback = {
             "from": {"id": 123},
             "message": {"message_id": 9, "chat": {"id": 123, "type": "private"}},
@@ -900,7 +936,10 @@ class MessageAuthorizationTests(unittest.TestCase):
         with mock.patch.object(bot, "load_config", return_value=config):
             bot.handle_callback_query({**callback, "id": "overview-open", "data": "overview:0"})
             bot.handle_callback_query({**callback, "id": "overview-back", "data": "overview_back:0"})
-        collect_keys.assert_called_once_with({"456": {"key_name": "Key A", "account_id": None}})
+        collect_keys.assert_called_once_with({
+            "456": {"key_name": "Key A", "account_id": None},
+            "789": {"key_name": "Key B", "account_id": None},
+        })
         collect_accounts.assert_called_once_with({"456": {"key_name": "Key A", "account_id": None}})
         allow.assert_called_once_with("123", cooldown=bot.ADMIN_CHECK_COOLDOWN)
         edits = [call.args[1] for call in tg.call_args_list if call.args[0] == "editMessageText"]
@@ -1238,7 +1277,7 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertIn("Key 使用量已完整回滚", edits[-1])
 
     @mock.patch.object(bot, "rollback_all_key_rate_limits")
-    @mock.patch.object(bot, "find_complete_backup_batch")
+    @mock.patch.object(bot, "find_backup_batch")
     @mock.patch.object(bot, "query_rate_limit_backup_batches")
     @mock.patch.object(bot, "tg")
     def test_admin_can_choose_and_execute_all_key_rollback(
@@ -1280,17 +1319,17 @@ class MessageAuthorizationTests(unittest.TestCase):
         rollback_all.assert_called_once()
         edits = [call.args[1]["text"] for call in tg.call_args_list if call.args[0] == "editMessageText"]
         self.assertIn("请选择回滚方式", edits[0])
-        self.assertIn("选择全员回滚版本", edits[1])
-        self.assertIn("确认回滚所有绑定 Key", edits[2])
-        self.assertIn("全员回滚完成", edits[-1])
+        self.assertIn("选择备份批次", edits[1])
+        self.assertIn("确认回滚本批次的 Key", edits[2])
+        self.assertIn("批次回滚完成", edits[-1])
 
     @mock.patch.object(bot, "_rollback_key_rate_limits_unlocked")
     @mock.patch.object(bot, "find_rate_limit_backup", side_effect=[
         (41, {"backup_id": 9, "key_name": "Key A"}),
         (42, {"backup_id": 10, "key_name": "Key B"}),
     ])
-    @mock.patch.object(bot, "find_complete_backup_batch")
-    def test_all_key_rollback_preflights_complete_batch_and_processes_each_key(
+    @mock.patch.object(bot, "find_backup_batch")
+    def test_batch_rollback_preflights_and_restores_only_backed_up_keys(
         self, find_batch, find_backup, rollback_one,
     ):
         batch = {
@@ -1305,6 +1344,7 @@ class MessageAuthorizationTests(unittest.TestCase):
         bindings = {
             "456": {"key_name": "Key A", "account_id": 1},
             "789": {"key_name": "Key B", "account_id": 2},
+            "999": {"key_name": "Key C", "account_id": 3},
         }
         returned_batch, results = bot.rollback_all_key_rate_limits(
             bindings, "0123456789abcdef"
@@ -1315,13 +1355,14 @@ class MessageAuthorizationTests(unittest.TestCase):
             {"key_name": "Key B", "status": "success"},
         ])
         self.assertEqual(rollback_one.call_count, 2)
+        self.assertEqual(find_backup.call_count, 2)
 
     @mock.patch.object(bot, "_rollback_key_rate_limits_unlocked")
     @mock.patch.object(bot, "find_rate_limit_backup", side_effect=[
         (41, {"backup_id": 9, "key_name": "Key A"}),
         RuntimeError("backup missing"),
     ])
-    @mock.patch.object(bot, "find_complete_backup_batch", return_value={
+    @mock.patch.object(bot, "find_backup_batch", return_value={
         "backups": [
             {"backup_id": 9, "key_name": "Key A"},
             {"backup_id": 10, "key_name": "Key B"},
@@ -1601,6 +1642,11 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("SET usage_7d = 0", sql)
         self.assertIn("window_7d_start = v_reset_at", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backup_batches(jsonb)", sql)
+        self.assertNotIn(
+            "HAVING count(DISTINCT backup.api_key_id) = (SELECT total FROM requested_count)",
+            sql,
+        )
+        self.assertIn("HAVING count(DISTINCT backup.reset_source) = 1", sql)
         self.assertIn("ADD COLUMN IF NOT EXISTS batch_id text", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.rate_limit_backups(text)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.restore_rate_limit_backup(bigint, text)", sql)
@@ -1618,6 +1664,7 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("'consumed_amount'", sql)
         self.assertIn("'models_today'", sql)
         self.assertIn("'ip_counts'", sql)
+        self.assertIn("api_key_row.status, api_key_row.expires_at", sql)
         self.assertIn("count(DISTINCT ip_address)", sql)
         self.assertIn("(SELECT max(usage_row.created_at)", sql)
         self.assertIn("WHERE usage_row.api_key_id = api_key_row.id) AS last_used_at", sql)
