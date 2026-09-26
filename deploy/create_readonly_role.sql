@@ -167,6 +167,7 @@ WITH bounds AS (
     AT TIME ZONE 'Asia/Shanghai' AS today_start
 ), matching_keys AS (
   SELECT api_key_row.id, api_key_row.name,
+         api_key_row.status, api_key_row.expires_at,
          (SELECT max(usage_row.created_at)
           FROM public.usage_logs AS usage_row
           WHERE usage_row.api_key_id = api_key_row.id) AS last_used_at,
@@ -623,10 +624,9 @@ WITH requested_keys AS (
   JOIN matching_keys AS matching ON matching.id = backup.api_key_id
   WHERE backup.batch_id IS NOT NULL
   GROUP BY backup.batch_id
-  HAVING count(DISTINCT backup.api_key_id) = (SELECT total FROM requested_count)
-     AND count(DISTINCT backup.reset_source) = 1
+  HAVING count(DISTINCT backup.reset_source) = 1
   ORDER BY min(backup.created_at) DESC, backup.batch_id DESC
-  LIMIT 3
+  LIMIT 20
 ), batch_payloads AS (
   SELECT
     batch.batch_id,
