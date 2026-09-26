@@ -25,8 +25,8 @@ Telegram Bot Token 只用于连接 Telegram。Bot 不保存或使用 Sub2API API
 - 管理员还可以查看绑定账号的周使用百分比、周重置时间、消耗金额和满额金额预估，也可以通过复选按钮选择一个或多个 Key，在最终确认后批量重置 5 小时/日/周限速用量。
 - 显示 Key 到期时间、总额度、5 小时/日/周限额、Key 自身的 5 小时与每周重置时间、今日及 7 天用量和模型统计；上游账号重置时间只在管理员 Key 总览中明确标注，7 天用量按 Asia/Shanghai 时区的 7 个自然日统计。
 - 周额度剩余不超过 20% 时主动提醒，每个周窗口只提醒一次。
-- 上游账号自然到达原计划时间后更新 7 日重置时间时，Bot 不重置 Key 且不通知；只有原计划时间尚未到却提前跳到新周期时，才进入该账号绑定 Key 的随号重置审批。多个账号同时触发时会逐个排队处理。
-- 手动重置前会完整备份三个用量及三个窗口开始时间，每个 Key 保留最近 3 份；管理员可在 `/check` 菜单中选择单 Key 备份回滚，也可选择完整覆盖当前全部绑定 Key 的批次版本执行全员回滚。
+- 上游账号在原计划时间附近自然进入新周期时，Bot 不重置 Key 且不通知；新周期开始时间比原计划时间提前至少 1 小时，且原计划时间尚未到，才进入该账号绑定 Key 的随号重置审批。多个账号同时触发时会逐个排队处理。
+- 手动重置前会完整备份三个用量及三个窗口开始时间，每个 Key 保留最近 3 份；管理员可在 `/check` 菜单中选择单 Key 备份回滚，也可选择一个批次，仅回滚该批次实际备份且当前仍绑定的 Key。
 - 重置成功后会向管理员发送重置前快照，格式与 Key 总览一致，包含最后使用时间、每周已用/限额/剩余及进度条。
 - 仅允许绑定用户在与 Bot 的私聊中查询；群聊不返回用量。
 - 限制并发、待处理消息数和每用户查询频率。
@@ -189,13 +189,13 @@ sub2api tg bot long polling started
 /check
 ```
 
-普通用户直接查询自己的 Key；管理员会先看到 Key 查询按钮、“Key 总览”、“批量重置速率限制”、“回滚 Key 使用量”和主页最下方的“IP 使用记录”按钮。普通用户和管理员查看单个 Key 时都不会显示上游账号信息。“Key 总览”按 Key 名称去重，每页显示 8 个 Key，展示最后使用时间、每周已用/限额/剩余、Key 自身的周重置时间和 12 格进度条；下方“上游账号信息”按 `account_id` 去重展示账号周使用百分比、明确标注的上游周重置时间、账号消耗金额、满额金额预估及汇总，最后显示本次刷新时间。账号名称若为邮箱格式会自动脱敏。总览下方的 Key 按钮用于打开对应 Key 的完整用量内容；今日/昨日去重 IP 数量继续保留在总览正文。具体 IP 地址统一从主页“IP 使用记录”进入，选择 Key 后查看近 3 天记录，详情返回时回到 IP Key 列表。总览支持刷新、翻页和返回，不显示请求、Tokens、模型、5 小时或每日信息。
+普通用户直接查询自己的 Key；管理员会先看到 Key 查询按钮、“Key 总览”、“批量重置速率限制”、“回滚 Key 使用量”和主页最下方的“IP 使用记录”按钮。普通用户和管理员查看单个 Key 时都不会显示上游账号信息。“Key 总览”按 Key 名称去重，不显示已过期或已禁用的 Key，每页显示 8 个 Key，展示最后使用时间、每周已用/限额/剩余、Key 自身的周重置时间和 12 格进度条；下方“上游账号信息”按 `account_id` 去重展示账号周使用百分比、明确标注的上游周重置时间、账号消耗金额、满额金额预估及汇总，最后显示本次刷新时间。账号名称若为邮箱格式会自动脱敏。总览下方的 Key 按钮用于打开对应 Key 的完整用量内容；今日/昨日去重 IP 数量继续保留在总览正文。具体 IP 地址统一从主页“IP 使用记录”进入，选择 Key 后查看近 3 天记录，详情返回时回到 IP Key 列表。总览支持刷新、翻页和返回，不显示请求、Tokens、模型、5 小时或每日信息。
 
 账号金额预估只对配置中的管理员开放。普通用户看不到 Key 总览按钮；即使伪造 `overview` 回调，Bot 也会在执行任何 Key 或账号数据库查询前重新校验 Telegram 管理员 ID。账号消耗金额采用 Sub2API 的账号用量统计口径，不代表 OpenAI 实际账单；满额金额是线性预估值。
 
 进入批量重置后，可以逐项勾选或取消 Key，也可以全选或清空；点击“重置所选”后还需最终确认。Bot 会先为每个 Key 备份 `usage_5h`、`usage_1d`、`usage_7d`、`window_5h_start`、`window_1d_start`、`window_7d_start`，并保存重置前的 `last_used_at` 与 `rate_limit_7d` 用于通知展示；备份成功才调用管理接口重置。所有选中 Key 的 5 小时、每日和 7 日窗口使用同一个批次重置时间，因此 7 日剩余时间会一起从 7 天开始倒计时。单个 Key 失败不会中断其余 Key，完成消息会分别汇总成功、需复查和失败数量，重置成功项会另行向管理员发送与 Key 总览相同格式的重置前数据。
 
-每个 Key 只保留最近 3 份重置前备份。在“回滚 Key 使用量”中可选择单 Key 回滚，或选择一个完整覆盖当前全部绑定 Key 的批次版本执行全员回滚；两种方式都要求再次确认。Bot 会先通过官方管理接口定向清除目标 Key 的数据库计数与 Redis 限速缓存，再立即从备份恢复上述六个字段并复查。回滚不修改 `quota_used`，也不删除历史用量记录。升级前产生的旧备份没有批次 ID，只能继续用于单 Key 回滚，不会按相近时间自动拼接为全员版本。
+每个 Key 只保留最近 3 份重置前备份。在“回滚 Key 使用量”中可选择单 Key 回滚，或选择一个备份批次，只回滚该批次实际备份且当前仍绑定的 Key；两种方式都要求再次确认。Bot 会先通过官方管理接口定向清除目标 Key 的数据库计数与 Redis 限速缓存，再立即从备份恢复上述六个字段并复查。回滚不修改 `quota_used`，也不删除历史用量记录。升级前产生的旧备份没有批次 ID，只能继续用于单 Key 回滚，不会按相近时间自动拼接为批次版本。
 
 重置不会清零累计总额度 `quota_used`，也不会删除今日或近 7 天历史用量记录。普通用户不会看到重置按钮，即使伪造 Telegram 回调也会被管理员 ID 校验拒绝。
 
@@ -292,9 +292,9 @@ docker compose logs --tail=100 sub2api-tg-bot
 
 The expected startup message is `sub2api tg bot long polling started`. Only one polling process may use a Telegram Bot Token at a time.
 
-Bot admins can reset the selected key's 5-hour, daily, and 7-day rate-limit counters after a second confirmation. Every reset first stores all six rate-limit values, keeping the latest three backups per key. Admins can select one backup to restore through the bot. Regular Telegram users cannot invoke reset or rollback callbacks.
+Bot admins can reset the selected key's 5-hour, daily, and 7-day rate-limit counters after a second confirmation. Every reset first stores all six rate-limit values, keeping the latest three backups per key. Admins can restore one key or choose a backup batch to restore only its currently bound keys. Regular Telegram users cannot invoke reset or rollback callbacks.
 
-The bot treats a 7-day timestamp advance as natural when the previous scheduled reset time has already arrived; natural resets only update the saved baseline and remain silent. If the timestamp advances by at least one hour before the previous reset was due, the bot asks the configured admin whether all unique bound keys should be backed up, reset, and aligned to the new upstream cycle start. Approval runs immediately, rejection skips the event, and no response runs it after three minutes. Only users whose keys are confirmed successful receive the public announcement. The bot polls Sub2API's saved snapshot rather than contacting the upstream provider directly.
+The bot treats a new upstream cycle starting within one hour of the previous scheduled reset as natural; it only updates the saved baseline and remains silent. If the new cycle starts at least one hour early before the previous reset was due, the bot asks the configured admin whether the keys bound to that account should be backed up, reset, and aligned. Approval runs immediately, rejection skips the event, and no response runs it after three minutes. Only users whose keys are confirmed successful receive the public announcement. The bot polls Sub2API's saved snapshot rather than contacting the upstream provider directly.
 
 ## License
 
