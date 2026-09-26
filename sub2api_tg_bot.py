@@ -474,7 +474,7 @@ def rollback_key_keyboard(bindings):
 def rollback_mode_keyboard():
     return json.dumps({"inline_keyboard": [
         [{"text": "👤 回滚单个 Key", "callback_data": "rollback_single:0"}],
-        [{"text": "👥 回滚所有绑定 Key", "callback_data": "rollback_all:0"}],
+        [{"text": "👥 按备份批次回滚", "callback_data": "rollback_all:0"}],
         [{"text": "◀️ 返回", "callback_data": "rollback_back:0"}],
     ]}, ensure_ascii=False)
 
@@ -500,7 +500,7 @@ def rollback_batch_keyboard(batches):
 def rollback_all_confirmation_keyboard(batch_id, key_count):
     return json.dumps({"inline_keyboard": [
         [{
-            "text": f"✅ 确认回滚全部 {key_count} 个 Key",
+            "text": f"✅ 确认回滚本批次 {key_count} 个 Key",
             "callback_data": f"rollback_all_confirm:{batch_id}",
         }],
         [{"text": "◀️ 返回版本列表", "callback_data": "rollback_all:0"}],
@@ -556,7 +556,7 @@ def format_rollback_backup(key_name, backup):
     ])
 
 
-def find_complete_backup_batch(bindings, batch_id):
+def find_backup_batch(bindings, batch_id):
     if not isinstance(batch_id, str) or not re.fullmatch(r"[0-9a-f]{8,32}", batch_id):
         raise ValueError("Invalid backup batch ID")
     data = query_rate_limit_backup_batches(bindings) or {}
@@ -565,18 +565,18 @@ def find_complete_backup_batch(bindings, batch_id):
     for batch in data.get("batches") or []:
         if batch.get("batch_id") == batch_id:
             return batch
-    raise RuntimeError("Backup batch is incomplete or no longer available")
+    raise RuntimeError("Backup batch is no longer available")
 
 
 def format_all_rollback_confirmation(batch):
     backups = batch.get("backups") or []
     source = "自动重置" if batch.get("reset_source") == "auto" else "手动重置"
     lines = [
-        "⚠️ 确认回滚所有绑定 Key？",
+        "⚠️ 确认回滚本批次的 Key？",
         "",
         f"版本时间：{format_timestamp(batch.get('created_at'))}",
         f"备份来源：{source}",
-        f"可回滚：{len(backups)} / {num(batch.get('key_count'))} 个 Key",
+        f"可回滚：{len(backups)} 个 Key",
         "",
     ]
     lines.extend(f"• {backup.get('key_name') or '-'}" for backup in backups[:30])
@@ -1211,7 +1211,7 @@ def _rollback_key_rate_limits_unlocked(key_name, account_id, key_id, backup_id, 
 
 def rollback_all_key_rate_limits(bindings, batch_id):
     with _RESET_OPERATION_LOCK:
-        batch = find_complete_backup_batch(bindings, batch_id)
+        batch = find_backup_batch(bindings, batch_id)
         bindings_by_name = {
             binding["key_name"]: binding
             for _user_id, binding in reset_candidates(bindings)
@@ -1242,7 +1242,7 @@ def format_all_rollback_results(batch, results):
     success_count = sum(result.get("status") == "success" for result in results)
     failed_count = len(results) - success_count
     lines = [
-        "✅ 全员回滚完成" if failed_count == 0 else "⚠️ 全员回滚完成，部分 Key 失败",
+        "✅ 批次回滚完成" if failed_count == 0 else "⚠️ 批次回滚完成，部分 Key 失败",
         "",
         f"版本时间：{format_timestamp(batch.get('created_at'))}",
         f"成功：{success_count}",
@@ -1254,7 +1254,8 @@ def format_all_rollback_results(batch, results):
     return "\n".join(lines)
 
 
-def collect_key_overview(bindings):
+def collect_key_overview(bindings, now=None):
+    current = datetime.now(timezone.utc) if now is None else now
     overview = []
     for target_user_id, binding in reset_candidates(bindings):
         key_name = binding["key_name"]
@@ -1263,6 +1264,11 @@ def collect_key_overview(bindings):
             key = data.get("key") or {}
             if not key:
                 raise RuntimeError("Overview query did not return API key data")
+            if str(key.get("status") or "").lower() in {"disabled", "expired"}:
+                continue
+            expires_at = parse_upstream_timestamp(key.get("expires_at"))
+            if expires_at is not None and expires_at <= current:
+                continue
             overview.append({
                 "key_name": key_name,
                 "last_used_at": key.get("last_used_at"),
@@ -1636,6 +1642,9 @@ def classify_upstream_reset(previous_reset_at, current_reset_at, now=None):
     current_time = datetime.now(timezone.utc) if now is None else parse_upstream_timestamp(now)
     if current_time is None:
         raise ValueError("Invalid current time")
+    new_window_start = upstream_alignment_time(current)
+    if (previous - new_window_start).total_seconds() < AUTO_RESET_MIN_ADVANCE_SECONDS:
+        return "natural"
     return "sudden" if current_time < previous else "natural"
 
 
@@ -1744,12 +1753,18 @@ def sudden_reset_approval_keyboard(token):
 
 
 def format_sudden_reset_approval(approval):
+    previous = parse_upstream_timestamp(approval.get("previous_reset_at"))
+    aligned = parse_upstream_timestamp(approval.get("align_at"))
+    advance_minutes = max(0, int((previous - aligned).total_seconds() // 60))
+    days, remainder = divmod(advance_minutes, 24 * 60)
+    hours, minutes = divmod(remainder, 60)
+    advance_text = f"{days} 天 {hours} 小时 {minutes} 分钟"
     return "\n".join([
         "通知：检测到 OpenAI 7 日额度提前重置",
         "",
         f"原计划重置时间：{format_timestamp(approval.get('previous_reset_at'))}",
-        f"新的重置时间：{format_timestamp(approval.get('reset_at'))}",
         f"新周期开始时间：{format_timestamp(approval.get('align_at'))}",
+        f"提前重置时间：{advance_text}",
         f"上游账号 ID：{approval.get('trigger_account_id')}",
         f"涉及 Key：{len(approval.get('keys') or [])} 个",
         "",
@@ -2449,18 +2464,18 @@ def handle_callback_query(callback):
                     "chat_id": chat_id,
                     "message_id": message_id,
                     "text": (
-                        "📦 选择全员回滚版本\n\n"
-                        "只显示包含当前全部绑定 Key 的完整备份版本。"
+                        "📦 选择备份批次\n\n"
+                        "每个批次只回滚该批次实际备份、且当前仍绑定的 Key。"
                         if batches else
-                        "📦 暂无可用的全员回滚版本。\n\n"
-                        "旧备份和未覆盖全部绑定 Key 的批次仍可单 Key 回滚。"
+                        "📦 暂无可用的批次备份。\n\n"
+                        "仍可选择单个 Key 回滚。"
                     ),
                     "reply_markup": rollback_batch_keyboard(batches),
                 })
                 return
             if action in {"rollback_all_prompt", "rollback_all_confirm"}:
                 batch_id = target_user_id
-                batch = find_complete_backup_batch(bindings, batch_id)
+                batch = find_backup_batch(bindings, batch_id)
                 key_count = len(batch.get("backups") or [])
                 if action == "rollback_all_prompt":
                     tg("answerCallbackQuery", {"callback_query_id": callback_id})
@@ -2475,12 +2490,12 @@ def handle_callback_query(callback):
                     return
                 tg("answerCallbackQuery", {
                     "callback_query_id": callback_id,
-                    "text": f"正在回滚全部 {key_count} 个 Key…",
+                    "text": f"正在回滚本批次 {key_count} 个 Key…",
                 })
                 tg("editMessageText", {
                     "chat_id": chat_id,
                     "message_id": message_id,
-                    "text": f"⏳ 正在回滚全部 {key_count} 个 Key，请稍候…",
+                    "text": f"⏳ 正在回滚本批次 {key_count} 个 Key，请稍候…",
                 })
                 batch, results = rollback_all_key_rate_limits(bindings, batch_id)
                 tg("editMessageText", {
@@ -2653,7 +2668,12 @@ def handle_callback_query(callback):
                 return
             tg("answerCallbackQuery", {"callback_query_id": callback_id})
             overview = collect_key_overview(bindings)
-            accounts = collect_account_overview(bindings)
+            visible_names = {item["key_name"] for item in overview}
+            visible_bindings = {
+                target_id: binding for target_id, binding in bindings.items()
+                if binding["key_name"] in visible_names
+            }
+            accounts = collect_account_overview(visible_bindings)
             reply, page, total_pages = format_key_overview(
                 overview, int(target_user_id), accounts=accounts
             )
@@ -2662,7 +2682,7 @@ def handle_callback_query(callback):
                 "chat_id": chat.get("id"),
                 "message_id": message.get("message_id"),
                 "text": reply,
-                "reply_markup": overview_keyboard(bindings, page, total_pages),
+                "reply_markup": overview_keyboard(visible_bindings, page, total_pages),
             })
             return
         if action in {"reset_prompt", "reset_confirm", "reset_cancel"}:
