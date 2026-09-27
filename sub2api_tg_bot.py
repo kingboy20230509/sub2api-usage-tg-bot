@@ -1087,6 +1087,10 @@ def query_account_estimate(account_id):
     return run_psql_json(sql, {"account_id": str(account_id)})
 
 
+def query_active_accounts():
+    return run_psql_json("SELECT sub2api_tg_bot_api.active_accounts()::text;")
+
+
 def query_account_weekly_reset(account_id):
     if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
         raise ValueError("Invalid account ID in binding config")
@@ -1296,15 +1300,18 @@ def collect_account_overview(bindings):
         if binding["key_name"] not in key_names:
             key_names.append(binding["key_name"])
 
+    active_accounts = (query_active_accounts() or {}).get("accounts") or []
     overview = []
-    for account_id, key_names in account_bindings.items():
+    for account in active_accounts:
+        account_id = account.get("id")
+        key_names = account_bindings.get(account_id, [])
         try:
             data = query_account_estimate(account_id) or {}
             if data.get("error"):
                 raise RuntimeError("Account estimate query did not return account data")
             overview.append({
                 "account_id": account_id,
-                "account_name": data.get("name"),
+                "account_name": data.get("name") or account.get("name"),
                 "key_names": key_names,
                 "used_7d_percent": data.get("used_7d_percent"),
                 "consumed_amount": data.get("consumed_amount"),
@@ -1313,7 +1320,12 @@ def collect_account_overview(bindings):
             })
         except Exception as error:
             log_failure(f"account overview account={masked_id(account_id)}", error)
-            overview.append({"account_id": account_id, "key_names": key_names, "error": True})
+            overview.append({
+                "account_id": account_id,
+                "account_name": account.get("name"),
+                "key_names": key_names,
+                "error": True,
+            })
     return overview
 
 
@@ -1339,7 +1351,7 @@ def account_estimated_total(consumed_amount, used_percent):
 def append_account_overview(lines, accounts, now=None):
     lines.extend(["", "🌐 上游账号信息"])
     if not accounts:
-        lines.append("• 暂无配置了 account_id 的绑定账号。")
+        lines.append("• 暂无生效的上游账号。")
         return
 
     total_consumed = Decimal("0")
@@ -1754,18 +1766,15 @@ def sudden_reset_approval_keyboard(token):
 
 def format_sudden_reset_approval(approval):
     previous = parse_upstream_timestamp(approval.get("previous_reset_at"))
-    aligned = parse_upstream_timestamp(approval.get("align_at"))
-    advance_minutes = max(0, int((previous - aligned).total_seconds() // 60))
-    days, remainder = divmod(advance_minutes, 24 * 60)
-    hours, minutes = divmod(remainder, 60)
-    advance_text = f"{days} 天 {hours} 小时 {minutes} 分钟"
+    previous_start = previous - timedelta(days=7)
     return "\n".join([
         "通知：检测到 OpenAI 7 日额度提前重置",
         "",
         f"原计划重置时间：{format_timestamp(approval.get('previous_reset_at'))}",
+        f"新计划重置时间：{format_timestamp(approval.get('reset_at'))}",
+        f"原周期开始时间：{format_timestamp(previous_start)}",
         f"新周期开始时间：{format_timestamp(approval.get('align_at'))}",
-        f"提前重置时间：{advance_text}",
-        f"上游账号 ID：{approval.get('trigger_account_id')}",
+        f"上游账号名称：{approval.get('account_name') or approval.get('trigger_account_id')}",
         f"涉及 Key：{len(approval.get('keys') or [])} 个",
         "",
         "本次属于突然重置，是否将该账号绑定的 Key 随号重置？",
@@ -1876,11 +1885,12 @@ def notify_sudden_reset_approval(admins, approval):
     return delivered
 
 
-def new_sudden_reset_approval(bindings, account_id, previous_reset_at, reset_at):
+def new_sudden_reset_approval(bindings, account_id, previous_reset_at, reset_at, account_name=None):
     keys = approval_keys_for_account(bindings, account_id)
     return {
         "token": secrets.token_hex(4),
         "trigger_account_id": account_id,
+        "account_name": account_name,
         "previous_reset_at": canonical_reset_timestamp(previous_reset_at),
         "reset_at": canonical_reset_timestamp(reset_at),
         "align_at": canonical_reset_timestamp(upstream_alignment_time(reset_at)),
@@ -2136,7 +2146,8 @@ def check_account_weekly_resets(now=None):
                 ) or changed
                 if classification == "sudden":
                     approval = new_sudden_reset_approval(
-                        bindings, account_id, previous_reset_at, current_reset_at
+                        bindings, account_id, previous_reset_at, current_reset_at,
+                        snapshot.get("name"),
                     )
                     became_active = enqueue_sudden_reset_approval(state, approval)
                     save_auto_reset_state(state)

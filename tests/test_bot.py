@@ -206,6 +206,7 @@ class MessageAuthorizationTests(unittest.TestCase):
     def test_sudden_reset_prompt_and_result_use_notification_prefix(self):
         approval = {
             "trigger_account_id": 12,
+            "account_name": "OpenAI 主号",
             "previous_reset_at": "2026-09-12T04:45:13Z",
             "reset_at": "2026-09-15T20:18:30Z",
             "align_at": "2026-09-08T20:18:30Z",
@@ -213,9 +214,12 @@ class MessageAuthorizationTests(unittest.TestCase):
         }
         prompt = bot.format_sudden_reset_approval(approval)
         self.assertTrue(prompt.startswith("通知："))
-        self.assertIn("上游账号 ID：12", prompt)
-        self.assertIn("提前重置时间：3 天 8 小时 26 分钟", prompt)
-        self.assertNotIn("新的重置时间：", prompt)
+        self.assertIn("上游账号名称：OpenAI 主号", prompt)
+        self.assertIn("原计划重置时间：2026-09-12 12:45:13", prompt)
+        self.assertIn("新计划重置时间：2026-09-16 04:18:30", prompt)
+        self.assertIn("原周期开始时间：2026-09-05 12:45:13", prompt)
+        self.assertIn("新周期开始时间：2026-09-09 04:18:30", prompt)
+        self.assertNotIn("提前重置时间：", prompt)
         self.assertIn("3 分钟内未操作将自动执行", prompt)
         result = bot.format_sudden_reset_result(approval, [
             {"key_name": "Key A", "status": "success"},
@@ -559,6 +563,11 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertEqual([item["key_name"] for item in overview], ["Key A", "Key E"])
         self.assertEqual(query.call_count, 5)
 
+    @mock.patch.object(bot, "query_active_accounts", return_value={"accounts": [
+        {"id": 12, "name": "account-a@example.com"},
+        {"id": 13, "name": "Account B"},
+        {"id": 14, "name": "Unbound account"},
+    ]})
     @mock.patch.object(bot, "query_account_estimate", side_effect=[
         {
             "name": "account-a@example.com",
@@ -568,15 +577,18 @@ class MessageAuthorizationTests(unittest.TestCase):
             "window_end": "2026-09-07T09:03:10Z",
         },
         RuntimeError("database unavailable"),
+        {"name": "Unbound account", "used_7d_percent": None,
+         "consumed_amount": None, "window_end": None},
     ])
-    def test_account_overview_deduplicates_accounts_and_collects_bound_keys(self, query):
+    def test_account_overview_includes_active_unbound_accounts(self, query, active):
         bindings = {
             "123": {"key_name": "Key A", "account_id": 12},
             "456": {"key_name": "Key B", "account_id": 13},
             "789": {"key_name": "Key C", "account_id": 12},
             "999": {"key_name": "Legacy", "account_id": None},
         }
-        self.assertEqual(bot.collect_account_overview(bindings), [
+        overview = bot.collect_account_overview(bindings)
+        self.assertEqual(overview, [
             {
                 "account_id": 12,
                 "account_name": "account-a@example.com",
@@ -586,9 +598,22 @@ class MessageAuthorizationTests(unittest.TestCase):
                 "snapshot_updated_at": "2026-08-31T03:56:00Z",
                 "reset_7d_at": "2026-09-07T09:03:10Z",
             },
-            {"account_id": 13, "key_names": ["Key B"], "error": True},
+            {"account_id": 13, "account_name": "Account B", "key_names": ["Key B"], "error": True},
+            {
+                "account_id": 14,
+                "account_name": "Unbound account",
+                "key_names": [],
+                "used_7d_percent": None,
+                "consumed_amount": None,
+                "snapshot_updated_at": None,
+                "reset_7d_at": None,
+            },
         ])
-        self.assertEqual(query.call_args_list, [mock.call(12), mock.call(13)])
+        active.assert_called_once_with()
+        self.assertEqual(query.call_args_list, [mock.call(12), mock.call(13), mock.call(14)])
+        lines = []
+        bot.append_account_overview(lines, overview)
+        self.assertIn("• 绑定 Key：-", lines)
 
     def test_key_overview_only_formats_last_use_and_weekly_limit_with_progress(self):
         text, page, total_pages = bot.format_key_overview([
@@ -1539,6 +1564,13 @@ class DataSafetyTests(unittest.TestCase):
             {"account_id": "12"},
         )
 
+    def test_active_accounts_uses_fixed_read_only_function(self):
+        with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
+            bot.query_active_accounts()
+        run.assert_called_once_with(
+            "SELECT sub2api_tg_bot_api.active_accounts()::text;"
+        )
+
     def test_account_weekly_reset_uses_fixed_read_only_function(self):
         with mock.patch.object(bot, "run_psql_json", return_value={}) as run:
             bot.query_account_weekly_reset(12)
@@ -1621,6 +1653,10 @@ class DataSafetyTests(unittest.TestCase):
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_ip_history(text, integer, integer)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint)", sql)
         self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint)", sql)
+        self.assertIn("CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.active_accounts()", sql)
+        self.assertIn("account.status = 'active'", sql)
+        self.assertIn("account.expires_at IS NULL OR account.expires_at > now()", sql)
+        self.assertIn("GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.active_accounts()", sql)
         self.assertIn("CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_weekly_reset", sql)
         self.assertIn("'reset_7d_after_seconds', account.extra->>'codex_7d_reset_after_seconds'", sql)
         self.assertIn("'used_7d_percent', account.extra->>'codex_7d_used_percent'", sql)
@@ -2242,6 +2278,7 @@ class SuddenUpstreamResetTests(unittest.TestCase):
                 with mock.patch.object(bot, "load_config", return_value=self.config()), \
                         mock.patch.object(bot, "query_account_weekly_reset", side_effect=lambda account_id: {
                             "id": account_id,
+                            "name": f"Account {account_id}",
                             "reset_7d_at": current_by_account[account_id],
                         }), \
                         mock.patch.object(
@@ -2271,8 +2308,8 @@ class SuddenUpstreamResetTests(unittest.TestCase):
                 if call.args[0] == "sendMessage"
             ]
             self.assertEqual([message["chat_id"] for message in prompts], ["123", "123"])
-            self.assertIn("上游账号 ID：12", prompts[0]["text"])
-            self.assertIn("上游账号 ID：13", prompts[1]["text"])
+            self.assertIn("上游账号名称：Account 12", prompts[0]["text"])
+            self.assertIn("上游账号名称：Account 13", prompts[1]["text"])
 
     def test_rejection_prevents_timeout_reset(self):
         approval = {

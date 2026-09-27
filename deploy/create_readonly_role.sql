@@ -381,6 +381,25 @@ SELECT CASE
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.active_accounts()
+RETURNS json
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+SELECT json_build_object(
+  'accounts', coalesce(json_agg(
+    json_build_object('id', account.id, 'name', account.name)
+    ORDER BY lower(account.name), account.id
+  ), '[]'::json)
+)
+FROM public.accounts AS account
+WHERE account.deleted_at IS NULL
+  AND account.status = 'active'
+  AND (account.expires_at IS NULL OR account.expires_at > now());
+$function$;
+
 CREATE OR REPLACE FUNCTION sub2api_tg_bot_api.account_weekly_reset(
   p_account_id bigint
 )
@@ -395,6 +414,7 @@ SELECT CASE
     THEN json_build_object('error', 'not_found', 'id', p_account_id)
   ELSE json_build_object(
     'id', account.id,
+    'name', account.name,
     'snapshot_updated_at', account.extra->>'codex_usage_updated_at',
     'reset_7d_at', account.extra->>'codex_7d_reset_at',
     'reset_7d_after_seconds', account.extra->>'codex_7d_reset_after_seconds',
@@ -756,6 +776,7 @@ REVOKE ALL ON FUNCTION sub2api_tg_bot_api.key_overview(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.key_ip_history(text, integer, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION sub2api_tg_bot_api.active_accounts() FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION sub2api_tg_bot_api.set_rate_limit_window_starts(bigint, timestamptz) FROM PUBLIC;
@@ -771,6 +792,7 @@ GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_overview(text) TO sub2api_tg_bo
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.key_ip_history(text, integer, integer) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.usage_with_account(text, bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_estimate(bigint) TO sub2api_tg_bot;
+GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.active_accounts() TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.account_weekly_reset(bigint) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.backup_rate_limits(text, bigint, text, text) TO sub2api_tg_bot;
 GRANT EXECUTE ON FUNCTION sub2api_tg_bot_api.set_rate_limit_window_starts(bigint, timestamptz) TO sub2api_tg_bot;
