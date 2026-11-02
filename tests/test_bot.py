@@ -247,6 +247,26 @@ class MessageAuthorizationTests(unittest.TestCase):
             for call in tg.call_args_list
         ))
 
+    @mock.patch.object(bot, "tg")
+    def test_manual_reset_announcement_only_goes_to_successful_key_users(self, tg):
+        bindings = {
+            "123": {"key_name": "Key A", "account_id": 1},
+            "456": {"key_name": "Key B", "account_id": 2},
+            "789": {"key_name": "Key A", "account_id": 1},
+            "999": {"key_name": "Key C", "account_id": 3},
+        }
+        delivered = bot.notify_successful_bound_users(bindings, [
+            {"key_name": "Key A", "status": "success"},
+            {"key_name": "Key B", "status": "failed"},
+            {"key_name": "Key C", "status": "warning"},
+        ], manual=True)
+        self.assertEqual(delivered, 2)
+        self.assertEqual([call.args[1]["chat_id"] for call in tg.call_args_list], ["123", "789"])
+        self.assertTrue(all(
+            call.args[1]["text"].startswith("公告：管理员已重置 Key 用量\n\nKey：Key A")
+            for call in tg.call_args_list
+        ))
+
     def test_batch_reset_keyboard_tracks_selection_and_deduplicates_key_names(self):
         bindings = {
             "123": {"key_name": "Key A", "account_id": 1},
@@ -1242,6 +1262,11 @@ class MessageAuthorizationTests(unittest.TestCase):
         self.assertEqual(len(backup_notices), 1)
         self.assertIn("最后使用：2026-09-03 18:56:43", backup_notices[0])
         self.assertIn("每周额度：已用 90 / 限额 600 / 剩余 510", backup_notices[0])
+        announcements = [
+            call.args[1] for call in tg.call_args_list
+            if call.args[0] == "sendMessage" and call.args[1]["text"].startswith("公告：")
+        ]
+        self.assertEqual([message["chat_id"] for message in announcements], ["456"])
         self.assertIn("batch_start:0", {
             button["callback_data"]
             for row in bot.json.loads(edits[-1]["reply_markup"])["inline_keyboard"]

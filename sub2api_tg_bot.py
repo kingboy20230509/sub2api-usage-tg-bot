@@ -1822,7 +1822,7 @@ def format_sudden_reset_result(approval, results, automatic=False):
     return "\n".join(lines)
 
 
-def notify_successful_bound_users(bindings, results):
+def notify_successful_bound_users(bindings, results, manual=False):
     successful_keys = {
         result.get("key_name") for result in results if result.get("status") == "success"
     }
@@ -1834,18 +1834,19 @@ def notify_successful_bound_users(bindings, results):
             tg("sendMessage", {
                 "chat_id": user_id,
                 "text": "\n".join([
-                    "公告：OpenAI重置，随号重置",
+                    "公告：管理员已重置 Key 用量" if manual else "公告：OpenAI重置，随号重置",
                     "",
                     f"Key：{binding['key_name']}",
                     "• 5 小时用量已重置",
                     "• 每日用量已重置",
                     "• 7 日用量已重置",
+                    "• 重置时间从本次重置开始计算" if manual else
                     "• 重置时间已与 OpenAI 新周期对齐",
                 ]),
             })
             delivered += 1
         except Exception as error:
-            log_failure(f"sudden reset announcement user={masked_id(user_id)}", error)
+            log_failure(f"{'manual' if manual else 'sudden'} reset announcement user={masked_id(user_id)}", error)
     return delivered
 
 
@@ -2781,6 +2782,7 @@ def handle_callback_query(callback):
                 reset_backup_text = format_reset_backup_snapshots(results)
                 if reset_backup_text:
                     notify_admins(config_admins(cfg), reset_backup_text)
+                notify_successful_bound_users(bindings, results, manual=True)
                 tg("editMessageText", {
                     "chat_id": chat_id,
                     "message_id": message_id,
